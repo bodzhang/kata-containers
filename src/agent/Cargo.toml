@@ -92,6 +92,40 @@ container-device-interface = "0.1.1"
 [target.'cfg(target_arch = "s390x")'.dependencies]
 pv_core = { git = "https://github.com/ibm-s390-linux/s390-tools", rev = "4942504a9a2977d49989a5e5b7c1c8e07dc0fa41", package = "s390_pv_core" }
 
+# Used to verify the initdata->launch-measurement binding in-process, before the
+# agent consumes any host-supplied initdata policy/config. `attester` is the
+# guest-components crate the attestation-agent itself is built from; we reuse its
+# per-TEE binding logic (SEV-SNP HOST_DATA, TDX MRCONFIGID) but run it inside the
+# launch-measured agent rather than delegating to the separate AA process.
+#
+# Optional and enabled only by the `init-data` feature: a non-CC (plain Kata)
+# build (INIT_DATA=no) has no initdata to bind, so neither the binding check nor
+# this attestation dependency is compiled in.
+#
+# TODO(size): pulling the whole `attester` crate drags in heavy, non-optional
+# transitive deps we never use (e.g. `crypto` -> aes-gcm/p256/p521/rsa, and
+# `kbs-types` -> ear/sm3), because the `Attester` trait is not separable from its
+# concrete impls. Feature trimming does not help (these deps are unconditional).
+# A future fix is to add a build option upstream in guest-components that exposes
+# only `bind_init_data` (a minimal trait/feature) so the agent can depend on just
+# that instead of the full attester crate.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+attester = { git = "https://github.com/confidential-containers/guest-components", rev = "a62c7537279c3f6e384f0171459f272751aef743", default-features = false, features = ["snp-attester", "tdx-attester"], optional = true }
+
+# aarch64 / Arm CCA. We pull the same `attester` crate with `cca-attester` so the
+# agent can eventually verify the initdata->launch binding against the CCA Realm
+# Personalization Value (RPV, 64 bytes).
+#
+# TODO(cca): upstream `CcaAttester` only implements `get_evidence`; it does NOT
+# implement `bind_init_data` yet, so it inherits the trait default
+# (`InitDataResult::Unsupported`) and there is no RPV-based initdata binding to
+# reuse. Until guest-components lands `CcaAttester::bind_init_data`, the agent
+# treats a detected CCA platform as a hard, CCA-specific fail-closed refusal (see
+# `verify_initdata_binding` in initdata.rs). Once upstream implements it, this
+# temporary special-casing can be removed and CCA will bind like SNP/TDX.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+attester = { git = "https://github.com/confidential-containers/guest-components", rev = "a62c7537279c3f6e384f0171459f272751aef743", default-features = false, features = ["cca-attester"], optional = true }
+
 [dev-dependencies]
 tempfile.workspace = true
 which.workspace = true
@@ -102,4 +136,4 @@ test-utils.workspace = true
 [features]
 seccomp = ["rustjail/seccomp"]
 agent-policy = ["kata-agent-policy"]
-init-data = []
+init-data = ["dep:attester"]

@@ -183,7 +183,122 @@ pub async fn initialize_initdata(logger: &Logger) -> Result<Option<InitdataRetur
         _policy: initdata.get_coco_data(POLICY_KEY).cloned(),
     };
 
+    // Boot-time initdata->launch binding gate.
+    //
+    // The initdata blob (policy.rego, aa.toml, cdh.toml) is supplied by the
+    // untrusted host. Its integrity is guaranteed only by the TEE launch
+    // measurement: the host must program the initdata digest into a launch-bound
+    // register that the hardware authenticates into every signed attestation
+    // report -- SEV-SNP `HOST_DATA` (32 bytes), TDX `MRCONFIGID` (48 bytes), or
+    // Arm CCA Realm Personalization Value (64 bytes). Nothing else ties this
+    // host-supplied blob to the measured guest.
+    //
+    // We MUST verify that binding here -- inside the launch-measured agent,
+    // synchronously, against a live hardware report -- BEFORE any
+    // initdata-provided policy or config is consumed and potentially used to
+    // admit containers. The binding must NOT be delegated to the in-UVM
+    // attestation-agent, because that creates a time-of-check/time-of-use race:
+    // if the policy binding is not yet verified but the policy is already used
+    // to admit containers, a malicious privileged container admitted by that
+    // unbound policy could tamper with the AA -- its binary/config, or the
+    // initdata file it reads -- so that the AA's later binding check still
+    // passes. Attestation would then report an acceptable, bound policy while
+    // the malicious unbound policy is what actually admitted containers. The
+    // binding check must therefore complete in launch-measured code before any
+    // container can be admitted.
+    //
+    // Fails closed: any mismatch, or inability to obtain the report, aborts
+    // initdata initialization so the host-supplied policy is never enforced.
+    #[cfg(feature = "init-data")]
+    verify_initdata_binding(&logger, &res._digest)
+        .await
+        .context("verify initdata launch binding")?;
+
     Ok(Some(res))
+}
+
+/// Verify that the launch measurement binds the initdata this agent has read,
+/// failing closed otherwise.
+///
+/// `digest` is the raw (pre-adjustment) initdata digest computed in
+/// [`initialize_initdata`]. The comparison is delegated to the guest-components
+/// `attester` crate -- the exact code the attestation-agent is built from -- but
+/// it runs *in-process* inside the launch-measured kata-agent, NOT in the
+/// separate AA daemon. The attester detects the TEE and compares the digest
+/// against the platform's launch-bound register:
+/// - SEV-SNP: `HOST_DATA` (digest truncated/zero-padded to 32 bytes),
+/// - TDX: `MRCONFIGID` (digest truncated/zero-padded to 48 bytes).
+///
+/// Arm CCA is detected but its binding anchor (the Realm Personalization Value,
+/// 64 bytes) is not yet checkable because upstream `CcaAttester` does not
+/// implement `bind_init_data`; a detected CCA platform is therefore treated as a
+/// temporary, CCA-specific fail-closed refusal until that lands upstream.
+#[cfg(all(feature = "init-data", any(target_arch = "x86_64", target_arch = "aarch64")))]
+async fn verify_initdata_binding(logger: &Logger, digest: &[u8]) -> Result<()> {
+    use attester::{detect_tee_type, BoxedAttester, InitDataResult};
+    use std::convert::TryFrom;
+
+    let logger = logger.new(o!("subsystem" => "initdata", "check" => "launch-binding"));
+
+    let tee = detect_tee_type();
+    let tee_dbg = format!("{tee:?}");
+    let attester =
+        BoxedAttester::try_from(tee).context("construct attester for detected TEE")?;
+
+    match attester
+        .bind_init_data(digest)
+        .await
+        .context("bind initdata to TEE launch measurement")?
+    {
+        InitDataResult::Ok => {
+            info!(logger, "initdata launch binding verified"; "tee" => tee_dbg);
+            Ok(())
+        }
+        // No launch-bound register to check (e.g. no TEE detected, or a platform
+        // whose attester does not implement init-data binding). We cannot
+        // establish the binding, so refuse the host-supplied initdata.
+        InitDataResult::Unsupported => {
+            // TEMP(cca): upstream `CcaAttester` does not implement
+            // `bind_init_data` yet, so a genuine Arm CCA platform also lands here
+            // (via the trait default) rather than binding the digest to the CCA
+            // Realm Personalization Value. Distinguish it so the failure is
+            // actionable. This branch should be removed once guest-components
+            // implements `CcaAttester::bind_init_data` (RPV, 64 bytes); CCA will
+            // then resolve to `Ok`/mismatch like SNP/TDX.
+            if tee_dbg == "Cca" {
+                error!(
+                    logger,
+                    "initdata launch binding not yet implemented for CCA";
+                    "tee" => tee_dbg,
+                );
+                bail!(
+                    "initdata launch binding not yet implemented for Arm CCA \
+                     (upstream CcaAttester lacks bind_init_data / RPV support); \
+                     refusing host-supplied initdata (fail closed)"
+                )
+            }
+            error!(
+                logger,
+                "initdata launch binding unsupported for detected TEE";
+                "tee" => tee_dbg,
+            );
+            bail!(
+                "initdata launch binding unsupported for detected TEE; \
+                 refusing host-supplied initdata (fail closed)"
+            )
+        }
+    }
+}
+
+/// On architectures without a supported TEE attester the SEV-SNP / TDX / CCA
+/// binding cannot be performed. Since initdata integrity depends on that
+/// binding, refuse host-supplied initdata rather than consume it unverified.
+#[cfg(all(feature = "init-data", not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+async fn verify_initdata_binding(_logger: &Logger, _digest: &[u8]) -> Result<()> {
+    bail!(
+        "initdata launch binding is not supported on this architecture; \
+         refusing host-supplied initdata (fail closed)"
+    )
 }
 
 #[cfg(test)]
