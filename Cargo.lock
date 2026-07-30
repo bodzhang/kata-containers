@@ -3651,6 +3651,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "genpolicy-oci-compiler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "genpolicy",
+ "kata-types",
+ "protocols",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml 0.8.26",
+]
+
+[[package]]
 name = "get_protocol"
 version = "0.0.0"
 source = "git+https://github.com/JocelynBerrendonner/openvmm?rev=99a0f1643fe21ce4338c8b85cbed1b390828ee08#99a0f1643fe21ce4338c8b85cbed1b390828ee08"

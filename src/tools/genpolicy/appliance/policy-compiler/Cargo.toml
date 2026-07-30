@@ -1,0 +1,15 @@
+[package]
+name = "genpolicy-oci-compiler"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow.workspace = true
+genpolicy = { path = "../.." }
+kata-types = { path = "../../../../libs/kata-types" }
+protocols = { workspace = true, features = ["with-serde"] }
+regex = "1.10.5"
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = "0.8"

@@ -42,6 +42,13 @@ $ genpolicy --help
 
 For advanced command line parameters, see [`genpolicy` advanced command line parameters](genpolicy-advanced-command-line-parameters.md).
 
+## Versioned OCI conversion appliance
+
+The experimental [GenPolicy OCI conversion appliance](appliance/README.md)
+runs a pinned kube-apiserver, kubelet, and containerd pipeline in an isolated,
+privileged container. It captures the generated OCI specifications and marks
+deployment- or cluster-specific values for later conversion to policy regexes.
+
 
 # Supported Kubernetes `YAML` file types
 

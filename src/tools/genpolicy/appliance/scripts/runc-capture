@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+bundle=""
+container_id=""
+previous=""
+
+for argument in "$@"; do
+	case "${previous}" in
+	--bundle|-b)
+		bundle="${argument}"
+		previous=""
+		continue
+		;;
+	esac
+	case "${argument}" in
+	--bundle|-b)
+		previous="${argument}"
+		;;
+	*)
+		container_id="${argument}"
+		;;
+	esac
+done
+
+if [[ -n "${bundle}" && -f "${bundle}/config.json" ]]; then
+	raw_dir="${GENPOLICY_CAPTURE_DIR:-/output/raw}"
+	mkdir -p "${raw_dir}"
+	(
+		flock 9
+		sequence_file="${raw_dir}/.sequence"
+		sequence=0
+		[[ -f "${sequence_file}" ]] && read -r sequence <"${sequence_file}"
+		sequence=$((sequence + 1))
+		printf '%s\n' "${sequence}" >"${sequence_file}"
+		prefix=$(printf '%04d-%s' "${sequence}" "${container_id}")
+		cp "${bundle}/config.json" "${raw_dir}/${prefix}.config.json"
+		CONTAINER_ID="${container_id}" BUNDLE="${bundle}" OUTPUT="${raw_dir}/${prefix}.meta.json" \
+			python3 - <<'PY'
+import json
+import os
+
+with open(os.environ["OUTPUT"], "w", encoding="utf-8") as output:
+    json.dump(
+        {
+            "bundle": os.environ["BUNDLE"],
+            "container_id": os.environ["CONTAINER_ID"],
+        },
+        output,
+        indent=2,
+        sort_keys=True,
+    )
+    output.write("\n")
+PY
+	) 9>"${raw_dir}/.capture.lock"
+fi
+
+exec /usr/local/bin/runc.real "$@"
