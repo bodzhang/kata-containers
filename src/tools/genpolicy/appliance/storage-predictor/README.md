@@ -80,6 +80,22 @@ allowlisted hash, while the writable `ext4` upper is allowed by shape. Legacy
 `genpolicy` emits no rootfs storages at all, so erofs containers fail closed
 under it — this is a capability the drive adds.
 
+### Image references must be digest-pinned
+
+Every appliance rootfs solution (erofs dm-verity, single-layer dm-verity, guest
+pull) exists to bind the generated policy to the **workload author's declared
+image**. dm-verity pins the layer *bytes* and guest pull pins the image
+*reference*, but that only faithfully encodes intent if the manifest names the
+image by digest: a mutable tag (`nginx:1.27`) can be repointed by whoever
+controls the registry, so it cannot specify which image the author meant. The
+compiler therefore enforces, for every workload container, that the
+`io.kubernetes.cri.image-name` (or CRI-O `io.kubernetes.cri-o.ImageName`)
+reference is a `name@sha256:<digest>` — a tag fails generation. The sandbox/pause
+container is exempt (infrastructure, not a workload reference). Set
+`GENPOLICY_ALLOW_IMAGE_TAGS=1` (`--require-image-digest false`) to relax this,
+in which case content integrity relies on the guest's own image signature
+policy instead.
+
 ### Rootfs: guest-pull image pinning
 
 For the mainstream CoCo rootfs (guest pull), the predictor reuses the shim's own
@@ -87,14 +103,14 @@ For the mainstream CoCo rootfs (guest pull), the predictor reuses the shim's own
 it through the real `handler_rootfs` with no `ShareFs` (`--guest-pull-rootfs`; in
 the appliance `GENPOLICY_GUEST_PULL=1`). The resulting `image_guest_pull`
 `Storage` carries `source` = the image reference from
-`io.kubernetes.cri.image-name`. The compiler collects the union of those
-references into `policy_data.guest_pull.allowed_images`, and the `rules.rego`
-`image_guest_pull` clause pins the pulled image to that allowlist. To stay
-backward compatible (legacy genpolicy, or the predictor not run), an empty
-allowlist falls back to the historical allow-by-shape. The huge, non-deterministic
-`driver_options` metadata blob is intentionally not pinned; the image reference
-is the security-relevant field (the guest pulls and verifies it by digest inside
-the TEE).
+`io.kubernetes.cri.image-name` (digest-pinned, per above). The compiler collects
+the union of those references into `policy_data.guest_pull.allowed_images`, and
+the `rules.rego` `image_guest_pull` clause pins the pulled image to that
+allowlist. To stay backward compatible (legacy genpolicy, or the predictor not
+run), an empty allowlist falls back to the historical allow-by-shape. The huge,
+non-deterministic `driver_options` metadata blob is intentionally not pinned; the
+image reference is the security-relevant field (the guest pulls and verifies it
+by digest inside the TEE).
 
 ### Volume storages: templated injection
 
