@@ -35,7 +35,7 @@ class PredictStoragesTests(unittest.TestCase):
 
             captured = {}
 
-            def fake_predict_one(predictor, config, cid, sid, emptydir_mode, block_driver):
+            def fake_predict_one(predictor, config, cid, sid, emptydir_mode, block_driver, kata_config):
                 captured["cid"] = cid
                 captured["sid"] = sid
                 captured["emptydir_mode"] = emptydir_mode
@@ -44,7 +44,7 @@ class PredictStoragesTests(unittest.TestCase):
 
             with mock.patch.object(MODULE, "predict_one", fake_predict_one):
                 report = MODULE.collect(
-                    raw, "/usr/local/bin/storage-predictor", "shared-fs", "virtio-blk-pci"
+                    raw, "/usr/local/bin/storage-predictor", "shared-fs", "virtio-blk-pci", ""
                 )
 
             self.assertEqual(captured["cid"], "abc")
@@ -62,11 +62,11 @@ class PredictStoragesTests(unittest.TestCase):
                 json.dumps({"container_id": "c"}), encoding="utf-8"
             )
 
-            def failing(predictor, config, cid, sid, emptydir_mode, block_driver):
+            def failing(predictor, config, cid, sid, emptydir_mode, block_driver, kata_config):
                 return {"container_id": cid, "sandbox_id": sid, "error": "boom"}
 
             with mock.patch.object(MODULE, "predict_one", failing):
-                report = MODULE.collect(raw, "predictor", "shared-fs", "virtio-blk-pci")
+                report = MODULE.collect(raw, "predictor", "shared-fs", "virtio-blk-pci", "")
 
             self.assertEqual(report["predictions"][0]["error"], "boom")
 

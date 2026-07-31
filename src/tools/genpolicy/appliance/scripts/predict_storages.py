@@ -28,29 +28,28 @@ def predict_one(
     sid: str,
     emptydir_mode: str,
     block_driver: str,
+    kata_config: str,
 ) -> dict:
     with tempfile.TemporaryDirectory() as temporary:
         output = Path(temporary) / "predicted.json"
-        result = subprocess.run(
-            [
-                predictor,
-                "--config",
-                str(config),
-                "--output",
-                str(output),
-                "--sid",
-                sid,
-                "--cid",
-                cid,
-                "--emptydir-mode",
-                emptydir_mode,
-                "--block-driver",
-                block_driver,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        command = [
+            predictor,
+            "--config",
+            str(config),
+            "--output",
+            str(output),
+            "--sid",
+            sid,
+            "--cid",
+            cid,
+            "--emptydir-mode",
+            emptydir_mode,
+            "--block-driver",
+            block_driver,
+        ]
+        if kata_config:
+            command += ["--kata-config", kata_config]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             return {
                 "container_id": cid,
@@ -60,7 +59,9 @@ def predict_one(
         return json.loads(output.read_text(encoding="utf-8"))
 
 
-def collect(raw_dir: Path, predictor: str, emptydir_mode: str, block_driver: str) -> dict:
+def collect(
+    raw_dir: Path, predictor: str, emptydir_mode: str, block_driver: str, kata_config: str
+) -> dict:
     predictions = []
     for config in sorted(raw_dir.glob(f"*{CONFIG_SUFFIX}")):
         meta_path = config.with_name(config.name[: -len(CONFIG_SUFFIX)] + ".meta.json")
@@ -72,7 +73,7 @@ def collect(raw_dir: Path, predictor: str, emptydir_mode: str, block_driver: str
         spec = json.loads(config.read_text(encoding="utf-8"))
         sid = sandbox_id(spec) or cid
         predictions.append(
-            predict_one(predictor, config, cid, sid, emptydir_mode, block_driver)
+            predict_one(predictor, config, cid, sid, emptydir_mode, block_driver, kata_config)
         )
     return {"schema_version": 1, "predictions": predictions}
 
@@ -84,9 +85,12 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--emptydir-mode", default="shared-fs")
     parser.add_argument("--block-driver", default="virtio-blk-pci")
+    parser.add_argument("--kata-config", default="")
     args = parser.parse_args()
 
-    report = collect(args.raw_dir, args.predictor, args.emptydir_mode, args.block_driver)
+    report = collect(
+        args.raw_dir, args.predictor, args.emptydir_mode, args.block_driver, args.kata_config
+    )
     args.output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

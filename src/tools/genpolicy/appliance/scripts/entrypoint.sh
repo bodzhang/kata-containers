@@ -334,6 +334,7 @@ python3 "${appliance_root}/scripts/predict_storages.py" \
 	--predictor /usr/local/bin/storage-predictor \
 	--emptydir-mode "${GENPOLICY_EMPTYDIR_MODE:-shared-fs}" \
 	--block-driver "${GENPOLICY_BLOCK_DRIVER:-virtio-blk-pci}" \
+	--kata-config "${GENPOLICY_KATA_CONFIG:-}" \
 	--output "${output_dir}/storages-devices-predicted.json" \
 	2>"${output_dir}/logs/storage-predictor.log" ||
 	echo "storage prediction failed (audit-only); see logs/storage-predictor.log" >&2

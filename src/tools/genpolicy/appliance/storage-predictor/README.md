@@ -101,9 +101,10 @@ Mitigation options (not yet implemented):
   (proven by the `dry_run_block_device_gets_deterministic_virt_path` unit test).
   Predictor-level prediction through `handler_volumes` is still e2e-only, because
   `BlockVolume::new` `stat`s the real host block device and direct volumes read
-  host mount-info metadata. The block `driver_option` is profile-sourced
-  (`--block-driver` / `GENPOLICY_BLOCK_DRIVER`), but the remaining `blockdev_info`
-  fields (aio, queues, sector sizes) are still `Default`.
+  host mount-info metadata. The full `blockdev_info` (driver, aio, queues, sector
+  sizes) plus `emptydir_mode`/`disable_guest_empty_dir` are sourced from the
+  deployment's Kata `configuration.toml` when `--kata-config` is given; otherwise
+  the block driver falls back to `--block-driver` / `GENPOLICY_BLOCK_DRIVER`.
 - Only per-volume `device_id` is emitted, not full `agent::Device` objects; the
   `Volume` trait exposes no device enumeration, so full devices need
   device-manager introspection and the container-manager `spec.linux.devices`
@@ -114,11 +115,11 @@ Mitigation options (not yet implemented):
 - Input fidelity: the captured spec is containerd's runc-handler spec; equivalence
   with the kata-handler spec is not yet verified. `pci_path` is not reconstructed
   (acceptable for virtio-blk, whose Agent source is the deterministic `/dev/vdX`).
-  `emptydir_mode` and the block driver are profile-sourced (`profile.env`:
-  `GENPOLICY_EMPTYDIR_MODE`, `GENPOLICY_BLOCK_DRIVER`). Full hypervisor-config
-  fidelity (all `blockdev_info` fields, `disable_guest_empty_dir`) would instead
-  load the deployment's Kata `configuration.toml` via `kata_types::TomlConfig` — a
-  future `--kata-config` input.
+  `emptydir_mode`, `disable_guest_empty_dir`, and the full hypervisor `blockdev_info`
+  are sourced from the deployment's Kata `configuration.toml` via `--kata-config`
+  (`GENPOLICY_KATA_CONFIG`), loaded raw (no hypervisor-binary validation). Without
+  it, only `emptydir_mode` and the block driver are profile-sourced from
+  `profile.env` (`GENPOLICY_EMPTYDIR_MODE`, `GENPOLICY_BLOCK_DRIVER`).
 
 ## Validation
 

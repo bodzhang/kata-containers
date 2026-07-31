@@ -31,6 +31,7 @@ use agent::{Agent, AgentManager, HealthService};
 use kata_types::config::Agent as AgentConfig;
 
 use kata_sys_util::k8s::update_ephemeral_storage_type;
+use kata_types::config::TomlConfig;
 use kata_types::k8s::is_watchable_mount;
 use resource::share_fs::{
     do_get_guest_path, kata_guest_share_dir, MountedInfo, ShareFs, ShareFsMount,
@@ -44,9 +45,8 @@ use resource::volume::{VolumeContext, VolumeResource};
 /// method type-checks regardless of its declared return type.
 #[derive(Debug, Default)]
 struct DryRunHypervisor {
-    // Block device driver from the pinned profile (e.g. virtio-blk-pci); the rest
-    // of the hypervisor config is Default.
-    block_driver: String,
+    // Sourced from the profile fallback or the deployment's Kata config.
+    config: HypervisorConfig,
 }
 
 #[async_trait]
@@ -102,9 +102,7 @@ impl Hypervisor for DryRunHypervisor {
         unimplemented!()
     }
     async fn hypervisor_config(&self) -> HypervisorConfig {
-        let mut config = HypervisorConfig::default();
-        config.blockdev_info.block_device_driver = self.block_driver.clone();
-        config
+        self.config.clone()
     }
     async fn get_thread_ids(&self) -> Result<VcpuThreadIds> {
         unimplemented!()
@@ -433,6 +431,7 @@ struct Args {
     emptydir_mode: String,
     block_driver: String,
     disable_guest_empty_dir: bool,
+    kata_config: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -443,6 +442,7 @@ fn parse_args() -> Result<Args> {
     let mut emptydir_mode = "shared-fs".to_string();
     let mut block_driver = "virtio-blk-pci".to_string();
     let mut disable_guest_empty_dir = false;
+    let mut kata_config: Option<PathBuf> = None;
 
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -457,6 +457,9 @@ fn parse_args() -> Result<Args> {
             "--block-driver" => {
                 block_driver = iter.next().context("--block-driver needs a value")?
             }
+            "--kata-config" => {
+                kata_config = Some(PathBuf::from(iter.next().context("--kata-config needs a value")?))
+            }
             "--disable-guest-empty-dir" => disable_guest_empty_dir = true,
             other => bail!("unknown argument: {other}"),
         }
@@ -470,7 +473,40 @@ fn parse_args() -> Result<Args> {
         emptydir_mode,
         block_driver,
         disable_guest_empty_dir,
+        kata_config,
     })
+}
+
+/// Extracts the active hypervisor config and empty-dir runtime settings from a
+/// parsed Kata `configuration.toml`.
+fn resolve_from_toml(toml: &TomlConfig) -> (HypervisorConfig, String, bool) {
+    let config = toml
+        .hypervisor
+        .get(&toml.runtime.hypervisor_name)
+        .cloned()
+        .unwrap_or_default();
+    let emptydir_mode = if toml.runtime.emptydir_mode.is_empty() {
+        "shared-fs".to_string()
+    } else {
+        toml.runtime.emptydir_mode.clone()
+    };
+    (config, emptydir_mode, toml.runtime.disable_guest_empty_dir)
+}
+
+/// Resolves the hypervisor config and empty-dir settings from `--kata-config`
+/// (authoritative) or, failing that, the individual profile-sourced args.
+fn resolve_runtime_config(args: &Args) -> Result<(HypervisorConfig, String, bool)> {
+    if let Some(path) = &args.kata_config {
+        // Raw load: parse the config values without `adjust_config`, which would
+        // validate hypervisor binary paths that are absent in the clean room.
+        let (toml, _) = TomlConfig::load_raw_from_file(path)
+            .with_context(|| format!("load kata config {}", path.display()))?;
+        Ok(resolve_from_toml(&toml))
+    } else {
+        let mut config = HypervisorConfig::default();
+        config.blockdev_info.block_device_driver = args.block_driver.clone();
+        Ok((config, args.emptydir_mode.clone(), args.disable_guest_empty_dir))
+    }
 }
 
 /// Serializable mirror of `agent::types::FSGroup` (the source type is not
@@ -552,14 +588,17 @@ async fn main() -> Result<()> {
     let mut spec: oci_spec::runtime::Spec =
         serde_json::from_str(&spec_text).context("parse OCI config.json")?;
 
+    let (hypervisor_config, emptydir_mode, disable_guest_empty_dir) =
+        resolve_runtime_config(&args)?;
+
     // Reproduce the shim's mount-type rewriting. This inspects live host mount
     // state (mountinfo / stat), so it is only authoritative while the workload's
     // host volume mounts are still present.
-    update_ephemeral_storage_type(&mut spec, args.disable_guest_empty_dir, &args.emptydir_mode);
+    update_ephemeral_storage_type(&mut spec, disable_guest_empty_dir, &emptydir_mode);
 
     // Real DeviceManager, backed by a dry-run hypervisor: no VM is created.
     let hv: Arc<dyn Hypervisor> = Arc::new(DryRunHypervisor {
-        block_driver: args.block_driver.clone(),
+        config: hypervisor_config,
     });
     let device_manager = RwLock::new(DeviceManager::new(hv, None).await?);
 
@@ -574,7 +613,7 @@ async fn main() -> Result<()> {
         d: &device_manager,
         sid: &args.sid,
         agent,
-        emptydir_mode: &args.emptydir_mode,
+        emptydir_mode: &emptydir_mode,
     };
 
     let volume_resource = VolumeResource::new();
@@ -597,7 +636,7 @@ async fn main() -> Result<()> {
         schema_version: 1,
         sandbox_id: args.sid,
         container_id: args.cid,
-        emptydir_mode: args.emptydir_mode,
+        emptydir_mode,
         volumes: predicted_volumes,
     };
 
@@ -647,10 +686,40 @@ mod tests {
     // The profile-sourced block driver flows into the hypervisor config.
     #[tokio::test]
     async fn hypervisor_config_uses_profile_block_driver() {
-        let hv = DryRunHypervisor {
-            block_driver: "virtio-blk-mmio".to_string(),
-        };
+        let mut config = HypervisorConfig::default();
+        config.blockdev_info.block_device_driver = "virtio-blk-mmio".to_string();
+        let hv = DryRunHypervisor { config };
         let config = hv.hypervisor_config().await;
         assert_eq!(config.blockdev_info.block_device_driver, "virtio-blk-mmio");
+    }
+
+    // A Kata configuration.toml sources the active hypervisor config and the
+    // empty-dir runtime settings.
+    #[test]
+    fn kata_config_sources_hypervisor_and_runtime() {
+        let dir = std::env::temp_dir().join(format!("gp-kata-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("configuration.toml");
+        std::fs::write(
+            &path,
+            r#"
+[hypervisor.qemu]
+block_device_driver = "virtio-blk-mmio"
+
+[runtime]
+hypervisor_name = "qemu"
+emptydir_mode = "block-encrypted"
+disable_guest_empty_dir = true
+"#,
+        )
+        .unwrap();
+
+        let (toml, _) = TomlConfig::load_raw_from_file(&path).unwrap();
+        let (config, emptydir_mode, disable) = resolve_from_toml(&toml);
+        assert_eq!(config.blockdev_info.block_device_driver, "virtio-blk-mmio");
+        assert_eq!(emptydir_mode, "block-encrypted");
+        assert!(disable);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
