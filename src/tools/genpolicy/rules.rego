@@ -1237,9 +1237,12 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
     # EROFS multi-layer rootfs storages are allowed by dedicated clauses below
     # (upper by shape, lower pinned by dm-verity root hash), not by p_storages.
     erofs_ml_count := count([s | s := i_storages[_]; "X-kata.multi-layer=true" in s.options])
-    print("allow_storages: p_count =", p_count, "i_count =", i_count, "img_pull_count =", img_pull_count, "erofs_ml_count =", erofs_ml_count)
+    # Single-layer verity block rootfs is likewise allowed by a dedicated clause
+    # (pinned by its dm-verity root hash), not by p_storages.
+    verity_rootfs_count := count([s | s := i_storages[_]; "X-kata.dmverity-enabled=true" in s.options; not "X-kata.multi-layer=true" in s.options])
+    print("allow_storages: p_count =", p_count, "i_count =", i_count, "img_pull_count =", img_pull_count, "erofs_ml_count =", erofs_ml_count, "verity_rootfs_count =", verity_rootfs_count)
 
-    p_count == i_count - img_pull_count - erofs_ml_count
+    p_count == i_count - img_pull_count - erofs_ml_count - verity_rootfs_count
 
     every i_storage in i_storages {
         allow_storage(p_storages, i_storage, bundle_id, sandbox_id)
@@ -1330,6 +1333,21 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     concat("", ["X-kata.dmverity.roothash=", roothash]) in i_storage.options
 
     print("allow_storage erofs multi-layer lower: true")
+}
+# Single-layer dm-verity block rootfs: one verity-protected block device mounted
+# read-only as the container rootfs (BlockRootfs), pinned by its dm-verity root
+# hash against the pod's allowlist. Distinguished from an EROFS lower layer by
+# the absence of the multi-layer marker.
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+    print("allow_storage single-layer dm-verity: start")
+
+    "X-kata.dmverity-enabled=true" in i_storage.options
+    not "X-kata.multi-layer=true" in i_storage.options
+
+    some roothash in policy_data.dmverity.allowed_roothashes
+    concat("", ["X-kata.dmverity.roothash=", roothash]) in i_storage.options
+
+    print("allow_storage single-layer dm-verity: true")
 }
 
 # Validates all storage fields except driver and source.

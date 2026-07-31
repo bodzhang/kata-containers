@@ -70,15 +70,33 @@ the **authoritative** storage shape rather than reimplementing the shim (as lega
 `genpolicy` does), so the generated policy matches the real runtime-rs
 `CreateContainerRequest`.
 
-### Rootfs: EROFS dm-verity pinning
+### Rootfs: dm-verity pinning (erofs multi-layer and single-layer block)
 
-The compiler collects the union of the multi-layer erofs **lower**-layer
-dm-verity root hashes into `policy_data.dmverity.allowed_roothashes`. A coverage
-gate fails generation if any erofs lower layer lacks a root hash (it would fail
-closed at runtime). `rules.rego` then pins each read-only lower layer to an
-allowlisted hash, while the writable `ext4` upper is allowed by shape. Legacy
-`genpolicy` emits no rootfs storages at all, so erofs containers fail closed
-under it — this is a capability the drive adds.
+The compiler collects the union of dm-verity **root hashes** into
+`policy_data.dmverity.allowed_roothashes`, covering two rootfs shapes:
+
+- **multi-layer erofs**: each read-only **lower** layer is pinned by its root
+  hash; the writable `ext4` upper is allowed by shape.
+- **single-layer block**: one verity-protected block device mounted read-only as
+  the container rootfs (`BlockRootfs`), pinned by its root hash. It is
+  distinguished from an erofs lower by the absence of the `X-kata.multi-layer`
+  marker, and allowed by a dedicated `rules.rego` clause.
+
+A coverage gate fails generation if any dm-verity-enabled rootfs storage lacks a
+root hash (it would fail closed at runtime). Both shapes are counted out of the
+`allow_storages` balance (like guest pull) since they are validated by dedicated
+clauses rather than `p_storages`. Legacy `genpolicy` emits no rootfs storages at
+all, so verity-protected containers fail closed under it — this is a capability
+the drive adds.
+
+The single-layer path reuses the shim's own dm-verity translation
+(`kata_types::gpt_disk::extract_dmverity_annotation` /
+`parse_dmverity_metadata_file` / `generate_dmverity_options`): `BlockRootfs` now
+honors the `X-containerd.dmverity` mount annotation and emits the same
+`X-kata.dmverity.*` storage options the erofs path does, so the predictor
+reproduces it with no VM (see the `dry_run_single_layer_dmverity_emits_roothash`
+test).
+
 
 ### Image references must be digest-pinned
 
@@ -374,14 +392,20 @@ For a `virtio-blk-pci` deployment the erofs transform hits the `pci_path` gap an
 `rootfs.error` field (see `erofs_pci_driver_surfaces_error`) so the container's
 volume prediction is never dropped.
 
-### Single-layer block / dm-verity rootfs — needs a real block device
+### Single-layer block / dm-verity rootfs — implemented
 
 For a single-layer host-prepared block rootfs, `BlockRootfs::new`
-(`resource/src/rootfs/block_rootfs.rs`) runs the same device flow, but
-`is_block_rootfs` inspects a **real** block device to detect the layer and derive
-its `dev_id`, so this single-layer path is snapshotter/e2e-only rather than an
-offline unit test. The multi-layer erofs path above is preferred because its
-detection keys on `fs_type` (`ext4`/`erofs`) rather than a live block device.
+(`resource/src/rootfs/block_rootfs.rs`) runs the same device flow. `BlockRootfs`
+now honors the `X-containerd.dmverity` mount annotation and translates it into
+the `X-kata.dmverity.*` storage options via the shared
+`kata_types::gpt_disk` helpers (the same ones the multi-layer erofs path uses),
+so a single verity-protected block image is pinned by its root hash exactly like
+an erofs lower layer. `is_block_rootfs` needs a **real** source that stats as a
+block device (`S_IFBLK`) or a loop-backed regular file (`S_IFREG` + the `loop`
+option); the predictor test uses the loop-file form so the whole path runs with
+no VM (`dry_run_single_layer_dmverity_emits_roothash`). Use `virtio-blk-mmio`
+(the `mmioblk` driver, deterministic `/dev/vdX` source) to avoid the
+`virtio-blk-pci` `pci_path` gap noted below.
 
 **Known dry-run gaps for the block/erofs device paths:**
 

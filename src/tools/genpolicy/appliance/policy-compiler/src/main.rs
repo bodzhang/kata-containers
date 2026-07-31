@@ -1030,10 +1030,12 @@ fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Collects the union of EROFS dm-verity root hashes from a predicted-storages
-/// report (produced by the storage-predictor). Coverage gate: every EROFS lower
-/// layer must carry a dm-verity root hash, otherwise the generated policy would
-/// deny that container at runtime — so fail generation instead.
+/// Collects the union of dm-verity root hashes from a predicted-storages report
+/// (produced by the storage-predictor), covering both multi-layer EROFS lower
+/// layers and single-layer verity block rootfs storages. Coverage gate: every
+/// verity-protected rootfs storage must carry a root hash, otherwise the
+/// generated policy would deny that container at runtime — so fail generation
+/// instead.
 fn collect_dmverity_roothashes(path: &Path) -> Result<DmVerityData> {
     let report: Value = serde_json::from_str(&fs::read_to_string(path)?)
         .with_context(|| format!("parse predicted storages {}", path.display()))?;
@@ -1057,26 +1059,30 @@ fn collect_dmverity_roothashes(path: &Path) -> Result<DmVerityData> {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
-            let is_erofs_lower = storage.get("fs_type").and_then(Value::as_str) == Some("erofs")
-                && options.contains(&"X-kata.multi-layer=true")
-                && options.contains(&"X-kata.overlay-lower");
-            if !is_erofs_lower {
-                continue;
-            }
             let roothash = options
                 .iter()
                 .find_map(|o| o.strip_prefix("X-kata.dmverity.roothash="));
+            // A dm-verity-protected rootfs storage: either a multi-layer erofs
+            // lower layer, or a single-layer verity block rootfs (BlockRootfs),
+            // both identified by the guest-facing `X-kata.dmverity.*` options.
+            let is_erofs_lower = storage.get("fs_type").and_then(Value::as_str) == Some("erofs")
+                && options.contains(&"X-kata.multi-layer=true")
+                && options.contains(&"X-kata.overlay-lower");
+            let verity_enabled = options.contains(&"X-kata.dmverity-enabled=true");
             match roothash {
                 Some(hash) => {
                     roots.insert(hash.to_string());
                 }
-                None => bail!(
-                    "container {} has an EROFS lower layer without a dm-verity root hash; \
+                // Coverage gate: a verity rootfs without a root hash would fail
+                // closed at runtime, so refuse to generate the policy.
+                None if verity_enabled || is_erofs_lower => bail!(
+                    "container {} has a dm-verity rootfs without a root hash; \
                      the generated policy would fail closed",
                     pred.get("container_id")
                         .and_then(Value::as_str)
                         .unwrap_or("?")
                 ),
+                None => {}
             }
         }
     }
@@ -1353,6 +1359,43 @@ mod tests {
         let path = write_report(&dir, "predicted.json", report);
         let dmv = collect_dmverity_roothashes(&path).unwrap();
         assert!(dmv.allowed_roothashes.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dmverity_roothash_collected_from_single_layer_block() {
+        let dir = std::env::temp_dir().join(format!("gp-dmv-slv-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let report = json!({
+            "predictions": [{
+                "container_id": "c1",
+                "rootfs": {"storages": [{
+                    "fs_type": "ext4", "driver": "mmioblk", "source": "/dev/vda",
+                    "options": ["ro", "X-kata.dmverity-enabled=true", "X-kata.dmverity.roothash=cafe1234"]
+                }]}
+            }]
+        });
+        let path = write_report(&dir, "predicted.json", report);
+        let dmv = collect_dmverity_roothashes(&path).unwrap();
+        assert_eq!(dmv.allowed_roothashes, vec!["cafe1234".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dmverity_coverage_gate_rejects_unpinned_single_layer_block() {
+        let dir = std::env::temp_dir().join(format!("gp-dmv-slv-gate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let report = json!({
+            "predictions": [{
+                "container_id": "c1",
+                "rootfs": {"storages": [{
+                    "fs_type": "ext4", "driver": "mmioblk",
+                    "options": ["ro", "X-kata.dmverity-enabled=true"]
+                }]}
+            }]
+        });
+        let path = write_report(&dir, "predicted.json", report);
+        assert!(collect_dmverity_roothashes(&path).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -19,9 +19,14 @@ use hypervisor::{
 };
 use kata_types::config::hypervisor::VIRTIO_PMEM;
 use kata_types::fs::VM_ROOTFS_FILESYSTEM_XFS;
+use kata_types::gpt_disk::{
+    extract_dmverity_annotation, generate_dmverity_options, parse_dmverity_metadata_file,
+    X_CONTAINERD_DMVERITY,
+};
 use kata_types::mount::Mount;
 use nix::sys::stat::{self, SFlag};
 use oci_spec::runtime as oci;
+use std::collections::HashMap;
 use std::fs;
 use tokio::sync::RwLock;
 
@@ -84,6 +89,26 @@ impl BlockRootfs {
             if !storage.options.iter().any(|opt| opt == "nouuid") {
                 storage.options.push("nouuid".to_string());
             }
+        }
+
+        // Single-layer dm-verity rootfs: if the mount carries an
+        // X-containerd.dmverity annotation, translate it into the
+        // X-kata.dmverity.* storage options the guest agent uses to set up
+        // dm-verity, using the same mechanism as the multi-layer erofs path.
+        let options_map: HashMap<String, String> = rootfs
+            .options
+            .iter()
+            .filter_map(|opt| opt.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect();
+        if let Some(dmverity_path) = extract_dmverity_annotation(&options_map) {
+            let metadata = parse_dmverity_metadata_file(dmverity_path)
+                .context("failed to parse dm-verity metadata for block rootfs")?;
+            let dmverity_opts = generate_dmverity_options(&metadata, Some(&rootfs.source));
+            // Drop the host-side annotation; keep only the guest-facing options.
+            storage
+                .options
+                .retain(|o| o.split_once('=').map(|(k, _)| k) != Some(X_CONTAINERD_DMVERITY));
+            storage.options.extend(dmverity_opts);
         }
 
         let mut device_id: String = "".to_owned();

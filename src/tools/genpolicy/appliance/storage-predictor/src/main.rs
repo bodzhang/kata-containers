@@ -1034,6 +1034,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A single-layer verity-protected block rootfs (one loop-backed image with an
+    // `X-containerd.dmverity` annotation) yields one Agent Storage carrying the
+    // dm-verity root hash, through the upstream BlockRootfs path — no VM.
+    #[tokio::test]
+    async fn dry_run_single_layer_dmverity_emits_roothash() {
+        let dir = std::env::temp_dir().join(format!("gp-slv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("rootfs.img");
+        std::fs::write(&image, vec![0u8; 1 << 20]).unwrap();
+        let meta = dir.join("rootfs.img.dmverity");
+        std::fs::write(
+            &meta,
+            serde_json::json!({ "roothash": "cafe1234", "hashoffset": 4096u64 }).to_string(),
+        )
+        .unwrap();
+
+        let mut config = HypervisorConfig::default();
+        config.blockdev_info.block_device_driver = "virtio-blk-mmio".to_string();
+        let hv: Arc<dyn Hypervisor> = Arc::new(DryRunHypervisor { config });
+        let device_manager = RwLock::new(DeviceManager::new(hv.clone(), None).await.unwrap());
+
+        // Loop-backed regular file so is_block_rootfs classifies it as a block rootfs.
+        let rootfs_mounts = vec![KataMount {
+            source: image.display().to_string(),
+            destination: PathBuf::from("/"),
+            fs_type: "ext4".to_string(),
+            options: vec![
+                "ro".to_string(),
+                "loop".to_string(),
+                format!("X-containerd.dmverity={}", meta.display()),
+            ],
+            ..Default::default()
+        }];
+
+        let share_fs: Option<Arc<dyn ShareFs>> = None;
+        let root = oci_spec::runtime::Root::default();
+        let annotations = HashMap::new();
+        let rootfs = RootFsResource::new()
+            .handler_rootfs(
+                &share_fs,
+                &None,
+                &device_manager,
+                hv.as_ref(),
+                "slv-sid",
+                "slv-cid",
+                &root,
+                "",
+                &rootfs_mounts,
+                &annotations,
+            )
+            .await
+            .unwrap();
+
+        let storages = rootfs.get_storage().await.unwrap();
+        assert_eq!(storages.len(), 1, "storages={:?}", storages);
+        let s = &storages[0];
+        assert_eq!(s.fs_type, "ext4");
+        assert_eq!(s.driver, "mmioblk");
+        assert!(
+            s.options.iter().any(|o| o == "X-kata.dmverity-enabled=true"),
+            "options={:?}",
+            s.options
+        );
+        assert!(
+            s.options.iter().any(|o| o == "X-kata.dmverity.roothash=cafe1234"),
+            "options={:?}",
+            s.options
+        );
+        // The host-side annotation must not leak into the guest storage.
+        assert!(
+            !s.options.iter().any(|o| o.starts_with("X-containerd.dmverity=")),
+            "options={:?}",
+            s.options
+        );
+        // Single layer: no multi-layer/overlay markers.
+        assert!(
+            !s.options.iter().any(|o| o == "X-kata.multi-layer=true"),
+            "options={:?}",
+            s.options
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // A virtio-blk-pci deployment hits the pci_path gap: the erofs transform
     // errors, and `predict_rootfs` surfaces that error (the caller captures it
     // into the `error` field rather than dropping the volume prediction).

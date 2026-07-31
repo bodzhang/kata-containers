@@ -55,7 +55,7 @@ const GPT_META_HEAD_IMG: &str = "gpt_meta_head.img";
 /// Temporary full GPT image used to synthesize head metadata
 const GPT_META_FULL_IMG: &str = "gpt_meta_full.img";
 /// Annotation key used by containerd to specify dm-verity metadata path
-const X_CONTAINERD_DMVERITY: &str = "X-containerd.dmverity";
+pub const X_CONTAINERD_DMVERITY: &str = "X-containerd.dmverity";
 /// dm-verity v1 superblock magic number: the ASCII string "verity" followed by two NUL bytes.
 const DM_VERITY_MAGIC: [u8; 8] = [0x76, 0x65, 0x72, 0x69, 0x74, 0x79, 0x00, 0x00];
 /// dm-verity superblock version that we support
