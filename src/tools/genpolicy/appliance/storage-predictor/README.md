@@ -98,11 +98,11 @@ Mitigation options (not yet implemented):
 - **Device-backed classes** (block, encrypted `emptyDir`, direct volumes): the
   dry-run hypervisor echoes devices and returns a default `hypervisor_config`, so
   the device manager assigns the deterministic guest path `/dev/vdX` with no VM
-  (proven by the `dry_run_block_device_gets_deterministic_virt_path` unit test).
-  Predictor-level prediction through `handler_volumes` is still e2e-only, because
-  `BlockVolume::new` `stat`s the real host block device and direct volumes read
-  host mount-info metadata. The full `blockdev_info` (driver, aio, queues, sector
-  sizes) plus `emptydir_mode`/`disable_guest_empty_dir` are sourced from the
+  (as exercised by the erofs rootfs device tests). Predictor-level prediction
+  through `handler_volumes` is still e2e-only, because `BlockVolume::new` `stat`s
+  the real host block device and direct volumes read host mount-info metadata. The
+  full `blockdev_info` (driver, aio, queues, sector sizes) and `emptydir_mode` are
+  sourced from the
   deployment's Kata `configuration.toml` when `--kata-config` is given; otherwise
   the block driver falls back to `--block-driver` / `GENPOLICY_BLOCK_DRIVER`.
 - Only per-volume `device_id` is emitted, not full `agent::Device` objects; the
@@ -127,8 +127,8 @@ Mitigation options (not yet implemented):
   captured `rootfs_mounts` artifact (`--rootfs-mounts`); the snapshotter capture
   stage that produces the artifact, plus the guest-pull and single-layer block
   paths, remain. See **Rootfs prediction (design)** below.
-- Config sourcing: `emptydir_mode`, `disable_guest_empty_dir`, and the full
-  hypervisor `blockdev_info` come from the deployment's Kata `configuration.toml`
+- Config sourcing: `emptydir_mode` and the full hypervisor `blockdev_info` come
+  from the deployment's Kata `configuration.toml`
   via `--kata-config` (`GENPOLICY_KATA_CONFIG`), loaded raw (no hypervisor-binary
   validation); otherwise `emptydir_mode` and the block driver are profile-sourced
   from `profile.env`. `pci_path` is not reconstructed (acceptable for virtio-blk,
@@ -175,7 +175,8 @@ increment.
 
 The predictor consumes a snapshotter-captured `rootfs_mounts` artifact via
 `--rootfs-mounts <file>` (a JSON array of `kata_types::mount::Mount`). A
-multi-layer erofs artifact (an `ext4` `rw` upper layer + an `erofs` lower layer)
+multi-layer erofs artifact (an `ext4` `rw` upper layer, an `erofs` lower layer,
+and an `overlay` mount)
 is routed by `handler_rootfs` to `ErofsMultiLayerRootfs`, which — like the block
 path — runs `do_handle_device` for each layer. Under the dry-run device manager
 each layer gets a deterministic `/dev/vdX` guest path with **no VM**, and
@@ -273,9 +274,10 @@ detection keys on `fs_type` (`ext4`/`erofs`) rather than a live block device.
   `add_device` echo leaves `pci_path = None`, so that driver needs the hypervisor's
   PCI-topology assignment reproduced. Use `virtio-blk-mmio` (the `mmioblk` driver),
   whose Agent source is the deterministic `virt_path` (`/dev/vdX`).
-- `ErofsMultiLayerRootfs::new` stats each erofs source file
-  (`generate_merged_erofs_vmdk`) and creates a host rootfs directory (side effect),
-  so the captured artifact's `source` paths must exist when the predictor runs.
+- `ErofsMultiLayerRootfs::new` stats each erofs source file (`get_erofs_layer_size`
+  in GPT mode, `generate_merged_erofs_vmdk` in fsmerge mode) and creates a host
+  rootfs directory (side effect), so the captured artifact's `source` paths must
+  exist when the predictor runs.
 - The snapshotter needs kernel support (erofs / dm-verity) and the plugin present
   in the appliance image.
 
