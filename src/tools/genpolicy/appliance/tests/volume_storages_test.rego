@@ -10,7 +10,10 @@ package agent_policy
 # json.unmarshal so rules.rego's other policy_data.* refs type-check) and
 # override it per-test with `with`. common.cpath mirrors genpolicy-settings.json.
 policy_data := json.unmarshal(`{
-	"common": {"cpath": "/run/kata-containers/shared/containers(?:/passthrough)?"},
+	"common": {
+		"cpath": "/run/kata-containers/shared/containers(?:/passthrough)?",
+		"sfprefix": "^$(cpath)/(watchable/)?$(bundle-id)-[a-z0-9]{16}-"
+	},
 	"dmverity": {"allowed_roothashes": []}
 }`)
 
@@ -49,6 +52,47 @@ local_policy(file) := {
 	"fstype": "local", "fs_group": null, "shared": false,
 	"options": ["mode=0777"],
 	"mount_point": concat("", ["^$(cpath)/$(sandbox-id)/rootfs/local/", file, "$"]),
+}
+
+# Runtime i_storage for a watchable configMap/secret bind, as produced by the
+# shim's virtio_fs_share_mount handler. The shared file is named
+# "sandbox-<8 hex>-<name>" (a random UUID segment).
+watchable_runtime(name) := {
+	"driver": "watchable-bind", "driver_options": [], "fstype": "bind",
+	"fs_group": null, "shared": false, "options": ["ro"],
+	"source": concat("", [
+		"/run/kata-containers/shared/containers/passthrough/sandbox-86d776af-", name,
+	]),
+	"mount_point": concat("", [
+		"/run/kata-containers/shared/containers/passthrough/watchable/sandbox-86d776af-", name,
+	]),
+}
+
+# Templated p_storage the compiler emits: the 8-hex hash is a wildcard, the name
+# is pinned. source matches allow_storage_source clause 2, mount_point the bind
+# allow_mount_point clause (both substitute $(cpath)).
+watchable_policy(name) := {
+	"driver": "watchable-bind", "driver_options": [], "fstype": "bind",
+	"fs_group": null, "shared": false, "options": ["ro"],
+	"source": concat("", ["^$(cpath)/sandbox-[0-9a-f]{8}-", name, "$"]),
+	"mount_point": concat("", ["^$(cpath)/watchable/sandbox-[0-9a-f]{8}-", name, "$"]),
+}
+
+# Runtime i_storage for a hugepage-backed emptyDir (hugetlbfs), guest-local under
+# the ephemeral path.
+hugepage_runtime(file) := {
+	"driver": "ephemeral", "driver_options": [], "source": "nodev",
+	"fstype": "hugetlbfs", "fs_group": null, "shared": false,
+	"options": ["pagesize=2097152,size=524288000"],
+	"mount_point": concat("", ["/run/kata-containers/sandbox/ephemeral/", file]),
+}
+
+# Templated p_storage the compiler emits for that hugepage volume.
+hugepage_policy(file) := {
+	"driver": "ephemeral", "driver_options": [], "source": "nodev",
+	"fstype": "hugetlbfs", "fs_group": null, "shared": false,
+	"options": ["pagesize=2097152,size=524288000"],
+	"mount_point": concat("", ["^/run/kata-containers/sandbox/ephemeral/", file, "$"]),
 }
 
 # An ephemeral volume storage is admitted when its templated p_storage matches.
@@ -98,6 +142,43 @@ test_mixed_volume_storages_allowed if {
 	allow_storages(
 		[ephemeral_policy("cache-volume"), local_policy("data-volume")],
 		[ephemeral_runtime("cache-volume"), local_runtime("data-volume")],
+		"bid", sandbox_id,
+	)
+}
+
+# A watchable configMap/secret bind is admitted; the random hash is wildcarded
+# and the name pinned via $(cpath) substitution.
+test_watchable_bind_storage_allowed if {
+	allow_storages(
+		[watchable_policy("myconfig")],
+		[watchable_runtime("myconfig")],
+		"bid", sandbox_id,
+	)
+}
+
+# The watchable name is pinned: a different configMap name is rejected.
+test_watchable_bind_wrong_name_denied if {
+	not allow_storages(
+		[watchable_policy("myconfig")],
+		[watchable_runtime("othermap")],
+		"bid", sandbox_id,
+	)
+}
+
+# A hugepage-backed emptyDir (hugetlbfs) is admitted by the new clause.
+test_hugepage_storage_allowed if {
+	allow_storages(
+		[hugepage_policy("hugepage-vol")],
+		[hugepage_runtime("hugepage-vol")],
+		"bid", sandbox_id,
+	)
+}
+
+# The hugepage mount path is pinned: a different file is rejected.
+test_hugepage_storage_wrong_file_denied if {
+	not allow_storages(
+		[hugepage_policy("hugepage-vol")],
+		[hugepage_runtime("other-vol")],
 		"bid", sandbox_id,
 	)
 }

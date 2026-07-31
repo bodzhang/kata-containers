@@ -1082,44 +1082,84 @@ fn template_volume_storage(storage: &Value) -> Result<Option<agent::Storage>> {
             .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
             .unwrap_or_default()
     };
+    let driver = field("driver");
     let fs_type = field("fs_type");
     let mount_point = field("mount_point");
+    let source = field("source");
 
-    let templated_mount_point = match fs_type {
-        // ephemeral emptyDir (tmpfs): /run/kata-containers/sandbox/ephemeral/<file>.
-        // The path carries no sandbox/bundle id, so anchor the escaped literal;
-        // the rules.rego `tmpfs` allow_mount_point clause matches it verbatim.
-        "tmpfs" => format!("^{}$", regex::escape(mount_point)),
-        // local emptyDir: $(cpath)/<sandbox-id>/rootfs/local/<file>. Template the
-        // shared-path prefix and sandbox id so the `local` allow_mount_point
-        // clause substitutes them, and pin the escaped file name.
-        "local" => {
-            let file = Path::new(mount_point)
-                .file_name()
-                .ok_or_else(|| {
-                    anyhow!("local storage mount_point {mount_point} has no file name")
-                })?
-                .to_string_lossy();
-            format!(
-                "^$(cpath)/$(sandbox-id)/rootfs/local/{}$",
-                regex::escape(&file)
-            )
-        }
-        _ => return Ok(None),
+    let (templated_source, templated_mount_point) = if driver == "watchable-bind" {
+        // configMap/secret/projected/downwardAPI watchable bind. runtime-rs names
+        // the shared file "sandbox-<8 hex>-<name>" via a random UUID segment
+        // (share_fs_volume::generate_mount_path), so the hash cannot be pinned:
+        // match it with a [0-9a-f]{8} wildcard and pin the escaped name.
+        //   source:      $(cpath)/sandbox-<hash>-<name>
+        //   mount_point: $(cpath)/watchable/sandbox-<hash>-<name>
+        // NB: this is deliberately NOT $(sfprefix). That legacy prefix is
+        // "<bundle-id>-[a-z0-9]{16}-", a different scheme that never matches the
+        // runtime-rs watchable path, so the predictor drives the real shape.
+        let Some(name) = watchable_shared_name(source) else {
+            return Ok(None);
+        };
+        let escaped = regex::escape(&name);
+        (
+            format!("^$(cpath)/sandbox-[0-9a-f]{{8}}-{escaped}$"),
+            format!("^$(cpath)/watchable/sandbox-[0-9a-f]{{8}}-{escaped}$"),
+        )
+    } else {
+        let mp = match fs_type {
+            // ephemeral tmpfs and hugepage (hugetlbfs) both mount under
+            // /run/kata-containers/sandbox/ephemeral/<file> with no sandbox/bundle
+            // id, so anchor the escaped literal path. tmpfs matches the existing
+            // `tmpfs` allow_mount_point clause; hugetlbfs matches the new one.
+            "tmpfs" | "hugetlbfs" => format!("^{}$", regex::escape(mount_point)),
+            // local emptyDir: $(cpath)/<sandbox-id>/rootfs/local/<file>. Template
+            // the shared-path prefix and sandbox id so the `local`
+            // allow_mount_point clause substitutes them, and pin the escaped file.
+            "local" => {
+                let file = Path::new(mount_point)
+                    .file_name()
+                    .ok_or_else(|| {
+                        anyhow!("local storage mount_point {mount_point} has no file name")
+                    })?
+                    .to_string_lossy();
+                format!(
+                    "^$(cpath)/$(sandbox-id)/rootfs/local/{}$",
+                    regex::escape(&file)
+                )
+            }
+            _ => return Ok(None),
+        };
+        // local/ephemeral/hugepage sources are the constants "local"/"tmpfs"/
+        // "nodev", matched by allow_storage_source's equality clause, so they
+        // need no templating.
+        (source.to_string(), mp)
     };
 
     Ok(Some(agent::Storage {
-        driver: field("driver").to_string(),
+        driver: driver.to_string(),
         driver_options: string_list("driver_options"),
-        // local/ephemeral sources are the constants "local"/"tmpfs", matched by
-        // allow_storage_source's equality clause, so they need no templating.
-        source: field("source").to_string(),
+        source: templated_source,
         fstype: fs_type.to_string(),
         options: string_list("options"),
         mount_point: templated_mount_point,
         shared: storage.get("shared").and_then(Value::as_bool).unwrap_or(false),
         ..Default::default()
     }))
+}
+
+/// Extracts the volume <name> from a runtime-rs watchable shared-path component
+/// "sandbox-<8 hex>-<name>" (share_fs_volume::generate_mount_path). Returns None
+/// if the component does not match the expected shape, so the caller skips it
+/// rather than emit a wrong (fail-closed) storage.
+fn watchable_shared_name(source: &str) -> Option<String> {
+    let component = Path::new(source).file_name()?.to_str()?;
+    let name = component.strip_prefix("sandbox-")?;
+    let (hash, rest) = name.split_once('-')?;
+    if hash.len() == 8 && hash.bytes().all(|b| b.is_ascii_hexdigit()) && !rest.is_empty() {
+        Some(rest.to_string())
+    } else {
+        None
+    }
 }
 
 /// Reads the predicted-storages report and templates each container's volume
@@ -1274,9 +1314,59 @@ mod tests {
     #[test]
     fn unsupported_storage_class_is_skipped() {
         let storage = json!({
-            "driver": "ephemeral", "source": "nodev", "fs_type": "hugetlbfs",
-            "options": ["pagesize=2M,size=100Mi"], "shared": false,
-            "mount_point": "/dev/hugepages"
+            "driver": "blk", "source": "01", "fs_type": "xfs",
+            "options": [], "shared": false,
+            "mount_point": "/run/kata-containers/foo"
+        });
+        assert!(template_volume_storage(&storage).unwrap().is_none());
+    }
+
+    #[test]
+    fn hugepage_storage_templated_to_anchored_path() {
+        let storage = json!({
+            "driver": "ephemeral", "driver_options": [], "source": "nodev",
+            "fs_type": "hugetlbfs", "shared": false,
+            "options": ["pagesize=2097152,size=524288000"],
+            "mount_point": "/run/kata-containers/sandbox/ephemeral/hugepage-vol"
+        });
+        let templated = template_volume_storage(&storage).unwrap().unwrap();
+        assert_eq!(templated.source, "nodev");
+        assert_eq!(templated.fstype, "hugetlbfs");
+        assert_eq!(
+            templated.mount_point,
+            "^/run/kata\\-containers/sandbox/ephemeral/hugepage\\-vol$"
+        );
+        assert_eq!(templated.options, vec!["pagesize=2097152,size=524288000".to_string()]);
+    }
+
+    #[test]
+    fn watchable_bind_templated_with_hash_wildcard() {
+        let storage = json!({
+            "driver": "watchable-bind", "driver_options": [], "fs_type": "bind",
+            "shared": false, "options": ["ro"],
+            "source": "/run/kata-containers/shared/containers/passthrough/sandbox-86d776af-my-cm",
+            "mount_point":
+                "/run/kata-containers/shared/containers/passthrough/watchable/sandbox-86d776af-my-cm"
+        });
+        let templated = template_volume_storage(&storage).unwrap().unwrap();
+        assert_eq!(templated.driver, "watchable-bind");
+        // The 8-hex hash becomes a wildcard; the escaped name is pinned.
+        assert_eq!(
+            templated.source,
+            "^$(cpath)/sandbox-[0-9a-f]{8}-my\\-cm$"
+        );
+        assert_eq!(
+            templated.mount_point,
+            "^$(cpath)/watchable/sandbox-[0-9a-f]{8}-my\\-cm$"
+        );
+    }
+
+    #[test]
+    fn watchable_bind_unexpected_shape_is_skipped() {
+        let storage = json!({
+            "driver": "watchable-bind", "fs_type": "bind", "options": [],
+            "source": "/run/kata-containers/shared/containers/passthrough/not-the-expected-shape",
+            "mount_point": "/run/kata-containers/shared/containers/passthrough/watchable/x"
         });
         assert!(template_volume_storage(&storage).unwrap().is_none());
     }
@@ -1296,16 +1386,16 @@ mod tests {
                         "mount_point": "/run/kata-containers/sandbox/ephemeral/cache"
                     }]},
                     {"storages": [{
-                        "driver": "ephemeral", "source": "nodev", "fs_type": "hugetlbfs",
-                        "options": ["pagesize=2M,size=100Mi"], "shared": false,
-                        "mount_point": "/dev/hugepages"
+                        "driver": "blk", "source": "01", "fs_type": "xfs",
+                        "options": [], "shared": false,
+                        "mount_point": "/run/kata-containers/foo"
                     }]}
                 ]
             }]
         });
         let path = write_report(&dir, "predicted.json", report);
         let by_container = collect_volume_storages(&path).unwrap();
-        // The hugetlbfs storage is skipped; only the ephemeral one is templated.
+        // The unsupported xfs storage is skipped; only the ephemeral one is templated.
         assert_eq!(by_container["app"].len(), 1);
         assert_eq!(by_container["app"][0].fstype, "tmpfs");
         let _ = fs::remove_dir_all(&dir);

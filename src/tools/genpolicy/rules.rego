@@ -1428,6 +1428,21 @@ allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
 
     print("allow_mount_point 3: true")
 }
+# Hugepage-backed emptyDir: the agent mounts a guest-local hugetlbfs under
+# /run/kata-containers/sandbox/ephemeral/<file> (no sandbox/bundle id in the
+# path), so match the anchored mount point verbatim like tmpfs.
+allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
+    print("allow_mount_point hugetlbfs: start")
+
+    p_storage.fstype == "hugetlbfs"
+
+    mount1 := p_storage.mount_point
+    print("allow_mount_point hugetlbfs: mount1 =", mount1)
+
+    regex.match(mount1, i_storage.mount_point)
+
+    print("allow_mount_point hugetlbfs: true")
+}
 allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
     print("allow_mount_point 4: start")
 
