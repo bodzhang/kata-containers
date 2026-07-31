@@ -35,18 +35,22 @@ class PredictStoragesTests(unittest.TestCase):
 
             captured = {}
 
-            def fake_predict_one(predictor, config, cid, sid, emptydir_mode):
+            def fake_predict_one(predictor, config, cid, sid, emptydir_mode, block_driver):
                 captured["cid"] = cid
                 captured["sid"] = sid
                 captured["emptydir_mode"] = emptydir_mode
+                captured["block_driver"] = block_driver
                 return {"container_id": cid, "sandbox_id": sid, "volumes": []}
 
             with mock.patch.object(MODULE, "predict_one", fake_predict_one):
-                report = MODULE.collect(raw, "/usr/local/bin/storage-predictor", "shared-fs")
+                report = MODULE.collect(
+                    raw, "/usr/local/bin/storage-predictor", "shared-fs", "virtio-blk-pci"
+                )
 
             self.assertEqual(captured["cid"], "abc")
             self.assertEqual(captured["sid"], "sb-xyz")
             self.assertEqual(captured["emptydir_mode"], "shared-fs")
+            self.assertEqual(captured["block_driver"], "virtio-blk-pci")
             self.assertEqual(report["schema_version"], 1)
             self.assertEqual(len(report["predictions"]), 1)
 
@@ -58,11 +62,11 @@ class PredictStoragesTests(unittest.TestCase):
                 json.dumps({"container_id": "c"}), encoding="utf-8"
             )
 
-            def failing(predictor, config, cid, sid, emptydir_mode):
+            def failing(predictor, config, cid, sid, emptydir_mode, block_driver):
                 return {"container_id": cid, "sandbox_id": sid, "error": "boom"}
 
             with mock.patch.object(MODULE, "predict_one", failing):
-                report = MODULE.collect(raw, "predictor", "shared-fs")
+                report = MODULE.collect(raw, "predictor", "shared-fs", "virtio-blk-pci")
 
             self.assertEqual(report["predictions"][0]["error"], "boom")
 

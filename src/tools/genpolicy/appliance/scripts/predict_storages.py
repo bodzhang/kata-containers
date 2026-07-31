@@ -22,7 +22,12 @@ def sandbox_id(spec: dict) -> str:
 
 
 def predict_one(
-    predictor: str, config: Path, cid: str, sid: str, emptydir_mode: str
+    predictor: str,
+    config: Path,
+    cid: str,
+    sid: str,
+    emptydir_mode: str,
+    block_driver: str,
 ) -> dict:
     with tempfile.TemporaryDirectory() as temporary:
         output = Path(temporary) / "predicted.json"
@@ -39,6 +44,8 @@ def predict_one(
                 cid,
                 "--emptydir-mode",
                 emptydir_mode,
+                "--block-driver",
+                block_driver,
             ],
             capture_output=True,
             text=True,
@@ -53,7 +60,7 @@ def predict_one(
         return json.loads(output.read_text(encoding="utf-8"))
 
 
-def collect(raw_dir: Path, predictor: str, emptydir_mode: str) -> dict:
+def collect(raw_dir: Path, predictor: str, emptydir_mode: str, block_driver: str) -> dict:
     predictions = []
     for config in sorted(raw_dir.glob(f"*{CONFIG_SUFFIX}")):
         meta_path = config.with_name(config.name[: -len(CONFIG_SUFFIX)] + ".meta.json")
@@ -64,7 +71,9 @@ def collect(raw_dir: Path, predictor: str, emptydir_mode: str) -> dict:
         cid = meta.get("container_id", config.name[: -len(CONFIG_SUFFIX)])
         spec = json.loads(config.read_text(encoding="utf-8"))
         sid = sandbox_id(spec) or cid
-        predictions.append(predict_one(predictor, config, cid, sid, emptydir_mode))
+        predictions.append(
+            predict_one(predictor, config, cid, sid, emptydir_mode, block_driver)
+        )
     return {"schema_version": 1, "predictions": predictions}
 
 
@@ -74,9 +83,10 @@ def main() -> None:
     parser.add_argument("--predictor", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--emptydir-mode", default="shared-fs")
+    parser.add_argument("--block-driver", default="virtio-blk-pci")
     args = parser.parse_args()
 
-    report = collect(args.raw_dir, args.predictor, args.emptydir_mode)
+    report = collect(args.raw_dir, args.predictor, args.emptydir_mode, args.block_driver)
     args.output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

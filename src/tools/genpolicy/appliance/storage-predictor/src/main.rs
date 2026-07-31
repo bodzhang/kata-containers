@@ -42,8 +42,12 @@ use resource::volume::{VolumeContext, VolumeResource};
 /// invoked by the ephemeral/local storage transformation path; they exist only
 /// so `DeviceManager` can be constructed. `unimplemented!()` diverges, so every
 /// method type-checks regardless of its declared return type.
-#[derive(Debug)]
-struct DryRunHypervisor;
+#[derive(Debug, Default)]
+struct DryRunHypervisor {
+    // Block device driver from the pinned profile (e.g. virtio-blk-pci); the rest
+    // of the hypervisor config is Default.
+    block_driver: String,
+}
 
 #[async_trait]
 impl Hypervisor for DryRunHypervisor {
@@ -98,7 +102,9 @@ impl Hypervisor for DryRunHypervisor {
         unimplemented!()
     }
     async fn hypervisor_config(&self) -> HypervisorConfig {
-        HypervisorConfig::default()
+        let mut config = HypervisorConfig::default();
+        config.blockdev_info.block_device_driver = self.block_driver.clone();
+        config
     }
     async fn get_thread_ids(&self) -> Result<VcpuThreadIds> {
         unimplemented!()
@@ -425,6 +431,7 @@ struct Args {
     sid: String,
     cid: String,
     emptydir_mode: String,
+    block_driver: String,
     disable_guest_empty_dir: bool,
 }
 
@@ -434,6 +441,7 @@ fn parse_args() -> Result<Args> {
     let mut sid = "sandbox".to_string();
     let mut cid = "container".to_string();
     let mut emptydir_mode = "shared-fs".to_string();
+    let mut block_driver = "virtio-blk-pci".to_string();
     let mut disable_guest_empty_dir = false;
 
     let mut iter = std::env::args().skip(1);
@@ -446,6 +454,9 @@ fn parse_args() -> Result<Args> {
             "--emptydir-mode" => {
                 emptydir_mode = iter.next().context("--emptydir-mode needs a value")?
             }
+            "--block-driver" => {
+                block_driver = iter.next().context("--block-driver needs a value")?
+            }
             "--disable-guest-empty-dir" => disable_guest_empty_dir = true,
             other => bail!("unknown argument: {other}"),
         }
@@ -457,6 +468,7 @@ fn parse_args() -> Result<Args> {
         sid,
         cid,
         emptydir_mode,
+        block_driver,
         disable_guest_empty_dir,
     })
 }
@@ -546,7 +558,9 @@ async fn main() -> Result<()> {
     update_ephemeral_storage_type(&mut spec, args.disable_guest_empty_dir, &args.emptydir_mode);
 
     // Real DeviceManager, backed by a dry-run hypervisor: no VM is created.
-    let hv: Arc<dyn Hypervisor> = Arc::new(DryRunHypervisor);
+    let hv: Arc<dyn Hypervisor> = Arc::new(DryRunHypervisor {
+        block_driver: args.block_driver.clone(),
+    });
     let device_manager = RwLock::new(DeviceManager::new(hv, None).await?);
 
     // A stub ShareFs routes share-fs volumes (configmap/secret/projected/
@@ -611,7 +625,7 @@ mod tests {
     // block device through the dry-run hypervisor, with no VM booted.
     #[tokio::test]
     async fn dry_run_block_device_gets_deterministic_virt_path() {
-        let hv: Arc<dyn Hypervisor> = Arc::new(DryRunHypervisor);
+        let hv: Arc<dyn Hypervisor> = Arc::new(DryRunHypervisor::default());
         let device_manager = RwLock::new(DeviceManager::new(hv, None).await.unwrap());
 
         let block = BlockConfig {
@@ -628,5 +642,15 @@ mod tests {
             DeviceType::Block(block) => assert_eq!(block.config.virt_path, "/dev/vda"),
             _ => panic!("expected a block device"),
         }
+    }
+
+    // The profile-sourced block driver flows into the hypervisor config.
+    #[tokio::test]
+    async fn hypervisor_config_uses_profile_block_driver() {
+        let hv = DryRunHypervisor {
+            block_driver: "virtio-blk-mmio".to_string(),
+        };
+        let config = hv.hypervisor_config().await;
+        assert_eq!(config.blockdev_info.block_device_driver, "virtio-blk-mmio");
     }
 }
