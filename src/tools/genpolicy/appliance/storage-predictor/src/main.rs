@@ -11,13 +11,13 @@
 // host mount state, then runs `handler_volumes` and emits predicted storages.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::Serialize;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use hypervisor::device::device_manager::DeviceManager;
 use hypervisor::device::DeviceType;
@@ -31,7 +31,11 @@ use agent::{Agent, AgentManager, HealthService};
 use kata_types::config::Agent as AgentConfig;
 
 use kata_sys_util::k8s::update_ephemeral_storage_type;
-use resource::share_fs::ShareFs;
+use kata_types::k8s::is_watchable_mount;
+use resource::share_fs::{
+    do_get_guest_path, kata_guest_share_dir, MountedInfo, ShareFs, ShareFsMount,
+    ShareFsMountResult, ShareFsRootfsConfig, ShareFsVolumeConfig, PASSTHROUGH_FS_DIR,
+};
 use resource::volume::{VolumeContext, VolumeResource};
 
 /// A Hypervisor implementation that performs no VMM I/O. Its methods are never
@@ -293,6 +297,125 @@ impl Agent for StubAgent {
     }
 }
 
+// Constants mirrored from runtime-rs/crates/resource/src/share_fs/
+// virtio_fs_share_mount.rs (private there). Alignment risk: if upstream renames
+// these, update here. Verified against that file's `share_volume`.
+const WATCHABLE_PATH_NAME: &str = "watchable";
+const WATCHABLE_BIND_DEV_TYPE: &str = "watchable-bind";
+
+/// Reproduces `VirtiofsShareMount::share_volume`'s storage output for share-fs
+/// volumes without performing the real host bind mount. Guest paths come from the
+/// shim's own `do_get_guest_path`; watchable detection uses the shim's own
+/// `is_watchable_mount`. Only the two constants above are mirrored.
+struct StubShareFsMount;
+
+#[async_trait]
+impl ShareFsMount for StubShareFsMount {
+    async fn share_rootfs(&self, _config: &ShareFsRootfsConfig) -> Result<ShareFsMountResult> {
+        unimplemented!()
+    }
+
+    async fn share_volume(&self, config: &ShareFsVolumeConfig) -> Result<ShareFsMountResult> {
+        // Mirrors virtio_fs_share_mount.rs `share_volume`, minus side effects:
+        // reuse the shim's guest-path computation instead of `share_to_guest`,
+        // and skip the host `mkdir` of the watchable directory.
+        let guest_path = do_get_guest_path(&config.target, &config.cid, true, config.is_rafs);
+
+        if is_watchable_mount(&config.source) {
+            let file_name = Path::new(&guest_path)
+                .file_name()
+                .context("get file name from guest path")?;
+            let watchable_guest_mount = Path::new(kata_guest_share_dir().as_str())
+                .join(PASSTHROUGH_FS_DIR)
+                .join(WATCHABLE_PATH_NAME)
+                .join(file_name)
+                .into_os_string()
+                .into_string()
+                .map_err(|e| anyhow::anyhow!("watchable guest mount path {:?}", e))?;
+
+            let storage = Storage {
+                driver: WATCHABLE_BIND_DEV_TYPE.to_string(),
+                driver_options: Vec::new(),
+                source: guest_path,
+                fs_type: "bind".to_string(),
+                fs_group: None,
+                options: config.mount_options.clone(),
+                mount_point: watchable_guest_mount.clone(),
+                shared: false,
+            };
+            return Ok(ShareFsMountResult {
+                guest_path: watchable_guest_mount,
+                storages: vec![storage],
+            });
+        }
+
+        Ok(ShareFsMountResult {
+            guest_path,
+            storages: Vec::new(),
+        })
+    }
+
+    async fn upgrade_to_rw(&self, _file_name: &str) -> Result<()> {
+        unimplemented!()
+    }
+    async fn downgrade_to_ro(&self, _file_name: &str) -> Result<()> {
+        unimplemented!()
+    }
+    async fn umount_volume(&self, _file_name: &str) -> Result<()> {
+        unimplemented!()
+    }
+    async fn umount_rootfs(&self, _config: &ShareFsRootfsConfig) -> Result<()> {
+        unimplemented!()
+    }
+    async fn cleanup(&self, _sid: &str) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+/// Minimal `ShareFs` so `handler_volumes` takes the shared-fs path rather than
+/// the copy-to-rootfs fallback (which needs a real Agent). Only
+/// `get_share_fs_mount` and an empty `mounted_info_set` are exercised.
+struct StubShareFs {
+    mount: Arc<dyn ShareFsMount>,
+    mounted_info: Arc<Mutex<HashMap<String, MountedInfo>>>,
+}
+
+impl StubShareFs {
+    fn new() -> Self {
+        Self {
+            mount: Arc::new(StubShareFsMount),
+            mounted_info: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl ShareFs for StubShareFs {
+    fn get_share_fs_mount(&self) -> Arc<dyn ShareFsMount> {
+        self.mount.clone()
+    }
+    async fn setup_device_before_start_vm(
+        &self,
+        _h: &dyn Hypervisor,
+        _d: &RwLock<DeviceManager>,
+    ) -> Result<()> {
+        unimplemented!()
+    }
+    async fn setup_device_after_start_vm(
+        &self,
+        _h: &dyn Hypervisor,
+        _d: &RwLock<DeviceManager>,
+    ) -> Result<()> {
+        unimplemented!()
+    }
+    async fn get_storages(&self) -> Result<Vec<Storage>> {
+        Ok(Vec::new())
+    }
+    fn mounted_info_set(&self) -> Arc<Mutex<HashMap<String, MountedInfo>>> {
+        self.mounted_info.clone()
+    }
+}
+
 #[derive(Debug)]
 struct Args {
     config: PathBuf,
@@ -424,7 +547,10 @@ async fn main() -> Result<()> {
     let hv: Arc<dyn Hypervisor> = Arc::new(DryRunHypervisor);
     let device_manager = RwLock::new(DeviceManager::new(hv, None).await?);
 
-    let share_fs: Option<Arc<dyn ShareFs>> = None;
+    // A stub ShareFs routes share-fs volumes (configmap/secret/projected/
+    // downwardAPI/hostPath) through the shared-fs path instead of the
+    // copy-to-rootfs fallback that needs a real Agent.
+    let share_fs: Option<Arc<dyn ShareFs>> = Some(Arc::new(StubShareFs::new()));
     let agent: Arc<dyn Agent> = Arc::new(StubAgent);
 
     let ctx = VolumeContext {

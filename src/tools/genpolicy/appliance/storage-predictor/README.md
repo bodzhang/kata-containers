@@ -49,16 +49,52 @@ and assembles `storages-devices-predicted.json`.
 
 ## Coverage
 
-Predicted authoritatively today (pure volume handlers): `shm`, `local`,
-`ephemeral`, `hugepage`, passthrough `default`.
+- Authoritative (real pure handlers, no reproduction): `shm`, `local`,
+  `ephemeral`, `hugepage`, passthrough `default`.
+- Shared-filesystem classes (`ConfigMap`, `Secret`, `projected`, `downwardAPI`,
+  regular `hostPath`) via a reproduced `ShareFs`/`ShareFsMount` stub: watchable
+  `ConfigMap`/`Secret` mounts yield a `watchable-bind` storage; other shared-fs
+  volumes yield a shared mount with no storage. See "Drift risk" below.
+
+## Drift risk and mitigation
+
+Unlike the volume handlers, the share-fs path cannot be reused as-is: the real
+`VirtiofsShareMount` is entangled with virtiofsd/hypervisor setup and performs a
+real host bind mount, which is incompatible with the no-VM design. The stub
+therefore *reproduces* `VirtiofsShareMount::share_volume`
+(`runtime-rs/crates/resource/src/share_fs/virtio_fs_share_mount.rs`).
+
+Reused directly from the shim (kept aligned automatically):
+
+- guest path — `resource::share_fs::do_get_guest_path` (same result as
+  `share_to_guest`, without the mount);
+- watchable detection — `kata_types::k8s::is_watchable_mount`;
+- shared-dir root — `kata_guest_share_dir()` and `PASSTHROUGH_FS_DIR`.
+
+Mirrored rather than reused (the drift surface):
+
+- the constants `watchable` and `watchable-bind` (private upstream);
+- the ~15-line `share_volume` control flow that assembles the `watchable-bind`
+  `Storage`.
+
+Residual risk:
+
+- Security-relevant `Storage` fields (`driver`, `fs_type`, `options`) are exact.
+  Path strings are policy-generalized by genpolicy's `sfprefix` regex, and the
+  guest path carries a random `sandbox-<uuid>-<name>` component that is not
+  deployment-stable regardless.
+- If upstream renames the constants or changes `share_volume`'s storage shape,
+  the stub diverges silently.
+
+Mitigation options (not yet implemented):
+
+- Make the two constants public in `virtio_fs_share_mount.rs` and import them.
+- Upstream a side-effect-free `predict_share_volume` helper in `resource` and call
+  it directly, removing the reproduction entirely.
+- Add an alignment test that fails if the upstream storage shape changes.
 
 ## Known gaps
 
-- **Shared-filesystem classes** (`ConfigMap`, `Secret`, `projected`,
-  `downwardAPI`, regular `hostPath`) are not yet predicted. They dispatch through
-  `ShareFsVolume`, which needs a `ShareFs`/`ShareFsMount` implementation and
-  performs real host virtio-fs mounting; they are currently recorded as errors
-  rather than approximated.
 - **Device-backed classes** (block, encrypted `emptyDir`, direct volumes) remain
   fail-closed: the dry-run `Hypervisor::add_device` is unimplemented and the block
   path needs the host backing object to `stat`. Enabling them requires echoing the

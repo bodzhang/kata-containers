@@ -63,3 +63,55 @@ fn predicts_storage_classes_without_vm() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+// A ConfigMap bind mount must be predicted as a watchable-bind storage, via the
+// stub ShareFs reproducing the shim's share_volume output.
+#[test]
+fn predicts_configmap_watchable_bind_storage() {
+    let base = std::env::temp_dir().join(format!("gp-p2-cm-{}", std::process::id()));
+    let cm_src = base.join("kubernetes.io~configmap").join("my-cm");
+    fs::create_dir_all(&cm_src).unwrap();
+    fs::write(cm_src.join("key"), "value").unwrap();
+
+    let config = base.join("config.json");
+    let output = base.join("predicted.json");
+    let spec = serde_json::json!({
+        "ociVersion": "1.0.0",
+        "mounts": [
+            { "destination": "/etc/config", "type": "bind", "source": cm_src.to_string_lossy(), "options": ["ro"] }
+        ]
+    });
+    fs::write(&config, serde_json::to_string(&spec).unwrap()).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_storage-predictor");
+    let status = Command::new(bin)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--sid",
+            "sb",
+            "--cid",
+            "ctr",
+            "--emptydir-mode",
+            "",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "predictor exited with failure");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+    let storages: Vec<&serde_json::Value> = parsed["volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|v| v["storages"].as_array().unwrap().iter())
+        .collect();
+    assert_eq!(storages.len(), 1, "parsed={parsed}");
+    assert_eq!(storages[0]["driver"], "watchable-bind");
+    assert_eq!(storages[0]["fs_type"], "bind");
+
+    let _ = fs::remove_dir_all(&base);
+}
