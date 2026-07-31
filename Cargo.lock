@@ -2499,6 +2499,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "genpolicy-oci-compiler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "genpolicy",
+ "kata-types",
+ "protocols",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml 0.8.26",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3763,6 +3777,23 @@ dependencies = [
  "log",
  "rstest",
  "serde_yaml 0.9.34+deprecated",
+ "tokio",
+]
+
+[[package]]
+name = "kata-storage-predictor"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "anyhow",
+ "async-trait",
+ "hypervisor",
+ "kata-sys-util",
+ "kata-types",
+ "oci-spec 0.10.0",
+ "resource",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
