@@ -5484,6 +5484,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kata-storage-predictor"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "anyhow",
+ "async-trait",
+ "hypervisor",
+ "kata-sys-util",
+ "kata-types",
+ "oci-spec 0.8.4",
+ "resource",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "kata-sys-util"
 version = "0.1.0"
 dependencies = [

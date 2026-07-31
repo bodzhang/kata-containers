@@ -30,6 +30,7 @@ grep -Fq "sandbox_image = \"${PAUSE_IMAGE}\"" "${appliance_dir}/config/container
 (
 	cd "${appliance_dir}/../../../.."
 	cargo test --locked --package genpolicy-oci-compiler
+	cargo test --locked --package kata-storage-predictor
 )
 
 echo "appliance validation passed"

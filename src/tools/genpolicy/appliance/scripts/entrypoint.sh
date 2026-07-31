@@ -325,6 +325,18 @@ if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
 		--output "${output_dir}/policy-mode-report.json"
 fi
 
+# Audit-only: predict Kata agent storages/devices from the captured OCI specs
+# using the real runtime-rs volume handlers driven by a dry-run hypervisor (no
+# VM). Best-effort and non-gating; the mount-type rewriting inspects live host
+# mount state, so this must run while the workload volumes are still mounted.
+python3 "${appliance_root}/scripts/predict_storages.py" \
+	--raw-dir "${output_dir}/raw" \
+	--predictor /usr/local/bin/storage-predictor \
+	--emptydir-mode "${GENPOLICY_EMPTYDIR_MODE:-shared-fs}" \
+	--output "${output_dir}/storages-devices-predicted.json" \
+	2>"${output_dir}/logs/storage-predictor.log" ||
+	echo "storage prediction failed (audit-only); see logs/storage-predictor.log" >&2
+
 provenance_artifacts=(
 	--artifact "kube-apiserver=/usr/local/bin/kube-apiserver"
 	--artifact "kubelet=/usr/local/bin/kubelet"
@@ -333,6 +345,7 @@ provenance_artifacts=(
 	--artifact "containerd=/usr/local/bin/containerd"
 	--artifact "runc=/usr/local/bin/runc.real"
 	--artifact "genpolicy-oci-compiler=/usr/local/bin/genpolicy-oci-compiler"
+	--artifact "storage-predictor=/usr/local/bin/storage-predictor"
 	--artifact "containerd-config=/etc/containerd/config.toml"
 	--artifact "kubelet-config=/etc/kubernetes/kubelet.yaml"
 	--artifact "cni-config=/etc/cni/net.d/10-genpolicy.conflist"
@@ -353,6 +366,7 @@ provenance_generated=(
 	--generated "policy-oci-diff.json=${output_dir}/policy-oci-diff.json"
 	--generated "policy-annotation.txt=${output_dir}/policy-annotation.txt"
 	--generated "workload-policy.yaml=${output_dir}/workload-policy.yaml"
+	--generated "storages-devices-predicted.json=${output_dir}/storages-devices-predicted.json"
 )
 if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
 	provenance_generated+=(

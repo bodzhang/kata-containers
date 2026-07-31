@@ -23,7 +23,9 @@ COPY tools/packaging/kata-deploy/binary ./tools/packaging/kata-deploy/binary
 RUN sed 's/@COMMIT_INFO@/genpolicy-appliance/' \
         src/tools/genpolicy/src/version.rs.in \
         >src/tools/genpolicy/src/version.rs \
-    && cargo build --locked --release --package genpolicy-oci-compiler
+    && cargo build --locked --release \
+        --package genpolicy-oci-compiler \
+        --package kata-storage-predictor
 
 FROM policy-builder AS legacy-builder
 
@@ -86,6 +88,8 @@ COPY --from=busybox / /opt/genpolicy/rootfs/busybox
 RUN mkdir -p /opt/genpolicy/rootfs/busybox/work
 COPY --from=policy-builder /workspace/target/release/genpolicy-oci-compiler \
     /usr/local/bin/genpolicy-oci-compiler
+COPY --from=policy-builder /workspace/target/release/storage-predictor \
+    /usr/local/bin/storage-predictor
 COPY src/tools/genpolicy/appliance /opt/genpolicy/appliance
 COPY src/tools/genpolicy/rules.rego /opt/genpolicy/policy/rules.rego
 COPY src/tools/genpolicy/genpolicy-settings.json /opt/genpolicy/policy/settings/genpolicy-settings.json
