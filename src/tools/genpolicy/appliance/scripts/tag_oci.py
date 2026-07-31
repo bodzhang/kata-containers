@@ -20,8 +20,8 @@ NETWORK_NAMESPACE = re.compile(
     r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 IP_REGEX = (
-    "(?:[0-9]{1,3}\\.){3}[0-9]{1,3}|"
-    "(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}"
+    "(?:(?:[0-9]{1,3}\\.){3}[0-9]{1,3}|"
+    "(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4})"
 )
 
 
@@ -35,6 +35,33 @@ def pointer(parts: list[str]) -> str:
 
 def value_digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def apply_kata_runtime_behavior(spec: dict) -> None:
+    annotations = spec.setdefault("annotations", {})
+    if annotations.get("io.kubernetes.cri.container-type") != "sandbox":
+        return
+
+    network_paths = {
+        namespace.get("path")
+        for namespace in (spec.get("linux") or {}).get("namespaces", [])
+        if namespace.get("type") == "network" and namespace.get("path")
+    }
+    if len(network_paths) > 1:
+        raise ValueError(
+            "sandbox OCI contains multiple network namespace paths"
+        )
+    if not network_paths:
+        return
+
+    network_path = network_paths.pop()
+    annotation = annotations.get("nerdctl/network-namespace")
+    if annotation is not None and annotation != network_path:
+        raise ValueError(
+            "Kata network namespace annotation does not match "
+            f"OCI Linux namespace: {annotation} != {network_path}"
+        )
+    annotations["nerdctl/network-namespace"] = network_path
 
 
 def add_derived_values(
@@ -91,6 +118,7 @@ def replace_string(
     exact_values: list[dict],
     occurrences: dict[str, list[dict]],
     definitions: dict[str, dict],
+    regex_policy_mode: str = "legacy",
 ) -> str:
     updated = value
     for item in sorted(exact_values, key=lambda entry: len(entry["value"]), reverse=True):
@@ -114,6 +142,8 @@ def replace_string(
 
     match = SERVICE_ENV.match(updated)
     if match and "GENPOLICY_DYNAMIC" not in match.group("value"):
+        if regex_policy_mode != "legacy":
+            return updated
         variable = match.group("name")
         tag = f"service-env.{variable}"
         service_value = match.group("value")
@@ -152,6 +182,8 @@ def replace_string(
 
     match = TERMINATION_LOG_SOURCE.match(updated)
     if parts[-1:] == ["source"] and match:
+        if regex_policy_mode != "legacy":
+            return updated
         tag = "termination-log.id"
         original = match.group("id")
         updated = match.group("prefix") + marker(tag)
@@ -202,6 +234,7 @@ def transform(
     exact_values: list[dict],
     occurrences: dict[str, list[dict]],
     definitions: dict[str, dict],
+    regex_policy_mode: str = "legacy",
 ):
     if isinstance(value, dict):
         return {
@@ -212,6 +245,7 @@ def transform(
                 exact_values,
                 occurrences,
                 definitions,
+                regex_policy_mode,
             )
             for key, child in value.items()
         }
@@ -224,6 +258,7 @@ def transform(
                 exact_values,
                 occurrences,
                 definitions,
+                regex_policy_mode,
             )
             for index, child in enumerate(value)
         ]
@@ -235,6 +270,7 @@ def transform(
             exact_values,
             occurrences,
             definitions,
+            regex_policy_mode,
         )
     return value
 
@@ -245,6 +281,11 @@ def main() -> None:
     parser.add_argument("--dynamic-values", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument(
+        "--regex-policy-mode",
+        choices=("legacy", "balanced"),
+        default="legacy",
+    )
     args = parser.parse_args()
 
     base_values = json.loads(args.dynamic_values.read_text(encoding="utf-8"))
@@ -266,6 +307,10 @@ def main() -> None:
             else {}
         )
         spec = json.loads(capture.read_text(encoding="utf-8"))
+        try:
+            apply_kata_runtime_behavior(spec)
+        except ValueError as error:
+            raise SystemExit(f"{capture.name}: {error}") from error
         exact_values = add_derived_values(spec, metadata, base_values)
         output_name = capture.name.replace(".config.json", ".tagged.json")
         tagged = transform(
@@ -275,6 +320,7 @@ def main() -> None:
             exact_values,
             occurrences,
             definitions,
+            args.regex_policy_mode,
         )
         (args.output_dir / output_name).write_text(
             json.dumps(tagged, indent=2, sort_keys=True) + "\n",
@@ -286,9 +332,11 @@ def main() -> None:
         definition = definitions[tag]
         definition["occurrences"] = occurrences[tag]
         tags.append(definition)
+    manifest = {"schema_version": 1, "tags": tags}
+    if args.regex_policy_mode != "legacy":
+        manifest["regex_policy_mode"] = args.regex_policy_mode
     args.manifest.write_text(
-        json.dumps({"schema_version": 1, "tags": tags}, indent=2, sort_keys=True)
-        + "\n",
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 

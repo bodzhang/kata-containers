@@ -21,6 +21,13 @@ TEMPLATE_PATHS = {
     "ReplicationController": ("spec", "template"),
     "StatefulSet": ("spec", "template"),
 }
+IMAGE_DIGEST = re.compile(
+    r"^(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]+)?/)?"
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
+    r"(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
+    r"(?::[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127})?"
+    r"@sha256:[0-9a-f]{64}$"
+)
 
 
 def kubectl_create(value: dict) -> dict:
@@ -94,14 +101,63 @@ def iter_documents(path: Path):
                 yield document
 
 
+def validate_image_references(path: Path) -> set[str]:
+    errors = []
+    images = set()
+    for document in iter_documents(path):
+        kind = document.get("kind")
+        if kind == "Pod":
+            pod_spec = document.get("spec") or {}
+        elif kind in TEMPLATE_PATHS:
+            pod_spec = (nested(document, TEMPLATE_PATHS[kind]).get("spec") or {})
+        else:
+            continue
+        for field in ("initContainers", "containers", "ephemeralContainers"):
+            for container in pod_spec.get(field, []):
+                image = container.get("image", "")
+                if not IMAGE_DIGEST.fullmatch(image):
+                    errors.append(
+                        f"{kind} container {container.get('name', '<unnamed>')} "
+                        f"image is not digest-pinned: {image or '<missing>'}"
+                    )
+                else:
+                    images.add(image)
+    if errors:
+        raise ValueError("\n".join(errors))
+    return images
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, type=Path)
-    parser.add_argument("--node-name", required=True)
-    parser.add_argument("--objects-output", required=True, type=Path)
-    parser.add_argument("--pods-output", required=True, type=Path)
-    parser.add_argument("--dynamic-output", required=True, type=Path)
+    parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--images-output", type=Path)
+    parser.add_argument("--node-name")
+    parser.add_argument("--objects-output", type=Path)
+    parser.add_argument("--pods-output", type=Path)
+    parser.add_argument("--dynamic-output", type=Path)
     args = parser.parse_args()
+
+    try:
+        images = validate_image_references(args.input)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        raise SystemExit(1)
+    if args.images_output:
+        args.images_output.write_text(
+            "".join(f"{image}\n" for image in sorted(images)),
+            encoding="utf-8",
+        )
+    if args.validate_only:
+        return
+    for name in (
+        "node_name",
+        "objects_output",
+        "pods_output",
+        "dynamic_output",
+    ):
+        if getattr(args, name) is None:
+            parser.error(f"--{name.replace('_', '-')} is required")
 
     defaulted_objects = []
     pods = []

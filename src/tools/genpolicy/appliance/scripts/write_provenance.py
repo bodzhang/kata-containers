@@ -28,6 +28,7 @@ def main() -> None:
     parser.add_argument("--profile", required=True, type=Path)
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--tag-manifest", required=True, type=Path)
+    parser.add_argument("--raw-dir", required=True, type=Path)
     parser.add_argument("--tagged-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--artifact", action="append", default=[])
@@ -49,12 +50,17 @@ def main() -> None:
     tagged = {
         path.name: sha256(path) for path in sorted(args.tagged_dir.glob("*.json"))
     }
+    raw = {
+        path.name: sha256(path)
+        for path in sorted(args.raw_dir.glob("*.config.json"))
+    }
     result = {
         "artifacts": artifacts,
         "input": {"path": "workload.yaml", "sha256": sha256(args.input)},
         "outputs": {
             "dynamic-tags.json": sha256(args.tag_manifest),
             "generated": generated,
+            "raw_oci": raw,
             "tagged": tagged,
         },
         "profile": parse_profile(args.profile),

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -55,6 +56,26 @@ class TagOciTests(unittest.TestCase):
             "{{GENPOLICY_DYNAMIC:service-env.KUBERNETES_SERVICE_HOST}}",
         )
         self.assertIn("service-env.KUBERNETES_SERVICE_HOST", definitions)
+        host_regex = (
+            "^KUBERNETES_SERVICE_HOST="
+            + definitions[
+                "service-env.KUBERNETES_SERVICE_HOST"
+            ]["suggested_regex"]
+            + "$"
+        )
+        self.assertIsNotNone(
+            re.search(host_regex, "KUBERNETES_SERVICE_HOST=10.96.0.1")
+        )
+        self.assertIsNotNone(
+            re.search(host_regex, "KUBERNETES_SERVICE_HOST=::1")
+        )
+        self.assertIsNone(re.search(host_regex, "LD_PRELOAD=::1"))
+        self.assertIsNone(
+            re.search(
+                host_regex,
+                "KUBERNETES_SERVICE_HOST=10.96.0.1-attacker",
+            )
+        )
 
         MODULE.replace_string(
             "KUBERNETES_PORT=tcp://10.96.0.1:443",
@@ -163,6 +184,80 @@ class TagOciTests(unittest.TestCase):
         )
         self.assertIn("network.namespace", definitions)
 
+    def test_balanced_mode_pins_service_and_generalizes_cni_path(self):
+        from collections import defaultdict
+
+        occurrences = defaultdict(list)
+        definitions = {}
+        service = MODULE.replace_string(
+            "BACKEND_SERVICE_HOST=10.96.0.12",
+            ["process", "env", "0"],
+            "tagged/test.json",
+            [],
+            occurrences,
+            definitions,
+            "balanced",
+        )
+        network_namespace = MODULE.replace_string(
+            "/var/run/netns/cni-11111111-2222-3333-4444-555555555555",
+            ["annotations", "nerdctl/network-namespace"],
+            "tagged/test.json",
+            [],
+            occurrences,
+            definitions,
+            "balanced",
+        )
+
+        self.assertEqual(service, "BACKEND_SERVICE_HOST=10.96.0.12")
+        self.assertEqual(
+            network_namespace,
+            "{{GENPOLICY_DYNAMIC:network.namespace}}",
+        )
+        self.assertIn("network.namespace", definitions)
+
+    def test_kata_runtime_annotation_follows_oci_network_namespace(self):
+        spec = {
+            "annotations": {
+                "io.kubernetes.cri.container-type": "sandbox",
+            },
+            "linux": {
+                "namespaces": [
+                    {
+                        "type": "network",
+                        "path": (
+                            "/var/run/netns/"
+                            "cni-11111111-2222-3333-4444-555555555555"
+                        ),
+                    }
+                ]
+            },
+        }
+
+        MODULE.apply_kata_runtime_behavior(spec)
+
+        self.assertEqual(
+            spec["annotations"]["nerdctl/network-namespace"],
+            "/var/run/netns/cni-11111111-2222-3333-4444-555555555555",
+        )
+
+    def test_kata_runtime_rejects_mismatched_network_annotation(self):
+        spec = {
+            "annotations": {
+                "io.kubernetes.cri.container-type": "sandbox",
+                "nerdctl/network-namespace": "/var/run/netns/cni-existing",
+            },
+            "linux": {
+                "namespaces": [
+                    {
+                        "type": "network",
+                        "path": "/var/run/netns/cni-from-oci",
+                    }
+                ]
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            MODULE.apply_kata_runtime_behavior(spec)
 
 if __name__ == "__main__":
     unittest.main()

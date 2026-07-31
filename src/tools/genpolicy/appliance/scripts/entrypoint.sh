@@ -47,6 +47,11 @@ wait_for() {
 [[ "$(stat -fc %T /sys/fs/cgroup)" == "cgroup2fs" ]] ||
 	fail "cgroup v2 is required"
 
+python3 "${appliance_root}/scripts/submit_workload.py" \
+	--input "${workload}" \
+	--images-output "${output_dir}/requested-images.txt" \
+	--validate-only
+
 install -D -m 0644 "${appliance_root}/config/containerd.toml" /etc/containerd/config.toml
 install -D -m 0644 "${appliance_root}/config/kubelet.yaml" /etc/kubernetes/kubelet.yaml
 install -D -m 0644 "${appliance_root}/config/10-genpolicy.conflist" /etc/cni/net.d/10-genpolicy.conflist
@@ -140,15 +145,49 @@ pids+=("$!")
 wait_for containerd ctr --address /run/containerd/containerd.sock version
 
 ctr --address /run/containerd/containerd.sock --namespace k8s.io images import \
-	/opt/genpolicy/images/pause.tar >/dev/null
+	--digests /opt/genpolicy/images/pause.tar >/dev/null
 ctr --address /run/containerd/containerd.sock --namespace k8s.io images import \
-	/opt/genpolicy/images/busybox.tar >/dev/null
+	--digests /opt/genpolicy/images/busybox.tar >/dev/null
 if [[ -d "${input_dir}/images" ]]; then
 	while IFS= read -r -d '' image; do
 		ctr --address /run/containerd/containerd.sock --namespace k8s.io images import \
-			"${image}" >/dev/null
+			--digests "${image}" >/dev/null
 	done < <(find "${input_dir}/images" -type f -name '*.tar' -print0)
 fi
+while IFS= read -r image_ref; do
+	digest=${image_ref##*@}
+	if ctr --address /run/containerd/containerd.sock --namespace k8s.io \
+		images list -q | grep -Fxq "${image_ref}"; then
+		continue
+	fi
+	source_ref=$(
+		ctr --address /run/containerd/containerd.sock --namespace k8s.io \
+			images list |
+			awk -v digest="${digest}" 'NR > 1 && $3 == digest { print $1; exit }'
+	)
+	if [[ -n "${source_ref}" ]]; then
+		ctr --address /run/containerd/containerd.sock --namespace k8s.io images tag \
+			"${source_ref}" "${image_ref}" >/dev/null
+	else
+		[[ "${image_ref}" != "${LOCAL_REGISTRY}/"* ]] ||
+			fail "no imported image has requested manifest digest ${digest}"
+		ctr --address /run/containerd/containerd.sock --namespace k8s.io \
+			images pull --hosts-dir /etc/containerd/certs.d "${image_ref}" >/dev/null
+	fi
+done <"${output_dir}/requested-images.txt"
+
+iptables --flush OUTPUT
+iptables --append OUTPUT --out-interface lo --jump ACCEPT
+iptables --policy OUTPUT DROP
+ip6tables --flush OUTPUT
+ip6tables --append OUTPUT --out-interface lo --jump ACCEPT
+ip6tables --policy OUTPUT DROP
+[[ "$(iptables --list-rules OUTPUT | head -n 1)" == "-P OUTPUT DROP" ]] ||
+	fail "failed to seal IPv4 outbound traffic"
+iptables --check OUTPUT --out-interface lo --jump ACCEPT
+[[ "$(ip6tables --list-rules OUTPUT | head -n 1)" == "-P OUTPUT DROP" ]] ||
+	fail "failed to seal IPv6 outbound traffic"
+ip6tables --check OUTPUT --out-interface lo --jump ACCEPT
 
 if [[ "${GENPOLICY_LEGACY_REFERENCE:-0}" == "1" ]]; then
 	mkdir -p /etc/docker/registry /var/lib/registry
@@ -188,6 +227,22 @@ python3 "${appliance_root}/scripts/submit_workload.py" \
 	--pods-output "${output_dir}/pods.json" \
 	--dynamic-output "${output_dir}/dynamic-values.json"
 
+while IFS=$'\t' read -r namespace pod_name; do
+	kubectl wait \
+		--namespace "${namespace}" \
+		--for=condition=Ready \
+		--timeout=180s \
+		"pod/${pod_name}"
+done < <(python3 - "${output_dir}/pods.json" <<'PY'
+import json
+import sys
+
+for pod in json.load(open(sys.argv[1], encoding="utf-8")):
+    metadata = pod["metadata"]
+    print(metadata.get("namespace", "default"), metadata["name"], sep="\t")
+PY
+)
+
 expected_captures=$(python3 - "${output_dir}/pods.json" <<'PY'
 import json
 import sys
@@ -205,7 +260,7 @@ for _ in $(seq 1 180); do
 	sleep 1
 done
 captures=$(find "${output_dir}/raw" -type f -name '*.config.json' | wc -l)
-[[ "${captures}" -ge "${expected_captures}" ]] ||
+[[ "${captures}" -eq "${expected_captures}" ]] ||
 	fail "expected ${expected_captures} OCI captures, found ${captures}"
 
 python3 "${appliance_root}/scripts/tag_oci.py" \
@@ -215,6 +270,7 @@ python3 "${appliance_root}/scripts/tag_oci.py" \
 	--manifest "${output_dir}/dynamic-tags.json"
 
 genpolicy-oci-compiler \
+	--raw-dir "${output_dir}/raw" \
 	--tagged-dir "${output_dir}/tagged" \
 	--tag-manifest "${output_dir}/dynamic-tags.json" \
 	--rules /opt/genpolicy/policy/rules.rego \
@@ -224,6 +280,28 @@ genpolicy-oci-compiler \
 	--diff-output "${output_dir}/policy-oci-diff.json" \
 	--annotation-output "${output_dir}/policy-annotation.txt" \
 	--annotated-yaml-output "${output_dir}/workload-policy.yaml"
+
+if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
+	python3 "${appliance_root}/scripts/tag_oci.py" \
+		--raw-dir "${output_dir}/raw" \
+		--dynamic-values "${output_dir}/dynamic-values.json" \
+		--output-dir "${output_dir}/tagged-balanced" \
+		--manifest "${output_dir}/dynamic-tags-balanced.json" \
+		--regex-policy-mode balanced
+
+	genpolicy-oci-compiler \
+		--raw-dir "${output_dir}/raw" \
+		--tagged-dir "${output_dir}/tagged-balanced" \
+		--tag-manifest "${output_dir}/dynamic-tags-balanced.json" \
+		--rules /opt/genpolicy/policy/rules.rego \
+		--settings /opt/genpolicy/policy/settings \
+		--workload "${workload}" \
+		--output "${output_dir}/policy-balanced.rego" \
+		--diff-output "${output_dir}/policy-oci-diff-balanced.json" \
+		--annotation-output "${output_dir}/policy-annotation-balanced.txt" \
+		--annotated-yaml-output "${output_dir}/workload-policy-balanced.yaml" \
+		--regex-policy-mode balanced
+fi
 
 if [[ "${GENPOLICY_LEGACY_REFERENCE:-0}" == "1" ]]; then
 	policy_work_dir=/var/lib/genpolicy-appliance
@@ -239,6 +317,12 @@ if [[ "${GENPOLICY_LEGACY_REFERENCE:-0}" == "1" ]]; then
 		--raw-out \
 		>"${output_dir}/legacy-reference-policy.rego" \
 		2>"${output_dir}/logs/genpolicy-reference.log"
+fi
+
+if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
+	python3 "${appliance_root}/scripts/compare_policy_modes.py" \
+		--output-dir "${output_dir}" \
+		--output "${output_dir}/policy-mode-report.json"
 fi
 
 provenance_artifacts=(
@@ -263,16 +347,32 @@ if [[ -d "${input_dir}/images" ]]; then
 	done < <(find "${input_dir}/images" -type f -name '*.tar' -print0)
 fi
 
+provenance_generated=(
+	--generated "policy.rego=${output_dir}/policy.rego"
+	--generated "requested-images.txt=${output_dir}/requested-images.txt"
+	--generated "policy-oci-diff.json=${output_dir}/policy-oci-diff.json"
+	--generated "policy-annotation.txt=${output_dir}/policy-annotation.txt"
+	--generated "workload-policy.yaml=${output_dir}/workload-policy.yaml"
+)
+if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
+	provenance_generated+=(
+		--generated "dynamic-tags-balanced.json=${output_dir}/dynamic-tags-balanced.json"
+		--generated "policy-balanced.rego=${output_dir}/policy-balanced.rego"
+		--generated "policy-oci-diff-balanced.json=${output_dir}/policy-oci-diff-balanced.json"
+		--generated "policy-annotation-balanced.txt=${output_dir}/policy-annotation-balanced.txt"
+		--generated "workload-policy-balanced.yaml=${output_dir}/workload-policy-balanced.yaml"
+		--generated "policy-mode-report.json=${output_dir}/policy-mode-report.json"
+	)
+fi
+
 python3 "${appliance_root}/scripts/write_provenance.py" \
 	--profile "${appliance_root}/profile.env" \
 	--input "${workload}" \
 	--tag-manifest "${output_dir}/dynamic-tags.json" \
+	--raw-dir "${output_dir}/raw" \
 	--tagged-dir "${output_dir}/tagged" \
 	--output "${output_dir}/provenance.json" \
-	--generated "policy.rego=${output_dir}/policy.rego" \
-	--generated "policy-oci-diff.json=${output_dir}/policy-oci-diff.json" \
-	--generated "policy-annotation.txt=${output_dir}/policy-annotation.txt" \
-	--generated "workload-policy.yaml=${output_dir}/workload-policy.yaml" \
+	"${provenance_generated[@]}" \
 	"${provenance_artifacts[@]}"
 
 echo "Generated ${captures} tagged OCI specifications and OCI-derived ${output_dir}/policy.rego"

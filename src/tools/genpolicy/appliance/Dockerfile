@@ -82,7 +82,8 @@ RUN set -eux; \
         | tar -xz -C /opt/cni/bin
 
 COPY --from=pause /pause /opt/genpolicy/rootfs/pause/pause
-COPY --from=busybox /bin/busybox /opt/genpolicy/rootfs/busybox/bin/busybox
+COPY --from=busybox / /opt/genpolicy/rootfs/busybox
+RUN mkdir -p /opt/genpolicy/rootfs/busybox/work
 COPY --from=policy-builder /workspace/target/release/genpolicy-oci-compiler \
     /usr/local/bin/genpolicy-oci-compiler
 COPY src/tools/genpolicy/appliance /opt/genpolicy/appliance

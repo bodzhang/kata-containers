@@ -35,6 +35,94 @@ class SubmitWorkloadTests(unittest.TestCase):
         self.assertTrue(pod["metadata"]["generateName"].startswith("gp-deployment-web-"))
         self.assertEqual(pod["spec"]["nodeName"], "genpolicy-node")
 
+    def test_image_references_must_be_digest_pinned(self):
+        import tempfile
+        import yaml
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workload = Path(temporary) / "workload.yaml"
+            workload.write_text(
+                yaml.safe_dump(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {"name": "web"},
+                        "spec": {
+                            "containers": [
+                                {
+                                    "name": "web",
+                                    "image": "example.invalid/web:latest",
+                                }
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "image is not digest-pinned"
+            ):
+                MODULE.validate_image_references(workload)
+
+    def test_digest_pinned_image_is_accepted(self):
+        import tempfile
+        import yaml
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workload = Path(temporary) / "workload.yaml"
+            workload.write_text(
+                yaml.safe_dump(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {"name": "web"},
+                        "spec": {
+                            "containers": [
+                                {
+                                    "name": "web",
+                                    "image": "genpolicy.local:5000/web@sha256:"
+                                    + "a" * 64,
+                                }
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                MODULE.validate_image_references(workload),
+                {"genpolicy.local:5000/web@sha256:" + "a" * 64},
+            )
+
+    def test_external_digest_pinned_image_is_accepted(self):
+        import tempfile
+        import yaml
+
+        image = "registry.example.com/team/web:release@sha256:" + "b" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            workload = Path(temporary) / "workload.yaml"
+            workload.write_text(
+                yaml.safe_dump(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {"name": "web"},
+                        "spec": {
+                            "containers": [
+                                {"name": "web", "image": image}
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                MODULE.validate_image_references(workload), {image}
+            )
+
     def test_cronjob_template_path(self):
         cronjob = {
             "apiVersion": "batch/v1",
@@ -59,6 +147,62 @@ class SubmitWorkloadTests(unittest.TestCase):
         pod, _ = MODULE.pod_from_workload(cronjob, "genpolicy-node")
 
         self.assertEqual(pod["spec"]["restartPolicy"], "Never")
+
+    def test_podtemplate_template_path(self):
+        pod_template = {
+            "apiVersion": "v1",
+            "kind": "PodTemplate",
+            "metadata": {"name": "worker"},
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "worker",
+                            "image": "example.invalid/worker@sha256:" + "c" * 64,
+                        }
+                    ]
+                }
+            },
+        }
+
+        pod, generated = MODULE.pod_from_workload(
+            pod_template, "genpolicy-node"
+        )
+
+        self.assertTrue(generated)
+        self.assertEqual(pod["spec"]["nodeName"], "genpolicy-node")
+
+    def test_podtemplate_image_is_validated(self):
+        import tempfile
+        import yaml
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workload = Path(temporary) / "workload.yaml"
+            workload.write_text(
+                yaml.safe_dump(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "PodTemplate",
+                        "metadata": {"name": "worker"},
+                        "template": {
+                            "spec": {
+                                "containers": [
+                                    {
+                                        "name": "worker",
+                                        "image": "example.invalid/worker:latest",
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "image is not digest-pinned"
+            ):
+                MODULE.validate_image_references(workload)
 
 
 if __name__ == "__main__":
