@@ -95,12 +95,17 @@ Mitigation options (not yet implemented):
 
 ## Known gaps
 
-- **Device-backed classes** (block, encrypted `emptyDir`, direct volumes) remain
-  fail-closed: the dry-run `Hypervisor::add_device` is unimplemented and the block
-  path needs the host backing object to `stat`. Enabling them requires echoing the
-  device through the dry-run hypervisor and a profile-backed `hypervisor_config`.
-- Only per-volume `device_id` is emitted, not full `agent::Device` objects; those
-  need device-manager introspection and the container-manager `spec.linux.devices`
+- **Device-backed classes** (block, encrypted `emptyDir`, direct volumes): the
+  dry-run hypervisor echoes devices and returns a default `hypervisor_config`, so
+  the device manager assigns the deterministic guest path `/dev/vdX` with no VM
+  (proven by the `dry_run_block_device_gets_deterministic_virt_path` unit test).
+  Predictor-level prediction through `handler_volumes` is still e2e-only, because
+  `BlockVolume::new` `stat`s the real host block device and direct volumes read
+  host mount-info metadata. `hypervisor_config` is a `Default`, so the block
+  `driver_option` is not yet sourced from the pinned profile.
+- Only per-volume `device_id` is emitted, not full `agent::Device` objects; the
+  `Volume` trait exposes no device enumeration, so full devices need
+  device-manager introspection and the container-manager `spec.linux.devices`
   path.
 - No authoritative CRI capture yet, so device requests not fully expressed in the
   OCI spec are not modeled, and the predictor depends on live host mount state

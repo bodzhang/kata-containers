@@ -80,14 +80,16 @@ impl Hypervisor for DryRunHypervisor {
     async fn resize_memory(&self, _new_mem_mb: u32) -> Result<(u32, MemoryConfig)> {
         unimplemented!()
     }
-    async fn add_device(&self, _device: DeviceType) -> Result<DeviceType> {
-        unimplemented!("dry-run hypervisor does not hotplug devices")
+    // Echo the device unchanged: the guest device path (/dev/vdX) is assigned
+    // deterministically by the device manager before attach, so no VM is needed.
+    async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {
+        Ok(device)
     }
     async fn remove_device(&self, _device: DeviceType) -> Result<()> {
-        unimplemented!()
+        Ok(())
     }
     async fn update_device(&self, _device: DeviceType) -> Result<()> {
-        unimplemented!()
+        Ok(())
     }
     async fn get_agent_socket(&self) -> Result<String> {
         unimplemented!()
@@ -96,7 +98,7 @@ impl Hypervisor for DryRunHypervisor {
         unimplemented!()
     }
     async fn hypervisor_config(&self) -> HypervisorConfig {
-        unimplemented!()
+        HypervisorConfig::default()
     }
     async fn get_thread_ids(&self) -> Result<VcpuThreadIds> {
         unimplemented!()
@@ -596,4 +598,35 @@ async fn main() -> Result<()> {
         output_path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hypervisor::device::device_manager::do_handle_device;
+    use hypervisor::device::{DeviceConfig, DeviceType};
+    use hypervisor::BlockConfig;
+
+    // The device manager assigns the deterministic guest path /dev/vda for a
+    // block device through the dry-run hypervisor, with no VM booted.
+    #[tokio::test]
+    async fn dry_run_block_device_gets_deterministic_virt_path() {
+        let hv: Arc<dyn Hypervisor> = Arc::new(DryRunHypervisor);
+        let device_manager = RwLock::new(DeviceManager::new(hv, None).await.unwrap());
+
+        let block = BlockConfig {
+            major: 8,
+            minor: 0,
+            driver_option: "virtio-blk-pci".to_string(),
+            ..Default::default()
+        };
+        let device = do_handle_device(&device_manager, &DeviceConfig::BlockCfg(block))
+            .await
+            .unwrap();
+
+        match device {
+            DeviceType::Block(block) => assert_eq!(block.config.virt_path, "/dev/vda"),
+            _ => panic!("expected a block device"),
+        }
+    }
 }
