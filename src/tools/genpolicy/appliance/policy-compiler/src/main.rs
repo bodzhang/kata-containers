@@ -29,6 +29,7 @@ struct Args {
     annotation_output: PathBuf,
     annotated_yaml_output: PathBuf,
     regex_policy_mode: String,
+    predicted_storages: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -117,6 +118,14 @@ struct PolicyData {
     request_defaults: Value,
     devices: policy::Devices,
     cluster_config: policy::ClusterConfig,
+    dmverity: DmVerityData,
+}
+
+/// Pod-scoped allowlist of EROFS dm-verity root hashes, consumed by the
+/// `allow_storage` erofs-lower clause in rules.rego.
+#[derive(Debug, Default, Serialize)]
+struct DmVerityData {
+    allowed_roothashes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -174,6 +183,7 @@ fn parse_args() -> Result<Args> {
             .get("--regex-policy-mode")
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| "legacy".to_string()),
+        predicted_storages: values.get("--predicted-storages").cloned(),
     })
 }
 
@@ -945,6 +955,10 @@ fn run(args: Args) -> Result<()> {
     }
     apply_regex_policy_mode(&mut request_defaults, &args.regex_policy_mode)?;
     append_allow_env_regex(&mut request_defaults, &allow_env_regex)?;
+    let dmverity = match &args.predicted_storages {
+        Some(path) => collect_dmverity_roothashes(path)?,
+        None => DmVerityData::default(),
+    };
     let data = PolicyData {
         containers,
         common: settings.common,
@@ -952,6 +966,7 @@ fn run(args: Args) -> Result<()> {
         request_defaults,
         devices: settings.devices,
         cluster_config: settings.cluster_config,
+        dmverity,
     };
     let rules = fs::read_to_string(&args.rules)?;
     let policy = format!(
@@ -980,6 +995,61 @@ fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Collects the union of EROFS dm-verity root hashes from a predicted-storages
+/// report (produced by the storage-predictor). Coverage gate: every EROFS lower
+/// layer must carry a dm-verity root hash, otherwise the generated policy would
+/// deny that container at runtime — so fail generation instead.
+fn collect_dmverity_roothashes(path: &Path) -> Result<DmVerityData> {
+    let report: Value = serde_json::from_str(&fs::read_to_string(path)?)
+        .with_context(|| format!("parse predicted storages {}", path.display()))?;
+    let mut roots = BTreeSet::new();
+    for pred in report
+        .get("predictions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let Some(storages) = pred
+            .get("rootfs")
+            .and_then(|r| r.get("storages"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for storage in storages {
+            let options: Vec<&str> = storage
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let is_erofs_lower = storage.get("fs_type").and_then(Value::as_str) == Some("erofs")
+                && options.contains(&"X-kata.multi-layer=true")
+                && options.contains(&"X-kata.overlay-lower");
+            if !is_erofs_lower {
+                continue;
+            }
+            let roothash = options
+                .iter()
+                .find_map(|o| o.strip_prefix("X-kata.dmverity.roothash="));
+            match roothash {
+                Some(hash) => {
+                    roots.insert(hash.to_string());
+                }
+                None => bail!(
+                    "container {} has an EROFS lower layer without a dm-verity root hash; \
+                     the generated policy would fail closed",
+                    pred.get("container_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                ),
+            }
+        }
+    }
+    Ok(DmVerityData {
+        allowed_roothashes: roots.into_iter().collect(),
+    })
+}
+
 fn main() -> Result<()> {
     run(parse_args()?)
 }
@@ -987,6 +1057,60 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_report(dir: &Path, name: &str, report: Value) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, serde_json::to_string(&report).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn dmverity_roothashes_collected_from_erofs_lowers() {
+        let dir = std::env::temp_dir().join(format!("gp-dmv-ok-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let report = json!({
+            "predictions": [{
+                "container_id": "c1",
+                "rootfs": {"storages": [
+                    {"fs_type": "ext4", "options": ["rw", "X-kata.overlay-upper", "X-kata.multi-layer=true"]},
+                    {"fs_type": "erofs", "options": ["ro", "X-kata.overlay-lower", "X-kata.multi-layer=true", "X-kata.dmverity.roothash=aa11"]},
+                    {"fs_type": "erofs", "options": ["ro", "X-kata.overlay-lower", "X-kata.multi-layer=true", "X-kata.dmverity.roothash=bb22"]}
+                ]}
+            }]
+        });
+        let path = write_report(&dir, "predicted.json", report);
+        let dmv = collect_dmverity_roothashes(&path).unwrap();
+        assert_eq!(dmv.allowed_roothashes, vec!["aa11".to_string(), "bb22".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dmverity_coverage_gate_rejects_unpinned_erofs_lower() {
+        let dir = std::env::temp_dir().join(format!("gp-dmv-gate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let report = json!({
+            "predictions": [{
+                "container_id": "c1",
+                "rootfs": {"storages": [
+                    {"fs_type": "erofs", "options": ["ro", "X-kata.overlay-lower", "X-kata.multi-layer=true"]}
+                ]}
+            }]
+        });
+        let path = write_report(&dir, "predicted.json", report);
+        assert!(collect_dmverity_roothashes(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dmverity_empty_when_no_rootfs() {
+        let dir = std::env::temp_dir().join(format!("gp-dmv-empty-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let report = json!({ "predictions": [{ "container_id": "c1", "volumes": [] }] });
+        let path = write_report(&dir, "predicted.json", report);
+        let dmv = collect_dmverity_roothashes(&path).unwrap();
+        assert!(dmv.allowed_roothashes.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn dynamic_environment_uses_macro_or_regex() {
