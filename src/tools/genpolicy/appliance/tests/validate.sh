@@ -27,6 +27,13 @@ grep -Fq "ARG ETCD_VERSION=${ETCD_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "ARG CNI_PLUGINS_VERSION=${CNI_PLUGINS_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "sandbox_image = \"${PAUSE_IMAGE}\"" "${appliance_dir}/config/containerd.toml"
 
+# Rego policy-rule tests (EROFS dm-verity storage pinning). Requires `opa`.
+if command -v opa >/dev/null 2>&1; then
+	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/erofs_dmverity_test.rego"
+else
+	echo "opa not found; skipping rego policy tests" >&2
+fi
+
 (
 	cd "${appliance_dir}/../../../.."
 	cargo test --locked --package genpolicy-oci-compiler

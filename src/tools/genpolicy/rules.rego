@@ -1234,9 +1234,12 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
     p_count := count(p_storages)
     i_count := count(i_storages)
     img_pull_count := count([s | s := i_storages[_]; s.driver == "image_guest_pull"])
-    print("allow_storages: p_count =", p_count, "i_count =", i_count, "img_pull_count =", img_pull_count)
+    # EROFS multi-layer rootfs storages are allowed by dedicated clauses below
+    # (upper by shape, lower pinned by dm-verity root hash), not by p_storages.
+    erofs_ml_count := count([s | s := i_storages[_]; "X-kata.multi-layer=true" in s.options])
+    print("allow_storages: p_count =", p_count, "i_count =", i_count, "img_pull_count =", img_pull_count, "erofs_ml_count =", erofs_ml_count)
 
-    p_count == i_count - img_pull_count
+    p_count == i_count - img_pull_count - erofs_ml_count
 
     every i_storage in i_storages {
         allow_storage(p_storages, i_storage, bundle_id, sandbox_id)
@@ -1287,6 +1290,32 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id)
 
     print("allow_storage with blk: true")
+}
+# EROFS multi-layer rootfs: writable upper (scratch ext4). Its content is
+# guest-writable, so it is allowed by shape, not pinned.
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+    print("allow_storage erofs multi-layer upper: start")
+
+    "X-kata.multi-layer=true" in i_storage.options
+    "X-kata.overlay-upper" in i_storage.options
+    i_storage.fstype == "ext4"
+
+    print("allow_storage erofs multi-layer upper: true")
+}
+# EROFS multi-layer rootfs: read-only lower layer, pinned by its dm-verity root
+# hash against the pod's allowlist (policy_data.dmverity.allowed_roothashes).
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+    print("allow_storage erofs multi-layer lower: start")
+
+    "X-kata.multi-layer=true" in i_storage.options
+    "X-kata.overlay-lower" in i_storage.options
+    i_storage.fstype == "erofs"
+    "X-kata.dmverity-enabled=true" in i_storage.options
+
+    some roothash in policy_data.dmverity.allowed_roothashes
+    concat("", ["X-kata.dmverity.roothash=", roothash]) in i_storage.options
+
+    print("allow_storage erofs multi-layer lower: true")
 }
 
 # Validates all storage fields except driver and source.
