@@ -513,6 +513,14 @@ fn resolve_runtime_config(args: &Args) -> Result<(HypervisorConfig, String, bool
     }
 }
 
+/// Mirrors the shim's `capabilities.is_fs_sharing_supported()`: virtio-fs host
+/// sharing is available unless the deployment sets `shared_fs = "none"` (the
+/// block-only / many CoCo profiles), which routes disk-backed emptyDir and local
+/// volumes to `LocalStorage` instead of sharing them over virtio-fs.
+fn fs_sharing_supported(config: &HypervisorConfig) -> bool {
+    config.shared_fs.shared_fs.as_deref() != Some("none")
+}
+
 /// Serializable mirror of `agent::types::FSGroup` (the source type is not
 /// `Serialize`).
 #[derive(Serialize)]
@@ -655,6 +663,7 @@ async fn main() -> Result<()> {
 
     let (hypervisor_config, emptydir_mode, _disable_guest_empty_dir) =
         resolve_runtime_config(&args)?;
+    let fs_sharing = fs_sharing_supported(&hypervisor_config);
 
     // Reproduce the shim's mount-type rewriting. This inspects live host mount
     // state (mountinfo / stat), so it is only authoritative while the workload's
@@ -679,7 +688,7 @@ async fn main() -> Result<()> {
         sid: &args.sid,
         agent,
         emptydir_mode: &emptydir_mode,
-        fs_sharing_supported: true,
+        fs_sharing_supported: fs_sharing,
         block_device_discard_supported: false,
     };
 
@@ -757,6 +766,19 @@ mod tests {
         let hv = DryRunHypervisor { config };
         let config = hv.hypervisor_config().await;
         assert_eq!(config.blockdev_info.block_device_driver, "virtio-blk-mmio");
+    }
+
+    // fs-sharing follows shared_fs: the default (virtio-fs) shares volumes, while
+    // shared_fs="none" (block-only / CoCo) turns it off so disk emptyDir/local
+    // volumes get LocalStorage.
+    #[test]
+    fn fs_sharing_supported_follows_shared_fs() {
+        let mut config = HypervisorConfig::default();
+        assert!(fs_sharing_supported(&config));
+        config.shared_fs.shared_fs = Some("virtio-fs".to_string());
+        assert!(fs_sharing_supported(&config));
+        config.shared_fs.shared_fs = Some("none".to_string());
+        assert!(!fs_sharing_supported(&config));
     }
 
     // A multi-layer erofs `rootfs_mounts` artifact (ext4 rw upper + erofs lower)

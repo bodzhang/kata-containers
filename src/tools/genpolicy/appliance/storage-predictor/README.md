@@ -133,6 +133,18 @@ Mitigation options (not yet implemented):
   validation); otherwise `emptydir_mode` and the block driver are profile-sourced
   from `profile.env`. `pci_path` is not reconstructed (acceptable for virtio-blk,
   whose Agent source is the deterministic `/dev/vdX`).
+- `fs_sharing_supported` (the `VolumeContext` flag that mirrors the shim's
+  `capabilities.is_fs_sharing_supported()`) is derived from the sourced config's
+  `shared_fs`: true unless `shared_fs = "none"`. It materially changes routing —
+  upstream's `need_local_volume` is `!fs_sharing_supported && … && is_disk_empty_dir`,
+  so with virtio-fs a disk-backed `emptyDir`/`local` volume is shared over
+  virtio-fs (no `Storage`), while under `shared_fs = "none"` (block-only / many
+  CoCo profiles) it yields a `local` `Storage`. Caveat: under `shared_fs = "none"`
+  the real shim has **no** `ShareFs`, so ConfigMap/Secret volumes take the
+  copy-to-rootfs path; the predictor keeps the virtio-fs stub (to avoid the
+  copy-path's real-Agent dependency), so those are still modeled as `watchable-bind`
+  rather than copy-to-rootfs. `block_device_discard_supported` is left false (it
+  only affects the e2e-only block-volume path).
 
 ## Rootfs prediction (design)
 

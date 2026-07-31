@@ -58,9 +58,11 @@ fn predicts_storage_classes_without_vm() {
         .flat_map(|v| v["storages"].as_array().unwrap().iter())
         .map(|s| s["driver"].as_str().unwrap().to_string())
         .collect();
-    // The ephemeral class is produced authoritatively with no VM. (Upstream
-    // routes this `local` mount to a shared-fs mount without a `local` Storage,
-    // unlike the older cc-branch handler, so only `ephemeral` is asserted here.)
+    // The ephemeral class is produced authoritatively with no VM. With the
+    // default virtio-fs profile `fs_sharing_supported` is true, so upstream's
+    // `need_local_volume` is false and this disk `local` mount is shared over
+    // virtio-fs (no `LocalStorage`); under `shared_fs="none"` it would instead
+    // yield a `local` storage. Only `ephemeral` is asserted here.
     assert!(drivers.contains(&"ephemeral".to_string()), "drivers={:?}", drivers);
 
     let _ = fs::remove_dir_all(&base);
