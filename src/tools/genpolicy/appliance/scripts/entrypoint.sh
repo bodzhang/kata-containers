@@ -269,6 +269,41 @@ python3 "${appliance_root}/scripts/tag_oci.py" \
 	--output-dir "${output_dir}/tagged" \
 	--manifest "${output_dir}/dynamic-tags.json"
 
+# Capture the Kata container rootfs_mounts (e.g. multi-layer erofs) that a
+# snapshotter would hand to the Kata shim. The appliance runs runc/overlayfs, so
+# the erofs mounts are prepared out-of-band on an equipped prep host and the
+# per-image snapshotter mounts are provided via GENPOLICY_ROOTFS_MOUNTS_DIR.
+# Best-effort; writes raw/<name>.rootfs-mounts.json consumed by the predictor.
+if [[ -n "${GENPOLICY_ROOTFS_MOUNTS_DIR:-}" && -d "${GENPOLICY_ROOTFS_MOUNTS_DIR}" ]]; then
+	python3 "${appliance_root}/scripts/capture_rootfs_mounts.py" \
+		--raw-dir "${output_dir}/raw" \
+		--mounts-dir "${GENPOLICY_ROOTFS_MOUNTS_DIR}" \
+		--report "${output_dir}/rootfs-mounts-captured.json" \
+		2>"${output_dir}/logs/rootfs-capture.log" ||
+		echo "rootfs-mounts capture failed; see logs/rootfs-capture.log" >&2
+fi
+
+# Predict Kata agent storages/devices from the captured OCI specs using the real
+# runtime-rs volume handlers driven by a dry-run hypervisor (no VM). The EROFS
+# dm-verity root hashes drive policy generation below; the rest is audit-only.
+# Best-effort; the mount-type rewriting inspects live host mount state, so this
+# must run while the workload volumes are still mounted.
+python3 "${appliance_root}/scripts/predict_storages.py" \
+	--raw-dir "${output_dir}/raw" \
+	--predictor /usr/local/bin/storage-predictor \
+	--emptydir-mode "${GENPOLICY_EMPTYDIR_MODE:-shared-fs}" \
+	--block-driver "${GENPOLICY_BLOCK_DRIVER:-virtio-blk-pci}" \
+	--kata-config "${GENPOLICY_KATA_CONFIG:-}" \
+	--output "${output_dir}/storages-devices-predicted.json" \
+	2>"${output_dir}/logs/storage-predictor.log" ||
+	echo "storage prediction failed; see logs/storage-predictor.log" >&2
+
+# Feed the predicted EROFS dm-verity root hashes into policy generation. The
+# predicted-storages file is best-effort, so pass it only when present.
+predicted_arg=()
+[[ -f "${output_dir}/storages-devices-predicted.json" ]] &&
+	predicted_arg=(--predicted-storages "${output_dir}/storages-devices-predicted.json")
+
 genpolicy-oci-compiler \
 	--raw-dir "${output_dir}/raw" \
 	--tagged-dir "${output_dir}/tagged" \
@@ -279,7 +314,8 @@ genpolicy-oci-compiler \
 	--output "${output_dir}/policy.rego" \
 	--diff-output "${output_dir}/policy-oci-diff.json" \
 	--annotation-output "${output_dir}/policy-annotation.txt" \
-	--annotated-yaml-output "${output_dir}/workload-policy.yaml"
+	--annotated-yaml-output "${output_dir}/workload-policy.yaml" \
+	"${predicted_arg[@]}"
 
 if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
 	python3 "${appliance_root}/scripts/tag_oci.py" \
@@ -300,7 +336,8 @@ if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
 		--diff-output "${output_dir}/policy-oci-diff-balanced.json" \
 		--annotation-output "${output_dir}/policy-annotation-balanced.txt" \
 		--annotated-yaml-output "${output_dir}/workload-policy-balanced.yaml" \
-		--regex-policy-mode balanced
+		--regex-policy-mode balanced \
+		"${predicted_arg[@]}"
 fi
 
 if [[ "${GENPOLICY_LEGACY_REFERENCE:-0}" == "1" ]]; then
@@ -324,36 +361,6 @@ if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
 		--output-dir "${output_dir}" \
 		--output "${output_dir}/policy-mode-report.json"
 fi
-
-# Audit-only: capture the Kata container rootfs_mounts (e.g. multi-layer erofs)
-# that a snapshotter would hand to the Kata shim, so the storage-predictor can
-# model the rootfs the guest actually mounts. The appliance runs runc/overlayfs,
-# so the erofs mounts are prepared out-of-band on an equipped prep host and the
-# per-image snapshotter mounts are provided via GENPOLICY_ROOTFS_MOUNTS_DIR.
-# Best-effort and non-gating; writes raw/<name>.rootfs-mounts.json consumed by
-# the predictor below.
-if [[ -n "${GENPOLICY_ROOTFS_MOUNTS_DIR:-}" && -d "${GENPOLICY_ROOTFS_MOUNTS_DIR}" ]]; then
-	python3 "${appliance_root}/scripts/capture_rootfs_mounts.py" \
-		--raw-dir "${output_dir}/raw" \
-		--mounts-dir "${GENPOLICY_ROOTFS_MOUNTS_DIR}" \
-		--report "${output_dir}/rootfs-mounts-captured.json" \
-		2>"${output_dir}/logs/rootfs-capture.log" ||
-		echo "rootfs-mounts capture failed (audit-only); see logs/rootfs-capture.log" >&2
-fi
-
-# Audit-only: predict Kata agent storages/devices from the captured OCI specs
-# using the real runtime-rs volume handlers driven by a dry-run hypervisor (no
-# VM). Best-effort and non-gating; the mount-type rewriting inspects live host
-# mount state, so this must run while the workload volumes are still mounted.
-python3 "${appliance_root}/scripts/predict_storages.py" \
-	--raw-dir "${output_dir}/raw" \
-	--predictor /usr/local/bin/storage-predictor \
-	--emptydir-mode "${GENPOLICY_EMPTYDIR_MODE:-shared-fs}" \
-	--block-driver "${GENPOLICY_BLOCK_DRIVER:-virtio-blk-pci}" \
-	--kata-config "${GENPOLICY_KATA_CONFIG:-}" \
-	--output "${output_dir}/storages-devices-predicted.json" \
-	2>"${output_dir}/logs/storage-predictor.log" ||
-	echo "storage prediction failed (audit-only); see logs/storage-predictor.log" >&2
 
 provenance_artifacts=(
 	--artifact "kube-apiserver=/usr/local/bin/kube-apiserver"
