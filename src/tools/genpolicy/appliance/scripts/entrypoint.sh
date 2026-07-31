@@ -314,13 +314,6 @@ coverage_arg=()
 [[ "${STRICT_STORAGE_COVERAGE:-0}" == "1" ]] &&
 	coverage_arg=(--strict-storage-coverage true)
 
-# Guest-pull images must be digest-pinned (name@sha256:...) by default, since a
-# mutable tag does not pin image content. GENPOLICY_ALLOW_IMAGE_TAGS=1 relaxes
-# this (content integrity then relies on the guest's image signature policy).
-digest_arg=()
-[[ "${GENPOLICY_ALLOW_IMAGE_TAGS:-0}" == "1" ]] &&
-	digest_arg=(--require-image-digest false)
-
 genpolicy-oci-compiler \
 	--raw-dir "${output_dir}/raw" \
 	--tagged-dir "${output_dir}/tagged" \
@@ -333,8 +326,7 @@ genpolicy-oci-compiler \
 	--annotation-output "${output_dir}/policy-annotation.txt" \
 	--annotated-yaml-output "${output_dir}/workload-policy.yaml" \
 	"${predicted_arg[@]}" \
-	"${coverage_arg[@]}" \
-	"${digest_arg[@]}"
+	"${coverage_arg[@]}"
 
 if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
 	python3 "${appliance_root}/scripts/tag_oci.py" \
@@ -357,8 +349,7 @@ if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
 		--annotated-yaml-output "${output_dir}/workload-policy-balanced.yaml" \
 		--regex-policy-mode balanced \
 		"${predicted_arg[@]}" \
-		"${coverage_arg[@]}" \
-		"${digest_arg[@]}"
+		"${coverage_arg[@]}"
 fi
 
 if [[ "${GENPOLICY_LEGACY_REFERENCE:-0}" == "1" ]]; then

@@ -88,13 +88,12 @@ image**. dm-verity pins the layer *bytes* and guest pull pins the image
 *reference*, but that only faithfully encodes intent if the manifest names the
 image by digest: a mutable tag (`nginx:1.27`) can be repointed by whoever
 controls the registry, so it cannot specify which image the author meant. The
-compiler therefore enforces, for every workload container, that the
-`io.kubernetes.cri.image-name` (or CRI-O `io.kubernetes.cri-o.ImageName`)
-reference is a `name@sha256:<digest>` — a tag fails generation. The sandbox/pause
-container is exempt (infrastructure, not a workload reference). Set
-`GENPOLICY_ALLOW_IMAGE_TAGS=1` (`--require-image-digest false`) to relax this,
-in which case content integrity relies on the guest's own image signature
-policy instead.
+appliance enforces this at the **input YAML** — the artifact it processes and
+annotates — in `scripts/submit_workload.py` (`validate_image_references`), which
+rejects any container (init / regular / ephemeral, across Pod and the workload
+kinds) whose `image:` is not a `name@sha256:<digest>` reference, before the
+workload is ever run or captured. The generated policy therefore only ever pins
+digest-anchored images.
 
 ### Rootfs: guest-pull image pinning
 

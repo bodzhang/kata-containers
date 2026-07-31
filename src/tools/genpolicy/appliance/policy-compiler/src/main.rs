@@ -31,7 +31,6 @@ struct Args {
     regex_policy_mode: String,
     predicted_storages: Option<PathBuf>,
     strict_storage_coverage: bool,
-    require_image_digest: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -199,11 +198,6 @@ fn parse_args() -> Result<Args> {
         strict_storage_coverage: values
             .get("--strict-storage-coverage")
             .is_some_and(|value| value.to_string_lossy() == "true"),
-        // Default on: a guest-pull image must be digest-pinned (name@sha256:...),
-        // since a mutable tag does not pin image content.
-        require_image_digest: values
-            .get("--require-image-digest")
-            .is_none_or(|value| value.to_string_lossy() != "false"),
     })
 }
 
@@ -941,7 +935,6 @@ fn run(args: Args) -> Result<()> {
             .get(&identity)
             .map(|(_, capture)| capture)
             .ok_or_else(|| anyhow!("no raw OCI capture for {identity:?}"))?;
-        enforce_image_digest(&identity.0, &capture, args.require_image_digest)?;
         let container_workload_policy = capture
             .annotations
             .get("io.kubernetes.cri.container-name")
@@ -1090,58 +1083,6 @@ fn collect_dmverity_roothashes(path: &Path) -> Result<DmVerityData> {
     Ok(DmVerityData {
         allowed_roothashes: roots.into_iter().collect(),
     })
-}
-
-/// Returns true if an image reference is digest-pinned (`name@algorithm:hex`,
-/// e.g. `...@sha256:<64 hex>`). Only a digest pins image content; a tag is
-/// mutable and can be repointed by whoever controls the registry, so it cannot
-/// express which image the workload author intended.
-fn is_digest_pinned(image: &str) -> bool {
-    match image.rsplit_once('@') {
-        Some((_, digest)) => digest.split_once(':').is_some_and(|(algo, hex)| {
-            !algo.is_empty() && hex.len() >= 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())
-        }),
-        None => false,
-    }
-}
-
-/// The workload author's declared image reference for a captured container, from
-/// the CRI (`io.kubernetes.cri.image-name`) or CRI-O
-/// (`io.kubernetes.cri-o.ImageName`) annotation.
-fn captured_image_reference(capture: &CapturedSpec) -> Option<&str> {
-    capture
-        .annotations
-        .get("io.kubernetes.cri.image-name")
-        .or_else(|| capture.annotations.get("io.kubernetes.cri-o.ImageName"))
-        .map(String::as_str)
-}
-
-/// Enforces that a workload container's image is digest-pinned. Every appliance
-/// rootfs solution (erofs dm-verity, single-layer dm-verity, guest pull) binds
-/// the generated policy to the developer's declared image; a mutable tag cannot
-/// express that intent, so with `require_digest` set (the default) a tag-only
-/// reference is rejected. The sandbox/pause container is exempt (its image is
-/// infrastructure, not a workload reference).
-fn enforce_image_digest(
-    container_type: &str,
-    capture: &CapturedSpec,
-    require_digest: bool,
-) -> Result<()> {
-    if !require_digest || container_type == "sandbox" {
-        return Ok(());
-    }
-    if let Some(image) = captured_image_reference(capture) {
-        if !is_digest_pinned(image) {
-            bail!(
-                "container image \"{image}\" is referenced by tag, not by digest; a mutable tag \
-                 does not pin image content, so the policy cannot enforce the workload author's \
-                 image intent. Use an image@sha256:<digest> reference in the manifest, or set \
-                 GENPOLICY_ALLOW_IMAGE_TAGS=1 (content integrity then relies on the guest's image \
-                 signature policy)"
-            );
-        }
-    }
-    Ok(())
 }
 
 /// Collects the union of guest-pull image references from a predicted-storages
@@ -1468,43 +1409,6 @@ mod tests {
         let path = write_report(&dir, "predicted.json", report);
         assert!(collect_guest_pull_images(&path).is_err());
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    fn capture_with_image(image: Option<&str>) -> CapturedSpec {
-        let mut annotations = BTreeMap::new();
-        if let Some(image) = image {
-            annotations.insert("io.kubernetes.cri.image-name".to_string(), image.to_string());
-        }
-        CapturedSpec {
-            annotations,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn image_digest_gate_rejects_tag_for_workload() {
-        let tagged = capture_with_image(Some("docker.io/library/nginx:1.27"));
-        let digest = capture_with_image(Some(
-            "docker.io/library/nginx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ));
-        // Workload container: a tag is rejected, a digest passes.
-        assert!(enforce_image_digest("container", &tagged, true).is_err());
-        assert!(enforce_image_digest("container", &digest, true).is_ok());
-        // Gate off, or the sandbox/pause container: always allowed.
-        assert!(enforce_image_digest("container", &tagged, false).is_ok());
-        assert!(enforce_image_digest("sandbox", &tagged, true).is_ok());
-        // No image annotation: nothing to check.
-        assert!(enforce_image_digest("container", &capture_with_image(None), true).is_ok());
-    }
-
-    #[test]
-    fn digest_pinned_reference_detection() {
-        assert!(is_digest_pinned(
-            "docker.io/library/nginx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        assert!(!is_digest_pinned("docker.io/library/nginx:1.27"));
-        assert!(!is_digest_pinned("nginx"));
-        assert!(!is_digest_pinned("nginx@sha256:tooshort"));
     }
 
     #[test]
