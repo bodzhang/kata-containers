@@ -912,6 +912,10 @@ fn run(args: Args) -> Result<()> {
     let mut allow_env_regex = Vec::new();
     let mut containers = Vec::new();
     let mut reports = Vec::new();
+    let volume_storages = match &args.predicted_storages {
+        Some(path) => collect_volume_storages(path)?,
+        None => BTreeMap::new(),
+    };
     for (identity, (name, capture)) in captures {
         let raw_capture = raw_captures
             .get(&identity)
@@ -938,6 +942,18 @@ fn run(args: Args) -> Result<()> {
                 exec_commands,
                 container_sandbox_name_pattern,
             )?;
+        let mut container = container;
+        // Inject the predictor's authoritative volume storages (templated to the
+        // policy path variables) so storage-bearing containers get a working
+        // policy instead of failing closed on an empty p_storages.
+        if let Some(storages) = capture
+            .annotations
+            .get("io.kubernetes.cri.container-name")
+            .and_then(|name| volume_storages.get(name))
+        {
+            container.storages = storages.clone();
+            report["injected_storages"] = json!(container.storages.len());
+        }
         if args.regex_policy_mode == "legacy" {
             let checked = validate_legacy_service_env_coverage(
                 &capture,
@@ -1050,6 +1066,111 @@ fn collect_dmverity_roothashes(path: &Path) -> Result<DmVerityData> {
     })
 }
 
+/// Templates a predicted volume storage so its concrete guest paths become the
+/// policy variables the rules.rego `allow_storage` clauses substitute at
+/// enforcement (`$(cpath)` / `$(sandbox-id)`). The literal file name is
+/// regex-escaped and anchored so the storage is pinned exactly. Returns `None`
+/// for storage classes we cannot yet template (the caller warns and omits them,
+/// so those containers keep failing closed, exactly as they do without a
+/// predicted report).
+fn template_volume_storage(storage: &Value) -> Result<Option<agent::Storage>> {
+    let field = |name: &str| storage.get(name).and_then(Value::as_str).unwrap_or_default();
+    let string_list = |name: &str| -> Vec<String> {
+        storage
+            .get(name)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+            .unwrap_or_default()
+    };
+    let fs_type = field("fs_type");
+    let mount_point = field("mount_point");
+
+    let templated_mount_point = match fs_type {
+        // ephemeral emptyDir (tmpfs): /run/kata-containers/sandbox/ephemeral/<file>.
+        // The path carries no sandbox/bundle id, so anchor the escaped literal;
+        // the rules.rego `tmpfs` allow_mount_point clause matches it verbatim.
+        "tmpfs" => format!("^{}$", regex::escape(mount_point)),
+        // local emptyDir: $(cpath)/<sandbox-id>/rootfs/local/<file>. Template the
+        // shared-path prefix and sandbox id so the `local` allow_mount_point
+        // clause substitutes them, and pin the escaped file name.
+        "local" => {
+            let file = Path::new(mount_point)
+                .file_name()
+                .ok_or_else(|| {
+                    anyhow!("local storage mount_point {mount_point} has no file name")
+                })?
+                .to_string_lossy();
+            format!(
+                "^$(cpath)/$(sandbox-id)/rootfs/local/{}$",
+                regex::escape(&file)
+            )
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(agent::Storage {
+        driver: field("driver").to_string(),
+        driver_options: string_list("driver_options"),
+        // local/ephemeral sources are the constants "local"/"tmpfs", matched by
+        // allow_storage_source's equality clause, so they need no templating.
+        source: field("source").to_string(),
+        fstype: fs_type.to_string(),
+        options: string_list("options"),
+        mount_point: templated_mount_point,
+        shared: storage.get("shared").and_then(Value::as_bool).unwrap_or(false),
+        ..Default::default()
+    }))
+}
+
+/// Reads the predicted-storages report and templates each container's volume
+/// storages into policy `p_storages`, keyed by CRI container name. Storage
+/// classes we cannot yet template are logged and omitted (those containers keep
+/// failing closed, as they do without a predicted report), so the generated
+/// policy is never silently loosened.
+fn collect_volume_storages(path: &Path) -> Result<BTreeMap<String, Vec<agent::Storage>>> {
+    let report: Value = serde_json::from_str(&fs::read_to_string(path)?)
+        .with_context(|| format!("parse predicted storages {}", path.display()))?;
+    let mut by_container = BTreeMap::new();
+    for pred in report
+        .get("predictions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let Some(name) = pred.get("container_name").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut templated = Vec::new();
+        for volume in pred
+            .get("volumes")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            for storage in volume
+                .get("storages")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                match template_volume_storage(storage)? {
+                    Some(s) => templated.push(s),
+                    None => eprintln!(
+                        "warning: container {name} has an unsupported volume storage class \
+                         (fs_type={}); it is omitted from the policy and will fail closed at \
+                         runtime",
+                        storage.get("fs_type").and_then(Value::as_str).unwrap_or("?")
+                    ),
+                }
+            }
+        }
+        if !templated.is_empty() {
+            by_container.insert(name.to_string(), templated);
+        }
+    }
+    Ok(by_container)
+}
+
 fn main() -> Result<()> {
     run(parse_args()?)
 }
@@ -1109,6 +1230,84 @@ mod tests {
         let path = write_report(&dir, "predicted.json", report);
         let dmv = collect_dmverity_roothashes(&path).unwrap();
         assert!(dmv.allowed_roothashes.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ephemeral_storage_templated_to_anchored_path() {
+        let storage = json!({
+            "driver": "ephemeral", "driver_options": [], "source": "tmpfs",
+            "fs_type": "tmpfs", "options": [], "shared": false,
+            "mount_point": "/run/kata-containers/sandbox/ephemeral/cache-volume"
+        });
+        let templated = template_volume_storage(&storage).unwrap().unwrap();
+        assert_eq!(templated.driver, "ephemeral");
+        assert_eq!(templated.source, "tmpfs");
+        assert_eq!(templated.fstype, "tmpfs");
+        // regex::escape escapes the literal path (including hyphens as `\-`); the
+        // escaped form still matches the runtime path at enforcement.
+        assert_eq!(
+            templated.mount_point,
+            "^/run/kata\\-containers/sandbox/ephemeral/cache\\-volume$"
+        );
+    }
+
+    #[test]
+    fn local_storage_templated_with_path_variables() {
+        let storage = json!({
+            "driver": "local", "driver_options": [], "source": "local",
+            "fs_type": "local", "options": ["mode=0777"], "shared": false,
+            "mount_point":
+                "/run/kata-containers/shared/containers/passthrough/sid123/rootfs/local/data.volume"
+        });
+        let templated = template_volume_storage(&storage).unwrap().unwrap();
+        assert_eq!(templated.source, "local");
+        // The concrete cpath/sandbox-id are replaced by policy variables and the
+        // file name is regex-escaped (the "." becomes "\.").
+        assert_eq!(
+            templated.mount_point,
+            "^$(cpath)/$(sandbox-id)/rootfs/local/data\\.volume$"
+        );
+        assert_eq!(templated.options, vec!["mode=0777".to_string()]);
+    }
+
+    #[test]
+    fn unsupported_storage_class_is_skipped() {
+        let storage = json!({
+            "driver": "ephemeral", "source": "nodev", "fs_type": "hugetlbfs",
+            "options": ["pagesize=2M,size=100Mi"], "shared": false,
+            "mount_point": "/dev/hugepages"
+        });
+        assert!(template_volume_storage(&storage).unwrap().is_none());
+    }
+
+    #[test]
+    fn volume_storages_collected_by_container_name() {
+        let dir = std::env::temp_dir().join(format!("gp-vol-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let report = json!({
+            "predictions": [{
+                "container_id": "c1",
+                "container_name": "app",
+                "volumes": [
+                    {"storages": [{
+                        "driver": "ephemeral", "driver_options": [], "source": "tmpfs",
+                        "fs_type": "tmpfs", "options": [], "shared": false,
+                        "mount_point": "/run/kata-containers/sandbox/ephemeral/cache"
+                    }]},
+                    {"storages": [{
+                        "driver": "ephemeral", "source": "nodev", "fs_type": "hugetlbfs",
+                        "options": ["pagesize=2M,size=100Mi"], "shared": false,
+                        "mount_point": "/dev/hugepages"
+                    }]}
+                ]
+            }]
+        });
+        let path = write_report(&dir, "predicted.json", report);
+        let by_container = collect_volume_storages(&path).unwrap();
+        // The hugetlbfs storage is skipped; only the ephemeral one is templated.
+        assert_eq!(by_container["app"].len(), 1);
+        assert_eq!(by_container["app"][0].fstype, "tmpfs");
         let _ = fs::remove_dir_all(&dir);
     }
 

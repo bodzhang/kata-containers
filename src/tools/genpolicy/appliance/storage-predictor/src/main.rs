@@ -578,6 +578,11 @@ struct Prediction {
     schema_version: u32,
     sandbox_id: String,
     container_id: String,
+    /// CRI container name (`io.kubernetes.cri.container-name`). The policy
+    /// compiler keys captures by this name, so it is emitted here to let the
+    /// compiler map predicted volume storages back to the right container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container_name: Option<String>,
     emptydir_mode: String,
     volumes: Vec<PredictedVolume>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -732,10 +737,15 @@ async fn main() -> Result<()> {
     };
 
     let output_path = args.output.clone();
+    let container_name = spec
+        .annotations()
+        .as_ref()
+        .and_then(|a| a.get("io.kubernetes.cri.container-name").cloned());
     let prediction = Prediction {
         schema_version: 1,
         sandbox_id: args.sid,
         container_id: args.cid,
+        container_name,
         emptydir_mode,
         volumes: predicted_volumes,
         rootfs,

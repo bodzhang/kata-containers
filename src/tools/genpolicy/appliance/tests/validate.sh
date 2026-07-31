@@ -27,9 +27,12 @@ grep -Fq "ARG ETCD_VERSION=${ETCD_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "ARG CNI_PLUGINS_VERSION=${CNI_PLUGINS_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "sandbox_image = \"${PAUSE_IMAGE}\"" "${appliance_dir}/config/containerd.toml"
 
-# Rego policy-rule tests (EROFS dm-verity storage pinning). Requires `opa`.
+# Rego policy-rule tests (EROFS dm-verity storage pinning, volume-storage
+# injection). Requires `opa`. Each test file declares its own package-level
+# `policy_data`, so they run in separate invocations to avoid a rule conflict.
 if command -v opa >/dev/null 2>&1; then
 	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/erofs_dmverity_test.rego"
+	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/volume_storages_test.rego"
 else
 	echo "opa not found; skipping rego policy tests" >&2
 fi
