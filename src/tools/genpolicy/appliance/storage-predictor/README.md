@@ -6,12 +6,12 @@ records containerd's mount view, not the Agent `storages`/`devices` that the Kat
 shim synthesizes downstream.
 
 The predicted `storages` now **drive policy generation**: the policy compiler
-consumes `storages-devices-predicted.json` to pin the container rootfs by EROFS
-dm-verity root hash and to inject each container's volume `storages` into the
-generated `policy.rego`, so storage-bearing workloads get a working,
-tightly-scoped policy instead of failing closed. Predicted **devices** remain
-audit-only — the generated `devices` list is still empty (see *Known gaps*). See
-*Driving policy generation* below.
+consumes `storages-devices-predicted.json` to pin the container rootfs (by EROFS
+dm-verity root hash, or by guest-pull image reference) and to inject each
+container's volume `storages` into the generated `policy.rego`, so storage-bearing
+workloads get a working, tightly-scoped policy instead of failing closed.
+Predicted **devices** remain audit-only — the generated `devices` list is still
+empty (see *Known gaps*). See *Driving policy generation* below.
 
 ## Design
 
@@ -80,6 +80,22 @@ allowlisted hash, while the writable `ext4` upper is allowed by shape. Legacy
 `genpolicy` emits no rootfs storages at all, so erofs containers fail closed
 under it — this is a capability the drive adds.
 
+### Rootfs: guest-pull image pinning
+
+For the mainstream CoCo rootfs (guest pull), the predictor reuses the shim's own
+`adjust_rootfs_mounts` to synthesize the guest-pull `KataVirtualVolume` and runs
+it through the real `handler_rootfs` with no `ShareFs` (`--guest-pull-rootfs`; in
+the appliance `GENPOLICY_GUEST_PULL=1`). The resulting `image_guest_pull`
+`Storage` carries `source` = the image reference from
+`io.kubernetes.cri.image-name`. The compiler collects the union of those
+references into `policy_data.guest_pull.allowed_images`, and the `rules.rego`
+`image_guest_pull` clause pins the pulled image to that allowlist. To stay
+backward compatible (legacy genpolicy, or the predictor not run), an empty
+allowlist falls back to the historical allow-by-shape. The huge, non-deterministic
+`driver_options` metadata blob is intentionally not pinned; the image reference
+is the security-relevant field (the guest pulls and verifies it by digest inside
+the TEE).
+
 ### Volume storages: templated injection
 
 Each container's predicted `volumes[].storages` are injected into
@@ -122,8 +138,8 @@ choice for operators who want to guarantee full coverage.
   `rules.rego` functions (legacy genpolicy calls them too); changing their
   signature would break that contract, so this is deferred pending an
   additive per-container mechanism.
-- **Devices** (block/scsi/direct-volume) and **guest-pull source pinning** are
-  larger follow-ups — see *Known gaps* and *Rootfs prediction (design)*.
+- **Devices** (block/scsi/direct-volume) are a larger follow-up — see *Known
+  gaps* and *Rootfs prediction (design)*.
 
 ## Drift risk and mitigation
 
@@ -248,10 +264,13 @@ entirely from data the appliance already captures:
 - `driver_options` = the serialized `ImagePull` metadata (the pod annotations)
 
 Because the guest pulls and verifies the image by digest inside the TEE, this
-storage is **deterministic from the captured spec** — the predictor can synthesize
-the guest-pull `KataVirtualVolume` option, call `handler_rootfs`, and emit the real
-Agent `Storage` with no snapshotter, VM, or device. This is a good follow-up
-increment.
+storage is **deterministic from the captured spec** — the predictor synthesizes
+the guest-pull `KataVirtualVolume` option (via the shim's own
+`adjust_rootfs_mounts`), calls `handler_rootfs`, and emits the real Agent
+`Storage` with no snapshotter, VM, or device. **Implemented** via
+`--guest-pull-rootfs`; the compiler pins `source` into
+`policy_data.guest_pull.allowed_images` (see *Driving policy generation*). Proven
+by the `predicts_guest_pull_rootfs` integration test.
 
 ### Multi-layer erofs rootfs — implemented (`--rootfs-mounts`)
 

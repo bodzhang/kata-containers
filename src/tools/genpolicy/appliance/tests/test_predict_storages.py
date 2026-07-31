@@ -35,7 +35,7 @@ class PredictStoragesTests(unittest.TestCase):
 
             captured = {}
 
-            def fake_predict_one(predictor, config, cid, sid, emptydir_mode, block_driver, kata_config, rootfs_mounts=""):
+            def fake_predict_one(predictor, config, cid, sid, emptydir_mode, block_driver, kata_config, rootfs_mounts="", guest_pull=False):
                 captured["cid"] = cid
                 captured["sid"] = sid
                 captured["emptydir_mode"] = emptydir_mode
@@ -64,7 +64,7 @@ class PredictStoragesTests(unittest.TestCase):
                 json.dumps({"container_id": "c"}), encoding="utf-8"
             )
 
-            def failing(predictor, config, cid, sid, emptydir_mode, block_driver, kata_config, rootfs_mounts=""):
+            def failing(predictor, config, cid, sid, emptydir_mode, block_driver, kata_config, rootfs_mounts="", guest_pull=False):
                 return {"container_id": cid, "sandbox_id": sid, "error": "boom"}
 
             with mock.patch.object(MODULE, "predict_one", failing):
@@ -84,7 +84,7 @@ class PredictStoragesTests(unittest.TestCase):
 
             captured = {}
 
-            def fake(predictor, config, cid, sid, emptydir_mode, block_driver, kata_config, rootfs_mounts=""):
+            def fake(predictor, config, cid, sid, emptydir_mode, block_driver, kata_config, rootfs_mounts="", guest_pull=False):
                 captured["rootfs_mounts"] = rootfs_mounts
                 return {"container_id": cid, "sandbox_id": sid, "volumes": []}
 
@@ -92,6 +92,27 @@ class PredictStoragesTests(unittest.TestCase):
                 MODULE.collect(raw, "predictor", "shared-fs", "virtio-blk-pci", "")
 
             self.assertEqual(captured["rootfs_mounts"], str(rootfs_artifact))
+
+    def test_collect_forwards_guest_pull(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary)
+            (raw / "0001-r.config.json").write_text("{}", encoding="utf-8")
+            (raw / "0001-r.meta.json").write_text(
+                json.dumps({"container_id": "r"}), encoding="utf-8"
+            )
+
+            captured = {}
+
+            def fake(predictor, config, cid, sid, emptydir_mode, block_driver, kata_config, rootfs_mounts="", guest_pull=False):
+                captured["guest_pull"] = guest_pull
+                return {"container_id": cid, "sandbox_id": sid, "volumes": []}
+
+            with mock.patch.object(MODULE, "predict_one", fake):
+                MODULE.collect(
+                    raw, "predictor", "shared-fs", "virtio-blk-pci", "", guest_pull=True
+                )
+
+            self.assertTrue(captured["guest_pull"])
 
 
 if __name__ == "__main__":

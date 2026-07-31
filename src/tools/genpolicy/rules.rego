@@ -1268,8 +1268,22 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     i_storage.fs_group == null
     i_storage.shared == false
     count(i_storage.options) == 0
-    # TODO: Check Mount Point, Source, Driver Options, etc.
+    allow_guest_pull_image(i_storage)
     print("allow_storage with image_guest_pull: true")
+}
+
+# Pin the guest-pulled image reference to the appliance-predicted allowlist
+# (policy_data.guest_pull.allowed_images). With no allowlist configured (legacy
+# genpolicy, or the predictor was not run) fall back to the historical
+# allow-by-shape so existing policies keep working.
+allow_guest_pull_image(i_storage) if {
+    count(object.get(policy_data, ["guest_pull", "allowed_images"], [])) == 0
+    print("allow_guest_pull_image: no allowlist, allow by shape")
+}
+allow_guest_pull_image(i_storage) if {
+    some image in object.get(policy_data, ["guest_pull", "allowed_images"], [])
+    i_storage.source == image
+    print("allow_guest_pull_image: pinned image =", image)
 }
 allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     print("allow_storage with scsi: start")

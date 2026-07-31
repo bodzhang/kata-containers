@@ -5,6 +5,57 @@
 use std::fs;
 use std::process::Command;
 
+// A guest-pull container rootfs (--guest-pull-rootfs) is predicted from the OCI
+// image-name annotation via the real handler_rootfs, with no snapshotter or VM.
+#[test]
+fn predicts_guest_pull_rootfs() {
+    let base = std::env::temp_dir().join(format!("gp-p2-gp-{}", std::process::id()));
+    fs::create_dir_all(&base).unwrap();
+    let config = base.join("config.json");
+    let output = base.join("predicted.json");
+    let spec = serde_json::json!({
+        "ociVersion": "1.0.0",
+        "mounts": [],
+        "annotations": {
+            "io.kubernetes.cri.container-type": "container",
+            "io.kubernetes.cri.image-name": "docker.io/library/nginx:1.27"
+        }
+    });
+    fs::write(&config, serde_json::to_string(&spec).unwrap()).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_storage-predictor");
+    let status = Command::new(bin)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--sid",
+            "sb",
+            "--cid",
+            "ctr123",
+            "--emptydir-mode",
+            "",
+            "--guest-pull-rootfs",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "predictor exited with failure");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+    let storage = &parsed["rootfs"]["storages"][0];
+    assert_eq!(storage["driver"], "image_guest_pull");
+    assert_eq!(storage["fs_type"], "overlay");
+    assert_eq!(storage["source"], "docker.io/library/nginx:1.27");
+    assert_eq!(
+        parsed["rootfs"]["guest_path"],
+        "/run/kata-containers/ctr123/rootfs"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
 // Drives the predictor binary end-to-end on an OCI config.json whose mounts are
 // already Kata-typed, so the run is deterministic without live host tmpfs mounts.
 #[test]

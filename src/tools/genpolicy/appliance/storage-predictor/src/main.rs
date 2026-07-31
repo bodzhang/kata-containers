@@ -429,6 +429,7 @@ struct Args {
     disable_guest_empty_dir: bool,
     kata_config: Option<PathBuf>,
     rootfs_mounts: Option<PathBuf>,
+    guest_pull_rootfs: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -441,6 +442,7 @@ fn parse_args() -> Result<Args> {
     let mut disable_guest_empty_dir = false;
     let mut kata_config: Option<PathBuf> = None;
     let mut rootfs_mounts: Option<PathBuf> = None;
+    let mut guest_pull_rootfs = false;
 
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -462,9 +464,14 @@ fn parse_args() -> Result<Args> {
                 rootfs_mounts =
                     Some(PathBuf::from(iter.next().context("--rootfs-mounts needs a value")?))
             }
+            "--guest-pull-rootfs" => guest_pull_rootfs = true,
             "--disable-guest-empty-dir" => disable_guest_empty_dir = true,
             other => bail!("unknown argument: {other}"),
         }
+    }
+
+    if guest_pull_rootfs && rootfs_mounts.is_some() {
+        bail!("--guest-pull-rootfs and --rootfs-mounts are mutually exclusive");
     }
 
     Ok(Args {
@@ -477,6 +484,7 @@ fn parse_args() -> Result<Args> {
         disable_guest_empty_dir,
         kata_config,
         rootfs_mounts,
+        guest_pull_rootfs,
     })
 }
 
@@ -657,6 +665,46 @@ async fn predict_rootfs(
     })
 }
 
+/// Predicts a guest-pull container rootfs (mainstream CoCo). It reuses the shim's
+/// own `adjust_rootfs_mounts` to synthesize the guest-pull `KataVirtualVolume`
+/// mount and routes it through the real `handler_rootfs` with **no** `ShareFs`
+/// (which is what `is_guest_pull_volume` keys on). The resulting `image_guest_pull`
+/// `Storage` derives its `source` from the OCI `io.kubernetes.cri.image-name`
+/// annotation, needs no snapshotter, VM, or device, and is fully deterministic
+/// from the captured spec.
+async fn predict_guest_pull_rootfs(
+    spec: &oci_spec::runtime::Spec,
+    device_manager: &RwLock<DeviceManager>,
+    hv: &dyn Hypervisor,
+    sid: &str,
+    cid: &str,
+) -> Result<PredictedRootfs> {
+    let mounts = kata_types::mount::adjust_rootfs_mounts().context("adjust_rootfs_mounts")?;
+    let root = spec.root().clone().unwrap_or_default();
+    let annotations = spec.annotations().clone().unwrap_or_default();
+    let rootfs = RootFsResource::new()
+        .handler_rootfs(
+            &None,
+            &None,
+            device_manager,
+            hv,
+            sid,
+            cid,
+            &root,
+            "",
+            &mounts,
+            &annotations,
+        )
+        .await
+        .context("handler_rootfs (guest-pull)")?;
+    let storages = rootfs.get_storage().await.unwrap_or_default();
+    Ok(PredictedRootfs {
+        guest_path: Some(rootfs.get_guest_rootfs_path().await?),
+        storages: storages.iter().map(map_storage).collect(),
+        device_id: rootfs.get_device_id().await?,
+        error: None,
+    })
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args()?;
@@ -716,24 +764,35 @@ async fn main() -> Result<()> {
     // artifact. A transform failure (e.g. a virtio-blk-pci deployment hitting the
     // pci_path gap) is captured into the `error` field so the container's volume
     // prediction still succeeds.
-    let rootfs = match &args.rootfs_mounts {
-        None => None,
-        Some(rootfs_path) => Some(
-            predict_rootfs(
-                rootfs_path,
-                &spec,
-                &share_fs,
-                &device_manager,
-                hv.as_ref(),
-                &args.sid,
-                &args.cid,
-            )
-            .await
-            .unwrap_or_else(|e| PredictedRootfs {
-                error: Some(format!("{e:#}")),
-                ..Default::default()
-            }),
-        ),
+    let rootfs = if args.guest_pull_rootfs {
+        Some(
+            predict_guest_pull_rootfs(&spec, &device_manager, hv.as_ref(), &args.sid, &args.cid)
+                .await
+                .unwrap_or_else(|e| PredictedRootfs {
+                    error: Some(format!("{e:#}")),
+                    ..Default::default()
+                }),
+        )
+    } else {
+        match &args.rootfs_mounts {
+            None => None,
+            Some(rootfs_path) => Some(
+                predict_rootfs(
+                    rootfs_path,
+                    &spec,
+                    &share_fs,
+                    &device_manager,
+                    hv.as_ref(),
+                    &args.sid,
+                    &args.cid,
+                )
+                .await
+                .unwrap_or_else(|e| PredictedRootfs {
+                    error: Some(format!("{e:#}")),
+                    ..Default::default()
+                }),
+            ),
+        }
     };
 
     let output_path = args.output.clone();

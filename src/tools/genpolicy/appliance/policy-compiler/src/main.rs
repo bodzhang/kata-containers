@@ -120,6 +120,7 @@ struct PolicyData {
     devices: policy::Devices,
     cluster_config: policy::ClusterConfig,
     dmverity: DmVerityData,
+    guest_pull: GuestPullData,
 }
 
 /// Pod-scoped allowlist of EROFS dm-verity root hashes, consumed by the
@@ -127,6 +128,15 @@ struct PolicyData {
 #[derive(Debug, Default, Serialize)]
 struct DmVerityData {
     allowed_roothashes: Vec<String>,
+}
+
+/// Pod-scoped allowlist of guest-pull image references, consumed by the
+/// `image_guest_pull` `allow_storage` clause in rules.rego. When empty the
+/// clause falls back to the historical allow-by-shape (backward compatible with
+/// policies that carry no predicted guest-pull data).
+#[derive(Debug, Default, Serialize)]
+struct GuestPullData {
+    allowed_images: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -979,6 +989,10 @@ fn run(args: Args) -> Result<()> {
         Some(path) => collect_dmverity_roothashes(path)?,
         None => DmVerityData::default(),
     };
+    let guest_pull = match &args.predicted_storages {
+        Some(path) => collect_guest_pull_images(path)?,
+        None => GuestPullData::default(),
+    };
     let data = PolicyData {
         containers,
         common: settings.common,
@@ -987,6 +1001,7 @@ fn run(args: Args) -> Result<()> {
         devices: settings.devices,
         cluster_config: settings.cluster_config,
         dmverity,
+        guest_pull,
     };
     let rules = fs::read_to_string(&args.rules)?;
     let policy = format!(
@@ -1067,6 +1082,52 @@ fn collect_dmverity_roothashes(path: &Path) -> Result<DmVerityData> {
     }
     Ok(DmVerityData {
         allowed_roothashes: roots.into_iter().collect(),
+    })
+}
+
+/// Collects the union of guest-pull image references from a predicted-storages
+/// report. Each container's `rootfs` storage with driver `image_guest_pull`
+/// contributes its `source` (the image reference from
+/// `io.kubernetes.cri.image-name`). The rules.rego `image_guest_pull` clause
+/// pins the pulled image to this allowlist; an empty allowlist leaves the
+/// historical allow-by-shape behavior intact.
+fn collect_guest_pull_images(path: &Path) -> Result<GuestPullData> {
+    let report: Value = serde_json::from_str(&fs::read_to_string(path)?)
+        .with_context(|| format!("parse predicted storages {}", path.display()))?;
+    let mut images = BTreeSet::new();
+    for pred in report
+        .get("predictions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let Some(storages) = pred
+            .get("rootfs")
+            .and_then(|r| r.get("storages"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for storage in storages {
+            if storage.get("driver").and_then(Value::as_str) != Some("image_guest_pull") {
+                continue;
+            }
+            match storage.get("source").and_then(Value::as_str) {
+                Some(source) if !source.is_empty() => {
+                    images.insert(source.to_string());
+                }
+                _ => bail!(
+                    "container {} has a guest-pull rootfs without an image reference; \
+                     the generated policy would fail closed",
+                    pred.get("container_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                ),
+            }
+        }
+    }
+    Ok(GuestPullData {
+        allowed_images: images.into_iter().collect(),
     })
 }
 
@@ -1289,6 +1350,56 @@ mod tests {
         let path = write_report(&dir, "predicted.json", report);
         let dmv = collect_dmverity_roothashes(&path).unwrap();
         assert!(dmv.allowed_roothashes.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_pull_images_collected_from_rootfs() {
+        let dir = std::env::temp_dir().join(format!("gp-gp-ok-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let report = json!({
+            "predictions": [
+                {"container_id": "c1", "rootfs": {"storages": [{
+                    "driver": "image_guest_pull", "fs_type": "overlay",
+                    "source": "docker.io/library/nginx:1.27", "options": []
+                }]}},
+                {"container_id": "c2", "rootfs": {"storages": [{
+                    "driver": "image_guest_pull", "fs_type": "overlay",
+                    "source": "ghcr.io/app/api:v2", "options": []
+                }]}}
+            ]
+        });
+        let path = write_report(&dir, "predicted.json", report);
+        let gp = collect_guest_pull_images(&path).unwrap();
+        assert_eq!(
+            gp.allowed_images,
+            vec!["docker.io/library/nginx:1.27".to_string(), "ghcr.io/app/api:v2".to_string()]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_pull_empty_when_no_guest_pull_rootfs() {
+        let dir = std::env::temp_dir().join(format!("gp-gp-empty-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let report = json!({ "predictions": [{ "container_id": "c1", "volumes": [] }] });
+        let path = write_report(&dir, "predicted.json", report);
+        let gp = collect_guest_pull_images(&path).unwrap();
+        assert!(gp.allowed_images.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_pull_gate_rejects_missing_image_reference() {
+        let dir = std::env::temp_dir().join(format!("gp-gp-gate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let report = json!({
+            "predictions": [{"container_id": "c1", "rootfs": {"storages": [{
+                "driver": "image_guest_pull", "fs_type": "overlay", "source": "", "options": []
+            }]}}]
+        });
+        let path = write_report(&dir, "predicted.json", report);
+        assert!(collect_guest_pull_images(&path).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

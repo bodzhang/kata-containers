@@ -285,15 +285,19 @@ fi
 
 # Predict Kata agent storages/devices from the captured OCI specs using the real
 # runtime-rs volume handlers driven by a dry-run hypervisor (no VM). The EROFS
-# dm-verity root hashes drive policy generation below; the rest is audit-only.
-# Best-effort; the mount-type rewriting inspects live host mount state, so this
-# must run while the workload volumes are still mounted.
+# dm-verity root hashes and guest-pull image references drive policy generation
+# below; the rest is audit-only. Best-effort; the mount-type rewriting inspects
+# live host mount state, so this must run while the workload volumes are still
+# mounted.
+guest_pull_arg=()
+[[ "${GENPOLICY_GUEST_PULL:-0}" == "1" ]] && guest_pull_arg=(--guest-pull)
 python3 "${appliance_root}/scripts/predict_storages.py" \
 	--raw-dir "${output_dir}/raw" \
 	--predictor /usr/local/bin/storage-predictor \
 	--emptydir-mode "${GENPOLICY_EMPTYDIR_MODE:-shared-fs}" \
 	--block-driver "${GENPOLICY_BLOCK_DRIVER:-virtio-blk-pci}" \
 	--kata-config "${GENPOLICY_KATA_CONFIG:-}" \
+	"${guest_pull_arg[@]}" \
 	--output "${output_dir}/storages-devices-predicted.json" \
 	2>"${output_dir}/logs/storage-predictor.log" ||
 	echo "storage prediction failed; see logs/storage-predictor.log" >&2

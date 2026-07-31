@@ -30,6 +30,7 @@ def predict_one(
     block_driver: str,
     kata_config: str,
     rootfs_mounts: str = "",
+    guest_pull: bool = False,
 ) -> dict:
     with tempfile.TemporaryDirectory() as temporary:
         output = Path(temporary) / "predicted.json"
@@ -52,6 +53,10 @@ def predict_one(
             command += ["--kata-config", kata_config]
         if rootfs_mounts:
             command += ["--rootfs-mounts", rootfs_mounts]
+        elif guest_pull:
+            # No snapshotter rootfs artifact: model the container rootfs as a
+            # guest-pull image (mainstream CoCo). Mutually exclusive with erofs.
+            command += ["--guest-pull-rootfs"]
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             return {
@@ -63,7 +68,12 @@ def predict_one(
 
 
 def collect(
-    raw_dir: Path, predictor: str, emptydir_mode: str, block_driver: str, kata_config: str
+    raw_dir: Path,
+    predictor: str,
+    emptydir_mode: str,
+    block_driver: str,
+    kata_config: str,
+    guest_pull: bool = False,
 ) -> dict:
     predictions = []
     for config in sorted(raw_dir.glob(f"*{CONFIG_SUFFIX}")):
@@ -91,6 +101,7 @@ def collect(
                 block_driver,
                 kata_config,
                 rootfs_mounts,
+                guest_pull,
             )
         )
     return {"schema_version": 1, "predictions": predictions}
@@ -104,10 +115,21 @@ def main() -> None:
     parser.add_argument("--emptydir-mode", default="shared-fs")
     parser.add_argument("--block-driver", default="virtio-blk-pci")
     parser.add_argument("--kata-config", default="")
+    parser.add_argument(
+        "--guest-pull",
+        action="store_true",
+        help="model each container rootfs as a guest-pull image when no "
+        "snapshotter rootfs-mounts artifact is present",
+    )
     args = parser.parse_args()
 
     report = collect(
-        args.raw_dir, args.predictor, args.emptydir_mode, args.block_driver, args.kata_config
+        args.raw_dir,
+        args.predictor,
+        args.emptydir_mode,
+        args.block_driver,
+        args.kata_config,
+        args.guest_pull,
     )
     args.output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
