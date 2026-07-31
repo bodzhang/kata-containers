@@ -227,18 +227,28 @@ The **capture stage** that produces the artifact is `capture_rootfs_mounts.py`:
    against a **real** `layer.erofs` blob produced by the containerd erofs
    snapshotter: the `erofs` lower resolves to `/dev/vdb` and the `ext4` upper to
    `/dev/vda`, no VM.
-4. **Integrity** — this appliance's vendored erofs snapshotter config uses
-   **fs-verity** (`enable_fsverity`), so its erofs mounts carry no dm-verity root
-   hash. Upstream kata, however, has an **erofs dm-verity mode** (containerd
-   `dmverity_mode = 'on'` + differ `enable_dmverity = true`, enabled by kata-deploy
-   `erofs_dmverity`): upstream `ErofsMultiLayerRootfs` (GPT+VMDK) reads each layer's
-   `X-containerd.dmverity` metadata and, via `kata-types::gpt_disk::generate_dmverity_options`,
-   appends `X-kata.dmverity.roothash=` / `hashoffset` / `salt` to the erofs
-   lower-layer `Storage.options`; the agent's `multi_layer_erofs.rs` then activates
-   a dm-verity device per layer. Because that root hash is emitted **by the shim
-   rootfs handler into the Storage options**, this predictor would surface it with
-   no drift — but only once the appliance tracks the upstream `erofs_rootfs.rs` +
-   `gpt_disk.rs` (this branch's copy predates GPT/dm-verity support). A separate,
+4. **Integrity (dm-verity)** — this branch tracks upstream `erofs_rootfs.rs` +
+   `kata-types::gpt_disk`, so the predictor emits the erofs **dm-verity root hash**
+   through the real handler. When the captured `rootfs_mounts` has **more than one**
+   erofs layer (GPT+VMDK mode) and each erofs layer carries an
+   `X-containerd.dmverity=<metadata.json>` option, `ErofsMultiLayerRootfs` parses
+   that metadata (`roothash`, `hashoffset`) and, via
+   `gpt_disk::generate_dmverity_options`, appends to each erofs lower-layer
+   `Storage.options`:
+
+   ```
+   X-kata.dmverity-enabled=true
+   X-kata.dmverity.roothash=<hash>
+   X-kata.dmverity.hashoffset=<off>
+   X-kata.dmverity.salt=<salt>
+   X-kata.gpt-partitioned=true, X-kata.partition-number=N
+   ```
+
+   Proven with no VM by `dry_run_erofs_gpt_dmverity_emits_roothash` (unit) and
+   `predicts_erofs_dmverity_rootfs` (binary end-to-end). This is the containerd
+   erofs dm-verity mode (`dmverity_mode = 'on'` + differ `enable_dmverity = true`,
+   enabled by kata-deploy `erofs_dmverity`); the guest agent's `multi_layer_erofs.rs`
+   activates a dm-verity device per layer from these options. A separate,
    Go-runtime dm-verity model exists via `KataVirtualVolume` `image_raw_block` /
    `layer_raw_block` / `*_nydus_block` carrying `DmVerityInfo`.
 

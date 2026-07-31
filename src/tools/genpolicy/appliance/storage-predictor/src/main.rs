@@ -837,6 +837,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A GPT multi-layer erofs rootfs (>1 erofs layer) with per-layer
+    // `X-containerd.dmverity` annotations yields Agent rootfs storages carrying
+    // the dm-verity root hash, through the upstream ErofsMultiLayerRootfs GPT
+    // path — no VM.
+    #[tokio::test]
+    async fn dry_run_erofs_gpt_dmverity_emits_roothash() {
+        let dir = std::env::temp_dir().join(format!("gp-erofs-dmv-{}", std::process::id()));
+        // Two erofs layers in distinct snapshot dirs (GPT mode needs >1 erofs).
+        let mut layers = Vec::new();
+        for (i, hash) in [(1u32, "aa11"), (2u32, "bb22")] {
+            let sdir = dir.join("snapshots").join(i.to_string());
+            std::fs::create_dir_all(&sdir).unwrap();
+            let blob = sdir.join("layer.erofs");
+            std::fs::write(&blob, vec![0u8; 1 << 20]).unwrap();
+            let meta = sdir.join("layer.erofs.dmverity");
+            std::fs::write(
+                &meta,
+                serde_json::json!({ "roothash": hash, "hashoffset": 4096u64, "salt": "00" })
+                    .to_string(),
+            )
+            .unwrap();
+            layers.push((blob, meta));
+        }
+
+        let mut config = HypervisorConfig::default();
+        config.blockdev_info.block_device_driver = "virtio-blk-mmio".to_string();
+        let hv: Arc<dyn Hypervisor> = Arc::new(DryRunHypervisor { config });
+        let device_manager = RwLock::new(DeviceManager::new(hv.clone(), None).await.unwrap());
+
+        let mut rootfs_mounts = vec![KataMount {
+            source: "/dev/loop0".to_string(),
+            destination: PathBuf::from("/"),
+            fs_type: "ext4".to_string(),
+            options: vec!["rw".to_string()],
+            ..Default::default()
+        }];
+        for (blob, meta) in &layers {
+            rootfs_mounts.push(KataMount {
+                source: blob.display().to_string(),
+                destination: PathBuf::from("/"),
+                fs_type: "erofs".to_string(),
+                options: vec![
+                    "ro".to_string(),
+                    format!("X-containerd.dmverity={}", meta.display()),
+                ],
+                ..Default::default()
+            });
+        }
+        rootfs_mounts.push(KataMount {
+            source: "overlay".to_string(),
+            destination: PathBuf::from("/"),
+            fs_type: "overlay".to_string(),
+            options: vec![],
+            ..Default::default()
+        });
+
+        let share_fs: Option<Arc<dyn ShareFs>> = None;
+        let root = oci_spec::runtime::Root::default();
+        let annotations = HashMap::new();
+        let rootfs = RootFsResource::new()
+            .handler_rootfs(
+                &share_fs,
+                &None,
+                &device_manager,
+                hv.as_ref(),
+                "dmv-sid",
+                "dmv-cid",
+                &root,
+                "",
+                &rootfs_mounts,
+                &annotations,
+            )
+            .await
+            .unwrap();
+
+        let storages = rootfs.get_storage().await.unwrap();
+        // One ext4 upper + one GPT partition storage per erofs layer.
+        let erofs: Vec<_> = storages.iter().filter(|s| s.fs_type == "erofs").collect();
+        assert_eq!(erofs.len(), 2, "storages={:?}", storages);
+        for s in &erofs {
+            assert!(
+                s.options.iter().any(|o| o == "X-kata.dmverity-enabled=true"),
+                "missing dmverity-enabled: {:?}",
+                s.options
+            );
+            assert!(
+                s.options.iter().any(|o| o == "X-kata.gpt-partitioned=true"),
+                "missing gpt-partitioned: {:?}",
+                s.options
+            );
+        }
+        // Both root hashes surfaced from the .dmverity metadata, no VM.
+        let hashes: Vec<String> = erofs
+            .iter()
+            .flat_map(|s| s.options.iter())
+            .filter_map(|o| {
+                o.strip_prefix("X-kata.dmverity.roothash=")
+                    .map(|h| h.to_string())
+            })
+            .collect();
+        assert!(hashes.contains(&"aa11".to_string()), "hashes={:?}", hashes);
+        assert!(hashes.contains(&"bb22".to_string()), "hashes={:?}", hashes);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // A virtio-blk-pci deployment hits the pci_path gap: the erofs transform
     // errors, and `predict_rootfs` surfaces that error (the caller captures it
     // into the `error` field rather than dropping the volume prediction).

@@ -111,7 +111,7 @@ fn predicts_configmap_watchable_bind_storage() {
         .iter()
         .flat_map(|v| v["storages"].as_array().unwrap().iter())
         .collect();
-    assert_eq!(storages.len(), 1, "parsed={parsed}");
+    assert_eq!(storages.len(), 1, "parsed={}", parsed);
     assert_eq!(storages[0]["driver"], "watchable-bind");
     assert_eq!(storages[0]["fs_type"], "bind");
 
@@ -178,11 +178,97 @@ fn predicts_erofs_multi_layer_rootfs() {
     let parsed: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
     let storages = parsed["rootfs"]["storages"].as_array().unwrap();
-    assert_eq!(storages.len(), 2, "parsed={parsed}");
+    assert_eq!(storages.len(), 2, "parsed={}", parsed);
     assert_eq!(storages[0]["fs_type"], "ext4");
     assert_eq!(storages[0]["source"], "/dev/vda");
     assert_eq!(storages[1]["fs_type"], "erofs");
     assert_eq!(storages[1]["source"], "/dev/vdb");
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+// A captured multi-layer erofs rootfs_mounts artifact whose erofs layers carry
+// `X-containerd.dmverity` annotations is transformed end-to-end by the binary
+// into GPT-partitioned rootfs storages carrying the dm-verity root hash, no VM.
+#[test]
+fn predicts_erofs_dmverity_rootfs() {
+    let base = std::env::temp_dir().join(format!("gp-p2-erofs-dmv-{}", std::process::id()));
+
+    let mut erofs_mounts = Vec::new();
+    for (i, hash) in [(1u32, "aa11"), (2u32, "bb22")] {
+        let sdir = base.join("snapshots").join(i.to_string());
+        fs::create_dir_all(&sdir).unwrap();
+        let blob = sdir.join("layer.erofs");
+        fs::write(&blob, vec![0u8; 1 << 20]).unwrap();
+        let meta = sdir.join("layer.erofs.dmverity");
+        fs::write(
+            &meta,
+            serde_json::json!({ "roothash": hash, "hashoffset": 4096u64, "salt": "00" }).to_string(),
+        )
+        .unwrap();
+        erofs_mounts.push(serde_json::json!({
+            "source": blob.to_string_lossy(), "destination": "/", "fs_type": "erofs",
+            "options": ["ro", format!("X-containerd.dmverity={}", meta.to_string_lossy())],
+            "device_id": null, "host_shared_fs_path": null, "read_only": true
+        }));
+    }
+
+    let config = base.join("config.json");
+    let output = base.join("predicted.json");
+    let rootfs_mounts = base.join("rootfs-mounts.json");
+    fs::write(
+        &config,
+        serde_json::to_string(&serde_json::json!({ "ociVersion": "1.0.0", "mounts": [] })).unwrap(),
+    )
+    .unwrap();
+
+    let mut mounts = vec![serde_json::json!({
+        "source": "/dev/loop0", "destination": "/", "fs_type": "ext4",
+        "options": ["rw"], "device_id": null, "host_shared_fs_path": null, "read_only": false
+    })];
+    mounts.extend(erofs_mounts);
+    mounts.push(serde_json::json!({
+        "source": "overlay", "destination": "/", "fs_type": "overlay",
+        "options": [], "device_id": null, "host_shared_fs_path": null, "read_only": false
+    }));
+    fs::write(&rootfs_mounts, serde_json::to_string(&mounts).unwrap()).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_storage-predictor");
+    let status = Command::new(bin)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--sid",
+            "dmv-sb",
+            "--cid",
+            "dmv-ctr",
+            "--emptydir-mode",
+            "",
+            "--block-driver",
+            "virtio-blk-mmio",
+            "--rootfs-mounts",
+            rootfs_mounts.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "predictor exited with failure");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+    let storages = parsed["rootfs"]["storages"].as_array().unwrap();
+    let roothashes: Vec<String> = storages
+        .iter()
+        .flat_map(|s| s["options"].as_array().cloned().unwrap_or_default())
+        .filter_map(|o| {
+            o.as_str()
+                .and_then(|s| s.strip_prefix("X-kata.dmverity.roothash="))
+                .map(|h| h.to_string())
+        })
+        .collect();
+    assert!(roothashes.contains(&"aa11".to_string()), "parsed={}", parsed);
+    assert!(roothashes.contains(&"bb22".to_string()), "parsed={}", parsed);
 
     let _ = fs::remove_dir_all(&base);
 }
