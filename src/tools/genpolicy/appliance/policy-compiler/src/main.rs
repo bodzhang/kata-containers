@@ -30,6 +30,7 @@ struct Args {
     annotated_yaml_output: PathBuf,
     regex_policy_mode: String,
     predicted_storages: Option<PathBuf>,
+    strict_storage_coverage: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -184,6 +185,9 @@ fn parse_args() -> Result<Args> {
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| "legacy".to_string()),
         predicted_storages: values.get("--predicted-storages").cloned(),
+        strict_storage_coverage: values
+            .get("--strict-storage-coverage")
+            .is_some_and(|value| value.to_string_lossy() == "true"),
     })
 }
 
@@ -913,7 +917,7 @@ fn run(args: Args) -> Result<()> {
     let mut containers = Vec::new();
     let mut reports = Vec::new();
     let volume_storages = match &args.predicted_storages {
-        Some(path) => collect_volume_storages(path)?,
+        Some(path) => collect_volume_storages(path, args.strict_storage_coverage)?,
         None => BTreeMap::new(),
     };
     for (identity, (name, capture)) in captures {
@@ -1166,8 +1170,13 @@ fn watchable_shared_name(source: &str) -> Option<String> {
 /// storages into policy `p_storages`, keyed by CRI container name. Storage
 /// classes we cannot yet template are logged and omitted (those containers keep
 /// failing closed, as they do without a predicted report), so the generated
-/// policy is never silently loosened.
-fn collect_volume_storages(path: &Path) -> Result<BTreeMap<String, Vec<agent::Storage>>> {
+/// policy is never silently loosened. When `strict` is set, an unsupported
+/// class is a hard error instead — the coverage gate operators can enable to
+/// refuse generating a policy that would fail closed at runtime.
+fn collect_volume_storages(
+    path: &Path,
+    strict: bool,
+) -> Result<BTreeMap<String, Vec<agent::Storage>>> {
     let report: Value = serde_json::from_str(&fs::read_to_string(path)?)
         .with_context(|| format!("parse predicted storages {}", path.display()))?;
     let mut by_container = BTreeMap::new();
@@ -1195,12 +1204,22 @@ fn collect_volume_storages(path: &Path) -> Result<BTreeMap<String, Vec<agent::St
             {
                 match template_volume_storage(storage)? {
                     Some(s) => templated.push(s),
-                    None => eprintln!(
-                        "warning: container {name} has an unsupported volume storage class \
-                         (fs_type={}); it is omitted from the policy and will fail closed at \
-                         runtime",
-                        storage.get("fs_type").and_then(Value::as_str).unwrap_or("?")
-                    ),
+                    None => {
+                        let fs_type =
+                            storage.get("fs_type").and_then(Value::as_str).unwrap_or("?");
+                        if strict {
+                            bail!(
+                                "container {name} has an unsupported volume storage class \
+                                 (fs_type={fs_type}); refusing to generate a policy that would \
+                                 fail closed at runtime (strict storage coverage)"
+                            );
+                        }
+                        eprintln!(
+                            "warning: container {name} has an unsupported volume storage class \
+                             (fs_type={fs_type}); it is omitted from the policy and will fail \
+                             closed at runtime"
+                        );
+                    }
                 }
             }
         }
@@ -1394,10 +1413,31 @@ mod tests {
             }]
         });
         let path = write_report(&dir, "predicted.json", report);
-        let by_container = collect_volume_storages(&path).unwrap();
+        let by_container = collect_volume_storages(&path, false).unwrap();
         // The unsupported xfs storage is skipped; only the ephemeral one is templated.
         assert_eq!(by_container["app"].len(), 1);
         assert_eq!(by_container["app"][0].fstype, "tmpfs");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_storage_coverage_rejects_unsupported_class() {
+        let dir = std::env::temp_dir().join(format!("gp-vol-strict-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let report = json!({
+            "predictions": [{
+                "container_id": "c1",
+                "container_name": "app",
+                "volumes": [{"storages": [{
+                    "driver": "blk", "source": "01", "fs_type": "xfs",
+                    "options": [], "shared": false,
+                    "mount_point": "/run/kata-containers/foo"
+                }]}]
+            }]
+        });
+        let path = write_report(&dir, "predicted.json", report);
+        assert!(collect_volume_storages(&path, false).is_ok());
+        assert!(collect_volume_storages(&path, true).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

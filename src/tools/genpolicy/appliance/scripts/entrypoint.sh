@@ -304,6 +304,12 @@ predicted_arg=()
 [[ -f "${output_dir}/storages-devices-predicted.json" ]] &&
 	predicted_arg=(--predicted-storages "${output_dir}/storages-devices-predicted.json")
 
+# Opt-in coverage gate: refuse to generate a policy that would fail closed on an
+# unsupported volume storage class (STRICT_STORAGE_COVERAGE=1).
+coverage_arg=()
+[[ "${STRICT_STORAGE_COVERAGE:-0}" == "1" ]] &&
+	coverage_arg=(--strict-storage-coverage true)
+
 genpolicy-oci-compiler \
 	--raw-dir "${output_dir}/raw" \
 	--tagged-dir "${output_dir}/tagged" \
@@ -315,7 +321,8 @@ genpolicy-oci-compiler \
 	--diff-output "${output_dir}/policy-oci-diff.json" \
 	--annotation-output "${output_dir}/policy-annotation.txt" \
 	--annotated-yaml-output "${output_dir}/workload-policy.yaml" \
-	"${predicted_arg[@]}"
+	"${predicted_arg[@]}" \
+	"${coverage_arg[@]}"
 
 if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
 	python3 "${appliance_root}/scripts/tag_oci.py" \
@@ -337,7 +344,8 @@ if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
 		--annotation-output "${output_dir}/policy-annotation-balanced.txt" \
 		--annotated-yaml-output "${output_dir}/workload-policy-balanced.yaml" \
 		--regex-policy-mode balanced \
-		"${predicted_arg[@]}"
+		"${predicted_arg[@]}" \
+		"${coverage_arg[@]}"
 fi
 
 if [[ "${GENPOLICY_LEGACY_REFERENCE:-0}" == "1" ]]; then

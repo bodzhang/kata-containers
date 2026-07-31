@@ -5,10 +5,13 @@ Predicts the Kata Agent `storages` and `devices` a workload would produce,
 records containerd's mount view, not the Agent `storages`/`devices` that the Kata
 shim synthesizes downstream.
 
-The output (`storages-devices-predicted.json`) is **audit-only**. It is a
-compatibility signal, not proof, and must not enter enforceable policy until
-Agent-side enforcement and a versioned storage/device contract exist. Generated
-`policy.rego` keeps workload `storages` and `devices` empty.
+The predicted `storages` now **drive policy generation**: the policy compiler
+consumes `storages-devices-predicted.json` to pin the container rootfs by EROFS
+dm-verity root hash and to inject each container's volume `storages` into the
+generated `policy.rego`, so storage-bearing workloads get a working,
+tightly-scoped policy instead of failing closed. Predicted **devices** remain
+audit-only — the generated `devices` list is still empty (see *Known gaps*). See
+*Driving policy generation* below.
 
 ## Design
 
@@ -29,8 +32,11 @@ Agent-side enforcement and a versioned storage/device contract exist. Generated
   mounted**.
 - **Serialization mirror.** `agent::types::Storage`/`Device` are not `Serialize`,
   so the tool maps them to local serializable structs for the JSON output.
-- **Non-gating.** The pipeline stage records per-container failures and never
-  blocks policy generation.
+- **Non-gating predictor.** The predictor stage records per-container prediction
+  failures and never blocks policy generation itself. Gating happens downstream
+  in the compiler: the EROFS dm-verity coverage gate always fails on an unpinned
+  erofs lower, and the opt-in `--strict-storage-coverage` gate fails on an
+  unsupported volume class (see *Driving policy generation*).
 
 ## Usage
 
@@ -56,6 +62,69 @@ and assembles `storages-devices-predicted.json`.
   `ConfigMap`/`Secret` mounts yield a `watchable-bind` storage; other shared-fs
   volumes yield a shared mount with no storage. See "Drift risk" below.
 
+## Driving policy generation
+
+The policy compiler (`policy-compiler`) reads the report via `--predicted-storages`
+and turns it into enforceable `policy.rego`. It consumes the predictor's output as
+the **authoritative** storage shape rather than reimplementing the shim (as legacy
+`genpolicy` does), so the generated policy matches the real runtime-rs
+`CreateContainerRequest`.
+
+### Rootfs: EROFS dm-verity pinning
+
+The compiler collects the union of the multi-layer erofs **lower**-layer
+dm-verity root hashes into `policy_data.dmverity.allowed_roothashes`. A coverage
+gate fails generation if any erofs lower layer lacks a root hash (it would fail
+closed at runtime). `rules.rego` then pins each read-only lower layer to an
+allowlisted hash, while the writable `ext4` upper is allowed by shape. Legacy
+`genpolicy` emits no rootfs storages at all, so erofs containers fail closed
+under it — this is a capability the drive adds.
+
+### Volume storages: templated injection
+
+Each container's predicted `volumes[].storages` are injected into
+`ContainerPolicy.storages`, keyed by CRI container name (the predictor emits
+`container_name` for the mapping). Concrete guest paths are re-templated to the
+policy variables that `rules.rego`'s `allow_storage` clauses substitute at
+enforcement, with literal file names regex-escaped and anchored so each storage
+is pinned:
+
+| Class | `fs_type` | Templated `mount_point` | Clause |
+|---|---|---|---|
+| ephemeral emptyDir | `tmpfs` | `^/run/kata-containers/sandbox/ephemeral/<file>$` | `tmpfs` |
+| local emptyDir | `local` | `^$(cpath)/$(sandbox-id)/rootfs/local/<file>$` | `local` |
+| hugepage emptyDir | `hugetlbfs` | `^/run/kata-containers/sandbox/ephemeral/<file>$` | `hugetlbfs` (added) |
+| watchable configMap/secret/projected/downwardAPI | `bind` | `^$(cpath)/watchable/sandbox-[0-9a-f]{8}-<name>$` | `bind` |
+
+The watchable case deliberately does **not** reuse genpolicy's `$(sfprefix)`
+(`<bundle-id>-[a-z0-9]{16}-`): runtime-rs names the shared file
+`sandbox-<8 hex>-<name>` via a random UUID segment
+(`share_fs_volume::generate_mount_path`), so the compiler wildcards the hash as
+`[0-9a-f]{8}` and pins the escaped name, and keeps the real `watchable-bind`
+driver (not the legacy `local`). Legacy genpolicy's configMap policy therefore
+does not match runtime-rs — another reason the drive is predictor-authoritative.
+
+### Coverage gate
+
+Storage classes the compiler cannot yet template are logged and omitted by
+default; the container then fails closed at runtime, exactly as it does without a
+predicted report (no silent loosening). Pass `--strict-storage-coverage true`
+(or set `STRICT_STORAGE_COVERAGE=1` in the appliance entrypoint) to make an
+unsupported class a hard generation error instead — the fail-closed-at-generation
+choice for operators who want to guarantee full coverage.
+
+### Not yet driven (rationale)
+
+- **Per-container dm-verity allowlist.** The allowlist is pod-scoped (a union),
+  so a container could present another same-pod container's rootfs hash.
+  Tightening to per-container would require threading a container-scoped list
+  through `allow_storages`/`allow_storage`, but those are **shared** upstream
+  `rules.rego` functions (legacy genpolicy calls them too); changing their
+  signature would break that contract, so this is deferred pending an
+  additive per-container mechanism.
+- **Devices** (block/scsi/direct-volume) and **guest-pull source pinning** are
+  larger follow-ups — see *Known gaps* and *Rootfs prediction (design)*.
+
 ## Drift risk and mitigation
 
 Unlike the volume handlers, the share-fs path cannot be reused as-is: the real
@@ -80,9 +149,10 @@ Mirrored rather than reused (the drift surface):
 Residual risk:
 
 - Security-relevant `Storage` fields (`driver`, `fs_type`, `options`) are exact.
-  Path strings are policy-generalized by genpolicy's `sfprefix` regex, and the
-  guest path carries a random `sandbox-<uuid>-<name>` component that is not
-  deployment-stable regardless.
+  Path strings are policy-generalized by the compiler when injected (the random
+  `sandbox-<8 hex>-<name>` component is wildcarded to `[0-9a-f]{8}` and the name
+  pinned; see *Driving policy generation*), so the non-deterministic hash does
+  not break enforcement.
 - If upstream renames the constants or changes `share_volume`'s storage shape,
   the stub diverges silently.
 
