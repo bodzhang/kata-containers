@@ -12,7 +12,8 @@ package agent_policy
 policy_data := json.unmarshal(`{
 	"common": {
 		"cpath": "/run/kata-containers/shared/containers(?:/passthrough)?",
-		"sfprefix": "^$(cpath)/(watchable/)?$(bundle-id)-[a-z0-9]{16}-"
+		"sfprefix": "^$(cpath)/(watchable/)?$(bundle-id)-[a-z0-9]{16}-",
+		"spath": "/run/kata-containers/sandbox/storage"
 	},
 	"dmverity": {"allowed_roothashes": []}
 }`)
@@ -209,3 +210,90 @@ test_guest_pull_fallback_by_shape if {
 	allow_storages([], [guest_pull_runtime("docker.io/library/nginx:1.27")], "bid", sandbox_id)
 		with data.agent_policy.policy_data as {}
 }
+
+# Runtime i_storage for a block-encrypted emptyDir as produced by the shim's
+# block_emptydir_volume handler: a virtio-blk device whose source is the guest
+# PCI address and whose mount_point is $(spath)/base64url(source). base64url("01")
+# is "MDE=".
+block_encrypted_runtime(source, b64) := {
+	"driver": "blk",
+	"driver_options": ["encryption_key=ephemeral", "create_filesystem"],
+	"source": source, "fstype": "ext4", "fs_group": null, "shared": true,
+	"options": [],
+	"mount_point": concat("", ["/run/kata-containers/sandbox/storage/", b64]),
+}
+
+# Templated p_storage the compiler emits: empty driver and source (the rego
+# matches by the runtime driver and wildcards the address), device-id mount
+# template, driver_options/fstype/fs_group/options/shared pinned exactly.
+block_encrypted_policy := {
+	"driver": "", "driver_options": ["encryption_key=ephemeral", "create_filesystem"],
+	"source": "", "fstype": "ext4", "fs_group": null, "shared": true, "options": [],
+	"mount_point": "$(spath)/$(b64_device_id)",
+}
+
+# A block-encrypted emptyDir is admitted: the runtime "blk" driver is matched,
+# the device address wildcarded through $(b64_device_id), and the encryption
+# driver_options pinned.
+test_block_encrypted_emptydir_allowed if {
+	allow_storages([block_encrypted_policy], [block_encrypted_runtime("01", "MDE=")], "bid", sandbox_id)
+}
+
+# The mount_point is bound to the device id: a runtime mount_point whose base64
+# does not encode the runtime source is rejected (host cannot redirect the
+# device to a different guest path).
+test_block_encrypted_emptydir_wrong_device_id_denied if {
+	not allow_storages(
+		[block_encrypted_policy],
+		[block_encrypted_runtime("02", "MDE=")],
+		"bid", sandbox_id,
+	)
+}
+
+# The encryption driver_options are pinned: a plaintext (no encryption_key)
+# runtime storage is rejected against the encrypted policy.
+test_block_encrypted_emptydir_missing_key_denied if {
+	not allow_storages(
+		[block_encrypted_policy],
+		[json.patch(
+			block_encrypted_runtime("01", "MDE="),
+			[{"op": "replace", "path": "/driver_options", "value": ["create_filesystem"]}],
+		)],
+		"bid", sandbox_id,
+	)
+}
+
+# fs_group is validated exactly: a runtime storage carrying a pod fsGroup is
+# rejected against a policy that pins none.
+test_block_encrypted_emptydir_fs_group_mismatch_denied if {
+	not allow_storages(
+		[block_encrypted_policy],
+		[json.patch(
+			block_encrypted_runtime("01", "MDE="),
+			[{"op": "replace", "path": "/fs_group", "value": {"group_id": 1000, "group_change_policy": 0}}],
+		)],
+		"bid", sandbox_id,
+	)
+}
+
+# A block-plain emptyDir over virtio-scsi is admitted: the runtime "scsi" driver
+# is matched, the SCSI address (SCSI-id:LUN) wildcarded, and the "discard"
+# option and "create_filesystem"-only driver_options pinned. base64url("0:0") is
+# "MDow".
+block_plain_scsi_runtime := {
+	"driver": "scsi", "driver_options": ["create_filesystem"],
+	"source": "0:0", "fstype": "ext4", "fs_group": null, "shared": true,
+	"options": ["discard"],
+	"mount_point": "/run/kata-containers/sandbox/storage/MDow",
+}
+
+block_plain_scsi_policy := {
+	"driver": "", "driver_options": ["create_filesystem"], "source": "",
+	"fstype": "ext4", "fs_group": null, "shared": true, "options": ["discard"],
+	"mount_point": "$(spath)/$(b64_device_id)",
+}
+
+test_block_plain_emptydir_scsi_allowed if {
+	allow_storages([block_plain_scsi_policy], [block_plain_scsi_runtime], "bid", sandbox_id)
+}
+

@@ -4,6 +4,7 @@ use genpolicy::policy::{
 };
 use genpolicy::settings::Settings;
 use protocols::agent;
+use protocols::types::FSGroupChangePolicy;
 use regex::escape;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1230,8 +1231,22 @@ fn template_volume_storage(storage: &Value) -> Result<Option<agent::Storage>> {
     let fs_type = field("fs_type");
     let mount_point = field("mount_point");
     let source = field("source");
+    let driver_options = string_list("driver_options");
 
-    let (templated_source, templated_mount_point) = if driver == "watchable-bind" {
+    // Block-backed emptyDir (encrypted or plain): the predictor models it as a
+    // virtio-blk/scsi device (driver "blk"/"scsi") whose driver_options carry
+    // "create_filesystem" (plus "encryption_key=ephemeral" when encrypted). The
+    // shared rules.rego matches these by the RUNTIME input driver via its
+    // "allow_storage with blk"/"with scsi" clauses and wildcards the device
+    // address through $(spath)/$(b64_device_id), so the policy p_storage carries
+    // an EMPTY driver and source — exactly like legacy genpolicy's
+    // emptyDir_encrypted/emptyDir_plain settings — pinning only driver_options,
+    // fstype, fs_group, options and shared. Mirrors
+    // mount_and_storage::get_guest_empty_dir_mount_and_storage.
+    let is_block_emptydir = driver_options.iter().any(|o| o == "create_filesystem");
+
+    let (templated_driver, templated_source, templated_mount_point) = if driver == "watchable-bind"
+    {
         // configMap/secret/projected/downwardAPI watchable bind. runtime-rs names
         // the shared file "sandbox-<8 hex>-<name>" via a random UUID segment
         // (share_fs_volume::generate_mount_path), so the hash cannot be pinned:
@@ -1246,8 +1261,17 @@ fn template_volume_storage(storage: &Value) -> Result<Option<agent::Storage>> {
         };
         let escaped = regex::escape(&name);
         (
+            driver.to_string(),
             format!("^$(cpath)/sandbox-[0-9a-f]{{8}}-{escaped}$"),
             format!("^$(cpath)/watchable/sandbox-[0-9a-f]{{8}}-{escaped}$"),
+        )
+    } else if is_block_emptydir {
+        // The device address (source) is wildcarded by the rego, so the p_storage
+        // carries an empty driver and source and the device-id mount template.
+        (
+            String::new(),
+            String::new(),
+            "$(spath)/$(b64_device_id)".to_string(),
         )
     } else {
         let mp = match fs_type {
@@ -1276,17 +1300,50 @@ fn template_volume_storage(storage: &Value) -> Result<Option<agent::Storage>> {
         // local/ephemeral/hugepage sources are the constants "local"/"tmpfs"/
         // "nodev", matched by allow_storage_source's equality clause, so they
         // need no templating.
-        (source.to_string(), mp)
+        (driver.to_string(), source.to_string(), mp)
     };
 
     Ok(Some(agent::Storage {
-        driver: driver.to_string(),
-        driver_options: string_list("driver_options"),
+        driver: templated_driver,
+        driver_options,
         source: templated_source,
         fstype: fs_type.to_string(),
         options: string_list("options"),
         mount_point: templated_mount_point,
+        // Validated exactly by rules.rego (allow_storage_base). The predictor
+        // derives it from the emptyDir directory GID (kubelet sets it from the
+        // pod's securityContext.fsGroup), matching what the shim writes onto the
+        // block emptyDir Storage; absent for the shared-fs classes.
+        fs_group: build_fs_group(storage)?,
         shared: storage.get("shared").and_then(Value::as_bool).unwrap_or(false),
+        ..Default::default()
+    }))
+}
+
+/// Builds the policy `agent::FSGroup` from a predicted storage's `fs_group`
+/// object (`{group_id, group_change_policy}`), or `none` when absent. rules.rego
+/// compares `fs_group` by exact structural equality, so this must reproduce the
+/// `agent::FSGroup` the shim (and the agent) serialize for the same storage.
+fn build_fs_group(storage: &Value) -> Result<protobuf::MessageField<agent::FSGroup>> {
+    let Some(fg) = storage.get("fs_group").filter(|v| !v.is_null()) else {
+        return Ok(protobuf::MessageField::none());
+    };
+    let group_id = fg
+        .get("group_id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("predicted fs_group has no numeric group_id"))?;
+    let group_id = u32::try_from(group_id)
+        .map_err(|_| anyhow!("predicted fs_group group_id {group_id} exceeds u32"))?;
+    // The predictor serializes the policy via Debug of the runtime-rs enum, so
+    // the only values are "Always" and "OnRootMismatch"; default to Always
+    // (the enum's 0 value) as the shim and legacy genpolicy do.
+    let policy = match fg.get("group_change_policy").and_then(Value::as_str) {
+        Some("OnRootMismatch") => FSGroupChangePolicy::OnRootMismatch,
+        _ => FSGroupChangePolicy::Always,
+    };
+    Ok(protobuf::MessageField::some(agent::FSGroup {
+        group_id,
+        group_change_policy: protobuf::EnumOrUnknown::new(policy),
         ..Default::default()
     }))
 }
@@ -1560,6 +1617,61 @@ mod tests {
             "^$(cpath)/$(sandbox-id)/rootfs/local/data\\.volume$"
         );
         assert_eq!(templated.options, vec!["mode=0777".to_string()]);
+    }
+
+    #[test]
+    fn block_encrypted_emptydir_templated_with_empty_driver_and_device_id_mount() {
+        // The predictor models a block-encrypted emptyDir as a virtio-blk device
+        // whose source is the synthesized PciPath slot and whose mount_point is
+        // $(spath)/base64url(source).
+        let storage = json!({
+            "driver": "blk",
+            "driver_options": ["encryption_key=ephemeral", "create_filesystem"],
+            "source": "01", "fs_type": "ext4", "options": [], "shared": true,
+            "mount_point": "/run/kata-containers/sandbox/storage/MDE=",
+            "fs_group": {"group_id": 1000, "group_change_policy": "Always"}
+        });
+        let templated = template_volume_storage(&storage).unwrap().unwrap();
+        // Driver and source are emptied — the rego matches by the runtime input
+        // driver and wildcards the device address via $(b64_device_id).
+        assert_eq!(templated.driver, "");
+        assert_eq!(templated.source, "");
+        assert_eq!(templated.mount_point, "$(spath)/$(b64_device_id)");
+        assert_eq!(templated.fstype, "ext4");
+        assert_eq!(
+            templated.driver_options,
+            vec![
+                "encryption_key=ephemeral".to_string(),
+                "create_filesystem".to_string()
+            ]
+        );
+        assert!(templated.shared);
+        let fg = templated.fs_group.as_ref().expect("fs_group is pinned");
+        assert_eq!(fg.group_id, 1000);
+        assert_eq!(
+            fg.group_change_policy.enum_value().unwrap(),
+            FSGroupChangePolicy::Always
+        );
+    }
+
+    #[test]
+    fn block_plain_emptydir_templated_without_fs_group() {
+        // Block-plain emptyDir: only "create_filesystem" (no encryption key), a
+        // "discard" mount option, and no pod fsGroup, so fs_group stays none.
+        let storage = json!({
+            "driver": "scsi", "driver_options": ["create_filesystem"],
+            "source": "0:0", "fs_type": "ext4", "options": ["discard"], "shared": true,
+            "mount_point": "/run/kata-containers/sandbox/storage/MDow"
+        });
+        let templated = template_volume_storage(&storage).unwrap().unwrap();
+        assert_eq!(templated.driver, "");
+        assert_eq!(templated.source, "");
+        assert_eq!(templated.mount_point, "$(spath)/$(b64_device_id)");
+        assert_eq!(templated.fstype, "ext4");
+        assert_eq!(templated.driver_options, vec!["create_filesystem".to_string()]);
+        assert_eq!(templated.options, vec!["discard".to_string()]);
+        assert!(templated.shared);
+        assert!(templated.fs_group.is_none());
     }
 
     #[test]

@@ -144,6 +144,21 @@ is pinned:
 | local emptyDir | `local` | `^$(cpath)/$(sandbox-id)/rootfs/local/<file>$` | `local` |
 | hugepage emptyDir | `hugetlbfs` | `^/run/kata-containers/sandbox/ephemeral/<file>$` | `hugetlbfs` (added) |
 | watchable configMap/secret/projected/downwardAPI | `bind` | `^$(cpath)/watchable/sandbox-[0-9a-f]{8}-<name>$` | `bind` |
+| block-encrypted / block-plain emptyDir | `ext4` | `$(spath)/$(b64_device_id)` | `blk` / `scsi` device-id |
+
+The block emptyDir row is the one device-backed volume the compiler drives. The
+predictor models it no-VM (the dry-run device manager plus the synthesized
+PCI/SCSI address — see *Dry-run block device address synthesis*), emitting a
+virtio-blk/scsi `Storage` whose `driver_options` carry `create_filesystem` (plus
+`encryption_key=ephemeral` when encrypted). The compiler recognizes that gate and
+templates it exactly like legacy genpolicy's `emptyDir_encrypted` /
+`emptyDir_plain` settings: the policy `p_storage` carries an **empty** `driver`
+and `source` (the shared `rules.rego` `allow_storage with blk`/`with scsi`
+clauses match by the runtime input driver and wildcard the device address), the
+`mount_point` becomes the device-id template `$(spath)/$(b64_device_id)`, and
+`driver_options`, `fstype`, `fs_group`, `options` and `shared` are pinned
+exactly. `fs_group` mirrors the pod `securityContext.fsGroup` (the emptyDir
+directory GID) so the agent's exact-equality check passes.
 
 The watchable case deliberately does **not** reuse genpolicy's `$(sfprefix)`
 (`<bundle-id>-[a-z0-9]{16}-`): runtime-rs names the shared file
@@ -171,8 +186,12 @@ choice for operators who want to guarantee full coverage.
   `rules.rego` functions (legacy genpolicy calls them too); changing their
   signature would break that contract, so this is deferred pending an
   additive per-container mechanism.
-- **Devices** (block/scsi/direct-volume) are a larger follow-up — see *Known
-  gaps* and *Rootfs prediction (design)*.
+- **Block/direct volume devices.** Block `volumeDevices[]` and direct-assigned
+  volumes remain compiler-side `container_path` pins (see *Known gaps*): their
+  handlers `stat` a real host `S_IFBLK` device, so the no-VM predictor cannot
+  model their content. Block **emptyDir** (encrypted/plain) IS now driven end to
+  end (predictor + compiler), since its handler backs the volume with a
+  hypervisor-plugged sparse disk the dry-run device manager can synthesize.
 
 ## Drift risk and mitigation
 
@@ -214,16 +233,20 @@ Mitigation options (not yet implemented):
 
 ## Known gaps
 
-- **Device-backed classes** (block, encrypted `emptyDir`, direct volumes): the
+- **Device-backed classes** (block emptyDir, block/direct volumes): the
   dry-run hypervisor returns a default `hypervisor_config`, so the device manager
   assigns the deterministic guest path `/dev/vdX`, and `add_device` synthesizes a
   deterministic guest address (`pci_path` for `virtio-blk-pci`, `scsi_addr` for
   `virtio-scsi`, `ccw_addr` for `virtio-blk-ccw`) so the block handlers complete
-  with no VM (as exercised by the erofs rootfs device tests). Predictor-level prediction
-  through `handler_volumes` is still e2e-only, because `BlockVolume::new` `stat`s
-  the real host block device and direct volumes read host mount-info metadata. The
-  full `blockdev_info` (driver, aio, queues, sector sizes) and `emptydir_mode` are
-  sourced from the
+  with no VM. **Block emptyDir (encrypted/plain) is now modeled end to end** and
+  driven into the policy by the compiler (empty-driver + `$(spath)/$(b64_device_id)`
+  device-id templating; see *Driving policy generation*), because its handler
+  backs the volume with a hypervisor-plugged sparse disk the dry-run device
+  manager can synthesize. Block `volumeDevices[]` and direct-assigned volumes
+  remain e2e-only, because `BlockVolume::new` `stat`s a real host `S_IFBLK`
+  device and direct volumes read host mount-info metadata; they are pinned by
+  `container_path` at the compiler/YAML level instead. The full `blockdev_info`
+  (driver, aio, queues, sector sizes) and `emptydir_mode` are sourced from the
   deployment's Kata `configuration.toml` when `--kata-config` is given; otherwise
   the block driver falls back to `--block-driver` / `GENPOLICY_BLOCK_DRIVER`.
 - Block-device volumes (`spec.containers[].volumeDevices[]`) ARE pinned in the
@@ -257,12 +280,20 @@ Mitigation options (not yet implemented):
   is representative regardless of handler. Residual, non-repo-verifiable risk: a
   containerd kata-handler-specific spec opt that adds/removes/retypes a container
   mount; standard CRI mount generation is handler-agnostic.
-- Rootfs snapshotter: kata may use nydus/erofs/devmapper (block or guest image
-  pull), producing a rootfs storage via `handler_rootfs` from the snapshotter
-  mounts. The predictor now models the **multi-layer erofs** rootfs from a
-  captured `rootfs_mounts` artifact (`--rootfs-mounts`); the snapshotter capture
-  stage that produces the artifact, plus the guest-pull and single-layer block
-  paths, remain. See **Rootfs prediction (design)** below.
+- Rootfs snapshotter: kata produces the container rootfs via `handler_rootfs`
+  from the snapshotter mounts. The predictor models every rootfs shape that
+  applies to confidential guests: **guest-pull** (`--guest-pull-rootfs`),
+  **multi-layer erofs** and **single-layer dm-verity block** (`--rootfs-mounts`).
+  What remains is the host-side **snapshotter capture stage** that produces the
+  `rootfs_mounts` artifact (`capture_rootfs_mounts.py`), not the prediction.
+  **Nydus rootfs (`NydusRootfs`) is intentionally out of scope and not a gap for
+  Kata-CC**: it shares a host-prepared nydus bootstrap + blobs into the guest
+  over virtio-fs (`NydusShareFs`), i.e. the *host* supplies the rootfs content.
+  That is incompatible with the confidential trust model, which requires the
+  image to be pulled and verified **inside** the TEE (guest-pull) or pinned by a
+  dm-verity root hash (erofs / single-layer block). A CC deployment therefore
+  never routes its rootfs through `NydusRootfs`, so modeling it would add a
+  no-VM stub for a path the threat model already excludes.
 - Config sourcing: `emptydir_mode` and the full hypervisor `blockdev_info` come
   from the deployment's Kata `configuration.toml`
   via `--kata-config` (`GENPOLICY_KATA_CONFIG`), loaded raw (no hypervisor-binary
