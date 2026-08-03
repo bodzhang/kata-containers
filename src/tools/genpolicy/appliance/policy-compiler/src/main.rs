@@ -156,6 +156,8 @@ type Identity = (String, String);
 struct WorkloadContainerPolicy {
     exec_commands: Vec<Vec<String>>,
     sandbox_name_pattern: Option<String>,
+    // Block-device volume paths (`spec.containers[].volumeDevices[].devicePath`).
+    volume_device_paths: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -365,6 +367,12 @@ fn collect_workload_policy(
         let container_policy = WorkloadContainerPolicy {
             exec_commands: container.get_exec_commands(),
             sandbox_name_pattern: sandbox_name_pattern.clone(),
+            volume_device_paths: container
+                .volumeDevices
+                .iter()
+                .flatten()
+                .map(|d| d.devicePath.clone())
+                .collect(),
         };
         if let Some(previous) = policy.containers.get(&container.name) {
             if previous != &container_policy {
@@ -690,6 +698,7 @@ fn compile_container(
     regex_policy_mode: &str,
     exec_commands: Vec<Vec<String>>,
     sandbox_name_pattern: Option<&str>,
+    volume_device_paths: &[String],
 ) -> Result<(ContainerPolicy, Value)> {
     let container_type = capture
         .annotations
@@ -720,11 +729,34 @@ fn compile_container(
         regexes,
         sandbox_name_pattern,
     )?;
+    // Block-device volumes (parity with legacy genpolicy): pin the container_path
+    // where each declared device appears. This bounds the device SET the host may
+    // present; the device content is untrusted by the guest under the CC model,
+    // so no identity/content pin is attempted here (see README).
+    let mut devices: Vec<agent::Device> = Vec::new();
+    let mut linux_devices = template.Linux.Devices.clone();
+    for path in volume_device_paths {
+        if path.starts_with(&settings.devices.vfio.device_path) {
+            bail!(
+                "volume device path {path:?} conflicts with the reserved VFIO passthrough path \
+                 {:?}; use resource limits (e.g. nvidia.com/gpu) for VFIO devices",
+                settings.devices.vfio.device_path
+            );
+        }
+        devices.push(agent::Device {
+            container_path: path.clone(),
+            ..Default::default()
+        });
+        linux_devices.push(policy::KataLinuxDevice {
+            Type: String::new(),
+            Path: path.clone(),
+        });
+    }
     let linux = KataLinux {
         Namespaces: policy::get_kata_namespaces(sandbox, false),
         MaskedPaths: capture.linux.masked_paths.clone(),
         ReadonlyPaths: capture.linux.readonly_paths.clone(),
-        Devices: template.Linux.Devices.clone(),
+        Devices: linux_devices,
         Sysctl: template.Linux.Sysctl.clone(),
     };
     let oci = KataSpec {
@@ -758,7 +790,7 @@ fn compile_container(
     let policy = ContainerPolicy {
         OCI: oci,
         storages: Vec::new(),
-        devices: Vec::new(),
+        devices,
         sandbox_pidns: false,
         exec_commands,
         runtime_anno_patterns,
@@ -945,6 +977,9 @@ fn run(args: Args) -> Result<()> {
         let container_sandbox_name_pattern = container_workload_policy
             .and_then(|policy| policy.sandbox_name_pattern.as_deref())
             .or(sandbox_name_pattern.map(String::as_str));
+        let volume_device_paths = container_workload_policy
+            .map(|policy| policy.volume_device_paths.clone())
+            .unwrap_or_default();
         let (container, mut report) =
             compile_container(
                 &name,
@@ -955,6 +990,7 @@ fn run(args: Args) -> Result<()> {
                 &args.regex_policy_mode,
                 exec_commands,
                 container_sandbox_name_pattern,
+                &volume_device_paths,
             )?;
         let mut container = container;
         // Inject the predictor's authoritative volume storages (templated to the
@@ -1855,6 +1891,36 @@ spec:
         assert_eq!(
             policy.containers["workload"].sandbox_name_pattern,
             Some("workload".to_string())
+        );
+    }
+
+    #[test]
+    fn workload_volume_devices_parsed() {
+        let document: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: blockpod
+spec:
+  containers:
+    - name: workload
+      image: example.invalid/workload
+      volumeDevices:
+        - name: data
+          devicePath: /dev/xvdb
+        - name: log
+          devicePath: /dev/xvdc
+"#,
+        )
+        .unwrap();
+        let mut policy = WorkloadPolicy::default();
+
+        collect_workload_policy(&document, &mut policy).unwrap();
+
+        assert_eq!(
+            policy.containers["workload"].volume_device_paths,
+            vec!["/dev/xvdb".to_string(), "/dev/xvdc".to_string()]
         );
     }
 

@@ -33,6 +33,7 @@ grep -Fq "sandbox_image = \"${PAUSE_IMAGE}\"" "${appliance_dir}/config/container
 if command -v opa >/dev/null 2>&1; then
 	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/erofs_dmverity_test.rego"
 	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/volume_storages_test.rego"
+	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/devices_test.rego"
 else
 	echo "opa not found; skipping rego policy tests" >&2
 fi

@@ -224,10 +224,18 @@ Mitigation options (not yet implemented):
   sourced from the
   deployment's Kata `configuration.toml` when `--kata-config` is given; otherwise
   the block driver falls back to `--block-driver` / `GENPOLICY_BLOCK_DRIVER`.
-- Only per-volume `device_id` is emitted, not full `agent::Device` objects; the
-  `Volume` trait exposes no device enumeration, so full devices need
-  device-manager introspection and the container-manager `spec.linux.devices`
-  path.
+- Block-device volumes (`spec.containers[].volumeDevices[]`) ARE pinned in the
+  generated policy by their `container_path`, at parity with legacy genpolicy:
+  the policy compiler reads them from the workload YAML (not the predictor) and
+  emits an `agent::Device{container_path}` per declared device, matched by the
+  `rules.rego` `allow_volume_devices` clause. This bounds the device *set* the
+  host may present but does not pin device identity/content — under the CC model
+  a raw block device is untrusted content anyway. The security-meaningful follow-up
+  is dm-verity root-hash pinning of read-only *data* volumes (making them trusted
+  devices, so a swap for an untrusted device is denied), reusing the single-layer
+  rootfs mechanism. Beyond `container_path`, only a per-volume `device_id` is
+  surfaced (not full `agent::Device` objects); VFIO/GPU pinning (PCI address + CDI
+  correlation) is not yet reproduced.
 - No authoritative CRI capture yet, so device requests not fully expressed in the
   OCI spec are not modeled, and the predictor depends on live host mount state
   rather than captured per-source metadata.
