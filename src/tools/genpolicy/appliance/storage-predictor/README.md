@@ -15,6 +15,21 @@ Predicted **devices** remain audit-only: the policy's device *set*
 YAML — the authority for device intent — not from the no-VM predictor (see
 *Design* and *Known gaps*). See *Driving policy generation* below.
 
+**ConfigMap / Secret (Kata-CC), at a glance.** These are delivered two ways
+depending on the deployment's `shared_fs`. With **virtio-fs** the shim emits a
+`watchable-bind` `Storage` *and* rewrites the container's OCI mount to a Kata
+shared-fs guest path (the agent then copies the projected files into a guest
+`tmpfs` and watches for updates). With **`shared_fs = "none"`** the shim instead
+copies the files straight into the container rootfs via the agent `CopyFile`
+RPC. The appliance drives the **virtio-fs** case end to end — the predictor
+emits both the storage and the rewritten mount, and the compiler pins both
+(regex-wildcarding the random per-mount UUID segment, pinning the volume name).
+The `shared_fs = "none"` copy path is a documented gap (the no-VM predictor
+cannot reproduce the agent copy). In **all** cases the file *content* is
+host-supplied and unattested, so confidential secrets must come through a
+trusted channel (KBS / CDH / guest-pull), not plain K8s Secrets. See *ConfigMap
+/ Secret: storage + mount pinning*.
+
 ## Design
 
 ### What "storage" is in a Kata-CC UVM, and who decides it
@@ -245,6 +260,44 @@ The watchable case deliberately does **not** reuse genpolicy's `$(sfprefix)`
 `[0-9a-f]{8}` and pins the escaped name, and keeps the real `watchable-bind`
 driver (not the legacy `local`). Legacy genpolicy's configMap policy therefore
 does not match runtime-rs — another reason the drive is predictor-authoritative.
+
+### ConfigMap / Secret: storage + mount pinning
+
+A ConfigMap/Secret (also projected/downwardAPI) needs **two** policy artifacts,
+because the kata-agent checks both the `storages` list (`allow_storages`) and
+each container OCI mount (`allow_mount`):
+
+1. the `watchable-bind` **Storage** (`source` + `mount_point`), templated as in
+   the table above; and
+2. the container **OCI mount**, whose `source` the shim rewrites from the
+   captured runc host bind path
+   (`/var/lib/kubelet/.../kubernetes.io~configmap/...`) to the Kata watchable
+   guest path (`$(cpath)/watchable/sandbox-<hash>-<name>`).
+
+The predictor produces **both** from the real `handler_volumes` (the
+`watchable-bind` storage and the rewritten OCI mount, via `map_mount`). The
+compiler injects the storage (`template_volume_storage`) **and** the mount
+(`template_volume_mount`): the mount source is templated exactly like the storage
+`mount_point` — the random `sandbox-<8 hex>` UUID segment wildcarded, the volume
+name pinned — so `rules.rego` `allow_mount` (`check_mount` → `mount_source_allows`
+substituting `$(cpath)`) matches the runtime `CreateContainerRequest`, and
+`allow_mount` clause 2 additionally binds the mount to the `watchable-bind`
+storage's `mount_point`. Before this, the compiler's `normalize_mounts` **failed**
+on the dynamically-destined bind mount (no static template existed) and *no
+policy was generated at all* for any ConfigMap/Secret-bearing container; the
+predictor already emitted the correct mount, but the compiler ignored it.
+
+**No `CopyFile` rule is needed for this (virtio-fs) path.** The agent's
+`BindWatcher` copies the projected files into a guest `tmpfs` *internally*, with
+no `CopyFile` ttRPC, so there is nothing to authorize beyond the storage + mount.
+`CopyFile` authorization (`policy_data.request_defaults.CopyFileRequest`, default
+`["$(sfprefix)"]`) only applies to the `shared_fs = "none"` copy-to-rootfs path —
+see *Known gaps*.
+
+**Content is host-supplied and unattested** in every path — the policy pins the
+storage/mount *shape*, never the file bytes — so under CoCo a ConfigMap/Secret is
+untrusted input; deliver confidential secrets through a trusted channel (KBS /
+CDH / guest-pull), not plain K8s Secret/ConfigMap.
 
 ### Coverage gate
 
