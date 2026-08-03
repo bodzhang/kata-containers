@@ -342,4 +342,84 @@ test_watchable_configmap_mount_wrong_options_denied if {
 	)
 }
 
+# --- shared_fs="none" ConfigMap/Secret (copy-to-rootfs) enforcement ---
+# The default Kata-CC config has no ShareFs: the shim copies the projected files
+# into the container rootfs and rewrites the OCI mount to the guest path
+# <cpath>/<cid>-<16 hex>-<name> (generate_guest_path). The compiler follows the
+# predictor output (NOT legacy $(sfprefix)): $(cpath) prefix, $(bundle-id) cid,
+# real [0-9a-f]{16} hex, pinned name. allow_mount must accept the runtime mount,
+# and the agent CopyFile destinations (under the confined shared dir) are
+# authorized by the default request_defaults.CopyFileRequest rule.
+bundle_id := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+sfnone_mount_policy(name) := {"Mounts": [{
+	"destination": "/etc/config", "type_": "bind",
+	"source": concat("", ["^$(cpath)/$(bundle-id)-[0-9a-f]{16}-", name, "$"]),
+	"options": ["rbind", "rprivate", "ro"],
+}]}
+
+sfnone_mount_runtime(bid, name) := {
+	"destination": "/etc/config", "type_": "bind",
+	"source": concat("", [
+		"/run/kata-containers/shared/containers/", bid, "-0011223344556677-", name,
+	]),
+	"options": ["rbind", "rprivate", "ro"],
+}
+
+mount_allowed_bid(p_oci, i_mount, bid) if {
+	allow_mount(p_oci, i_mount, [], bid, sandbox_id) == 0
+}
+
+# The shared_fs="none" configMap mount is admitted: the cid is $(bundle-id), the
+# random hex is [0-9a-f]{16}, and the name is pinned.
+test_shared_fs_none_configmap_mount_allowed if {
+	mount_allowed_bid(sfnone_mount_policy("config"), sfnone_mount_runtime(bundle_id, "config"), bundle_id)
+}
+
+# The name is still pinned under the copy scheme.
+test_shared_fs_none_configmap_mount_wrong_name_denied if {
+	not mount_allowed_bid(sfnone_mount_policy("config"), sfnone_mount_runtime(bundle_id, "evil"), bundle_id)
+}
+
+# The random segment must be 16 hex: a mount whose hex segment is a different
+# length is rejected (the host cannot fabricate an arbitrary shared-dir name).
+test_shared_fs_none_configmap_mount_bad_hex_denied if {
+	not mount_allowed_bid(
+		sfnone_mount_policy("config"),
+		json.patch(sfnone_mount_runtime(bundle_id, "config"), [{
+			"op": "replace", "path": "/source",
+			"value": concat("", ["/run/kata-containers/shared/containers/", bundle_id, "-00-config"]),
+		}]),
+		bundle_id,
+	)
+}
+
+# The agent CopyFile destinations (the projected files copied into the rootfs)
+# are confined to the shared dir, so the default CopyFileRequest rule authorizes
+# them.
+copy_policy_data := {
+	"common": {
+		"cpath": "/run/kata-containers/shared/containers(?:/passthrough)?",
+		"sfprefix": "^$(cpath)/(watchable/)?$(bundle-id)-[a-z0-9]{16}-",
+	},
+	"request_defaults": {"CopyFileRequest": ["$(sfprefix)"]},
+}
+
+test_shared_fs_none_configmap_copy_allowed if {
+	CopyFileRequest with input as {
+		"file_type": "Regular",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/token",
+		]),
+	}
+		with data.agent_policy.policy_data as copy_policy_data
+}
+
+# A copy outside the shared-fs domain (arbitrary host path) is rejected.
+test_copy_outside_shared_fs_denied if {
+	not CopyFileRequest with input as {"file_type": "Regular", "path": "/etc/passwd"}
+		with data.agent_policy.policy_data as copy_policy_data
+}
+
+
 

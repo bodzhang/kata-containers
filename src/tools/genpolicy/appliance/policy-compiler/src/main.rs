@@ -1421,28 +1421,50 @@ fn template_volume_mount(mount: &Value) -> Result<Option<KataMount>> {
     if destination.is_empty() || type_ != "bind" {
         return Ok(None);
     }
-    let Some(name) = watchable_shared_name(source) else {
-        return Ok(None);
-    };
-    let escaped = regex::escape(&name);
-    // Watchable configMap/secret land under `.../watchable/`; other shared-fs
-    // binds directly under the passthrough shared dir.
-    let templated_source = if source.contains("/watchable/") {
-        format!("^$(cpath)/watchable/sandbox-[0-9a-f]{{8}}-{escaped}$")
-    } else {
-        format!("^$(cpath)/sandbox-[0-9a-f]{{8}}-{escaped}$")
-    };
-    let options = mount
+    let options: Vec<String> = mount
         .get("options")
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
         .unwrap_or_default();
-    Ok(Some(KataMount {
+    let make = |templated_source: String| KataMount {
         destination: destination.to_string(),
         type_: type_.to_string(),
         source: templated_source,
-        options,
-    }))
+        options: options.clone(),
+    };
+    // virtio-fs shared path: `.../[watchable/]sandbox-<8 hex>-<name>`.
+    if let Some(name) = watchable_shared_name(source) {
+        let escaped = regex::escape(&name);
+        let templated_source = if source.contains("/watchable/") {
+            format!("^$(cpath)/watchable/sandbox-[0-9a-f]{{8}}-{escaped}$")
+        } else {
+            format!("^$(cpath)/sandbox-[0-9a-f]{{8}}-{escaped}$")
+        };
+        return Ok(Some(make(templated_source)));
+    }
+    // shared_fs="none" copy-to-rootfs guest path (generate_guest_path):
+    // `<cpath>/<cid>-<16 hex>-<dest_base>`. Follow the predictor's actual output
+    // rather than reusing legacy genpolicy's `$(sfprefix)` macro (which would
+    // re-encode the shim's naming in a settings constant and drift): pin the
+    // shared-dir prefix as `$(cpath)`, the cid as `$(bundle-id)` (substituted
+    // with the per-instance container id at enforcement), the random segment as
+    // the real `[0-9a-f]{16}` hex, and the destination basename.
+    if let (Some(dest_base), Some(src_base)) = (
+        Path::new(destination).file_name().and_then(|c| c.to_str()),
+        Path::new(source).file_name().and_then(|c| c.to_str()),
+    ) {
+        if let Some(prefix) = src_base.strip_suffix(&format!("-{dest_base}")) {
+            if let Some((_, hex)) = prefix.rsplit_once('-') {
+                if hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Ok(Some(make(format!(
+                        "^$(cpath)/$(bundle-id)-[0-9a-f]{{16}}-{}$",
+                        regex::escape(dest_base)
+                    ))));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Reads the predicted-storages report and templates each container's volume
@@ -1840,6 +1862,29 @@ mod tests {
         });
         let templated = template_volume_mount(&mount).unwrap().unwrap();
         assert_eq!(templated.source, "^$(cpath)/sandbox-[0-9a-f]{8}-vol$");
+    }
+
+    #[test]
+    fn shared_fs_none_configmap_mount_follows_predictor_path() {
+        // shared_fs="none" copy-to-rootfs guest path <cpath>/<cid>-<16 hex>-<base>.
+        // Templated by following the predictor output (not legacy $(sfprefix)):
+        // $(cpath) prefix, $(bundle-id) cid, real [0-9a-f]{16} hex, pinned base.
+        let mount = json!({
+            "destination": "/etc/config",
+            "type": "bind",
+            "source": "/run/kata-containers/shared/containers/abc123def4560000-0011223344556677-config",
+            "options": ["rbind", "rprivate", "ro"]
+        });
+        let templated = template_volume_mount(&mount).unwrap().unwrap();
+        assert_eq!(
+            templated.source,
+            "^$(cpath)/$(bundle-id)-[0-9a-f]{16}-config$"
+        );
+        assert_eq!(templated.type_, "bind");
+        assert_eq!(
+            templated.options,
+            vec!["rbind".to_string(), "rprivate".to_string(), "ro".to_string()]
+        );
     }
 
     #[test]

@@ -16,19 +16,23 @@ YAML — the authority for device intent — not from the no-VM predictor (see
 *Design* and *Known gaps*). See *Driving policy generation* below.
 
 **ConfigMap / Secret (Kata-CC), at a glance.** These are delivered two ways
-depending on the deployment's `shared_fs`. With **virtio-fs** the shim emits a
-`watchable-bind` `Storage` *and* rewrites the container's OCI mount to a Kata
-shared-fs guest path (the agent then copies the projected files into a guest
-`tmpfs` and watches for updates). With **`shared_fs = "none"`** the shim instead
-copies the files straight into the container rootfs via the agent `CopyFile`
-RPC. The appliance drives the **virtio-fs** case end to end — the predictor
-emits both the storage and the rewritten mount, and the compiler pins both
-(regex-wildcarding the random per-mount UUID segment, pinning the volume name).
-The `shared_fs = "none"` copy path is a documented gap (the no-VM predictor
-cannot reproduce the agent copy). In **all** cases the file *content* is
-host-supplied and unattested, so confidential secrets must come through a
-trusted channel (KBS / CDH / guest-pull), not plain K8s Secrets. See *ConfigMap
-/ Secret: storage + mount pinning*.
+depending on the deployment's `shared_fs`. Under **`shared_fs = "none"`** — the
+default Kata-CC config — there is no virtio-fs: the shim copies the projected
+files into the container rootfs via the agent `CopyFile` RPC and rewrites the
+container OCI mount to a guest path `<cpath>/<cid>-<16 hex>-<name>`. With
+**virtio-fs** the shim instead emits a `watchable-bind` `Storage` and rewrites
+the mount to a `.../watchable/sandbox-<hash>-<name>` path (the agent copies the
+files into a guest `tmpfs` and watches for updates). The appliance drives
+**both** end to end: the predictor runs the shim's own volume handler under the
+sourced `shared_fs` (so it reproduces whichever mechanism the deployment uses,
+no VM), and the compiler pins the resulting OCI mount by **following the
+predictor output** — wildcarding only the non-deterministic cid / UUID segments
+and pinning the volume name, never re-encoding the shim's naming in a genpolicy
+template. The `CopyFile` destinations are confined to the shared-fs domain and
+authorized by the default `CopyFileRequest` rule. In all cases the file
+*content* is host-supplied and unattested, so confidential secrets must come
+through a trusted channel (KBS / CDH / guest-pull), not plain K8s Secrets. See
+*ConfigMap / Secret: storage + mount pinning*.
 
 ## Design
 
@@ -128,8 +132,9 @@ Guided by this framing, the **Known gaps** below fall into three kinds: (a)
 mutations the no-VM predictor cannot yet reproduce (real `S_IFBLK` block volumes,
 the snapshotter capture stage); (b) paths the **threat model excludes**, which
 are therefore deliberately not modeled (nydus host-share rootfs); and (c)
-fidelity caveats where a stub diverges from a real CC config (copy-to-rootfs
-under `shared_fs = "none"`).
+fidelity caveats where a stub diverges from a real CC config (e.g. a virtio-fs
+ConfigMap/Secret with more than 8 files is classified by the live host file
+count).
 
 ## Usage
 
@@ -151,9 +156,13 @@ and assembles `storages-devices-predicted.json`.
 - Authoritative (real pure handlers, no reproduction): `shm`, `local`,
   `ephemeral`, `hugepage`, passthrough `default`.
 - Shared-filesystem classes (`ConfigMap`, `Secret`, `projected`, `downwardAPI`,
-  regular `hostPath`) via a reproduced `ShareFs`/`ShareFsMount` stub: watchable
-  `ConfigMap`/`Secret` mounts yield a `watchable-bind` storage; other shared-fs
-  volumes yield a shared mount with no storage. See "Drift risk" below.
+  regular `hostPath`): under **virtio-fs**, via a reproduced `ShareFs`/`ShareFsMount`
+  stub — watchable `ConfigMap`/`Secret` mounts yield a `watchable-bind` storage,
+  others a shared mount with no storage (see "Drift risk"). Under
+  **`shared_fs = "none"`** (the default Kata-CC config), the real shim's
+  copy-to-rootfs branch runs no-VM (`share_fs = None`, `CopyFile` to the stub
+  `Agent`), producing the rewritten OCI mount with no storage (see *ConfigMap /
+  Secret: storage + mount pinning*).
 
 ## Driving policy generation
 
@@ -263,36 +272,50 @@ does not match runtime-rs — another reason the drive is predictor-authoritativ
 
 ### ConfigMap / Secret: storage + mount pinning
 
-A ConfigMap/Secret (also projected/downwardAPI) needs **two** policy artifacts,
-because the kata-agent checks both the `storages` list (`allow_storages`) and
-each container OCI mount (`allow_mount`):
+A ConfigMap/Secret (also projected/downwardAPI) is delivered by one of two shim
+mechanisms depending on the sourced `shared_fs`, and the appliance drives both.
+The predictor runs the shim's own `handler_volumes` with the deployment's
+`shared_fs`, so it reproduces the exact mechanism no-VM; the compiler then pins
+the resulting OCI mount by **following the predictor output** (wildcarding only
+the non-deterministic segments) rather than re-encoding the shim's naming in a
+genpolicy template — the same drift-avoidance rationale as the rest of the drive.
 
-1. the `watchable-bind` **Storage** (`source` + `mount_point`), templated as in
-   the table above; and
-2. the container **OCI mount**, whose `source` the shim rewrites from the
-   captured runc host bind path
-   (`/var/lib/kubelet/.../kubernetes.io~configmap/...`) to the Kata watchable
-   guest path (`$(cpath)/watchable/sandbox-<hash>-<name>`).
+- **`shared_fs = "none"` (default Kata-CC).** There is no `ShareFs`, so the shim
+  runs `ShareFsVolume::new`'s `None` branch: it computes a deterministic guest
+  path `<cpath>/<cid>-<16 hex>-<dest_base>` (`generate_guest_path`), copies the
+  projected files there via the agent `CopyFile` RPC, and sets that path as the
+  container OCI mount `source` (`type = bind`), emitting **no `Storage`**. In the
+  predictor this whole branch runs with no VM: `VolumeManager` and
+  `generate_guest_path` are pure host-side, and the `CopyFile` calls hit the stub
+  `Agent` (which returns `Ok` — the shim only needs the call to succeed to finish
+  rewriting the mount). The compiler templates the mount as
+  `^$(cpath)/$(bundle-id)-[0-9a-f]{16}-<dest_base>$` — `$(cpath)` / `$(bundle-id)`
+  are shared `rules.rego` substitutions (the cid becomes the per-instance
+  container id at enforcement), `[0-9a-f]{16}` is the *actual* hex pattern the
+  shim emits (tighter than legacy genpolicy's `[a-z0-9]{16}`), and `<dest_base>`
+  is pinned. The matching `CopyFile` destinations are confined to the shared-fs
+  domain and authorized by the default `request_defaults.CopyFileRequest`
+  (`["$(sfprefix)"]`) rule; no `CopyFile` rule generation is required.
 
-The predictor produces **both** from the real `handler_volumes` (the
-`watchable-bind` storage and the rewritten OCI mount, via `map_mount`). The
-compiler injects the storage (`template_volume_storage`) **and** the mount
-(`template_volume_mount`): the mount source is templated exactly like the storage
-`mount_point` — the random `sandbox-<8 hex>` UUID segment wildcarded, the volume
-name pinned — so `rules.rego` `allow_mount` (`check_mount` → `mount_source_allows`
-substituting `$(cpath)`) matches the runtime `CreateContainerRequest`, and
-`allow_mount` clause 2 additionally binds the mount to the `watchable-bind`
-storage's `mount_point`. Before this, the compiler's `normalize_mounts` **failed**
-on the dynamically-destined bind mount (no static template existed) and *no
-policy was generated at all* for any ConfigMap/Secret-bearing container; the
-predictor already emitted the correct mount, but the compiler ignored it.
+- **virtio-fs.** The shim emits a `watchable-bind` `Storage` (source + mount_point)
+  **and** rewrites the OCI mount `source` from the captured runc host bind path
+  (`/var/lib/kubelet/.../kubernetes.io~configmap/...`) to the watchable guest path
+  (`.../watchable/sandbox-<8 hex>-<name>`). Both are needed because the agent
+  checks the `storages` list (`allow_storages`) **and** each OCI mount
+  (`allow_mount`). The predictor emits both (via `handler_volumes` / `map_mount`);
+  the compiler injects the storage (`template_volume_storage`) and the mount
+  (`template_volume_mount`), templating the mount source the same way as the
+  storage `mount_point` — `^$(cpath)/watchable/sandbox-[0-9a-f]{8}-<name>$` — so
+  `allow_mount` (`check_mount` → `mount_source_allows`, substituting `$(cpath)`)
+  matches, and `allow_mount` clause 2 additionally binds the mount to the
+  `watchable-bind` storage's `mount_point`. **No `CopyFile` rule is needed here**:
+  the agent's `BindWatcher` copies the files into a guest `tmpfs` *internally*,
+  with no `CopyFile` ttRPC.
 
-**No `CopyFile` rule is needed for this (virtio-fs) path.** The agent's
-`BindWatcher` copies the projected files into a guest `tmpfs` *internally*, with
-no `CopyFile` ttRPC, so there is nothing to authorize beyond the storage + mount.
-`CopyFile` authorization (`policy_data.request_defaults.CopyFileRequest`, default
-`["$(sfprefix)"]`) only applies to the `shared_fs = "none"` copy-to-rootfs path —
-see *Known gaps*.
+Before this drive, the compiler's `normalize_mounts` **failed** on the
+dynamically-destined ConfigMap/Secret bind mount (no static template existed) and
+*no policy was generated at all*; the predictor already emitted the correct
+mount, but the compiler ignored it.
 
 **Content is host-supplied and unattested** in every path — the policy pins the
 storage/mount *shape*, never the file bytes — so under CoCo a ConfigMap/Secret is
@@ -370,7 +393,8 @@ cares about. Each entry is one of — **pinned at parity** (already enforced, no
 gap: raw `volumeDevices`, VFIO GPU); **not-yet-reproducible** no-VM (real
 `S_IFBLK` block volumes, the snapshotter capture stage); **excluded by the
 threat model** (nydus host-share rootfs); or a **fidelity caveat** where a stub
-diverges from a real CC config (copy-to-rootfs under `shared_fs = "none"`).
+diverges from a real CC config (a virtio-fs ConfigMap/Secret with more than 8
+files, classified by the live host file count).
 
 - **Device-backed classes** (block emptyDir, block/direct volumes): the
   dry-run hypervisor returns a default `hypervisor_config`, so the device manager
@@ -451,25 +475,17 @@ diverges from a real CC config (copy-to-rootfs under `shared_fs = "none"`).
   `shared_fs`: true unless `shared_fs = "none"`. It materially changes routing —
   upstream's `need_local_volume` is `!fs_sharing_supported && … && is_disk_empty_dir`,
   so with virtio-fs a disk-backed `emptyDir`/`local` volume is shared over
-  virtio-fs (no `Storage`), while under `shared_fs = "none"` (block-only / many
-  CoCo profiles) it yields a `local` `Storage`. Caveat (fidelity, **fails
-  closed**): under `shared_fs = "none"` the real shim has **no** `ShareFs`, so
-  ConfigMap/Secret volumes take a different mechanism entirely — `ShareFsVolume`'s
-  `None` branch **copies** the files into the guest rootfs via the agent
-  `copy_file` RPC and emits **no `Storage`** (just an OCI bind mount to the copied
-  guest path, plus an `FsWatcher` that re-copies on change). The predictor keeps
-  the virtio-fs stub (reproducing the copy-to-rootfs path needs a real Agent,
-  which the no-VM run stubs out), so it still models those as `watchable-bind`.
-  The generated policy then pins a `watchable-bind` storage the runtime never
-  produces, and does **not** authorize the actual `CopyFile` RPCs / bind mount, so
-  ConfigMap/Secret **fail closed** on a `shared_fs = "none"` deployment — a
-  fidelity bug, not a bypass. (A related, milder fidelity point: even with
-  virtio-fs, a ConfigMap/Secret with **> 8 files** is not "watchable"
-  (`is_watchable_mount` caps the count at 8) and the shim emits a plain
-  `virtio-fs-mount` with no `Storage` rather than `watchable-bind`; the predictor
-  classifies by the **live** host file count, so this depends on capture
-  fidelity.) `block_device_discard_supported` is left false (it only affects the
-  e2e-only block-volume path).
+  virtio-fs (no `Storage`), while under `shared_fs = "none"` (the default Kata-CC
+  config) it yields a `local` `Storage`. The predictor now **models both**: it
+  passes `share_fs = None` when the sourced config sets `shared_fs = "none"`, so
+  the shim's copy-to-rootfs branch runs no-VM (`CopyFile` hits the stub Agent) and
+  ConfigMap/Secret are driven end to end (see *ConfigMap / Secret: storage + mount
+  pinning*). One residual, milder fidelity point: with virtio-fs a ConfigMap/Secret
+  with **> 8 files** is not "watchable" (`is_watchable_mount` caps the count at 8)
+  and the shim emits a plain `virtio-fs-mount` with no `Storage` rather than
+  `watchable-bind`; the predictor classifies by the **live** host file count, so
+  this depends on capture fidelity. `block_device_discard_supported` is left false
+  (it only affects the e2e-only block-volume path).
 
 ## Rootfs prediction (design)
 

@@ -275,7 +275,12 @@ impl Agent for StubAgent {
         unimplemented!()
     }
     async fn copy_file(&self, _req: CopyFileRequest) -> Result<Empty> {
-        unimplemented!()
+        // shared_fs="none" copy-to-rootfs: the shim issues CopyFile to deliver
+        // configMap/secret files into the container rootfs. There is no VM/agent,
+        // so accept and discard -- the shim only needs the call to succeed to
+        // finish rewriting the OCI mount. The copy destinations are
+        // $(sfprefix)-shaped and authorized by the default CopyFileRequest rule.
+        Ok(Empty::default())
     }
     async fn get_metrics(&self, _req: Empty) -> Result<MetricsResponse> {
         unimplemented!()
@@ -748,10 +753,17 @@ async fn main() -> Result<()> {
     });
     let device_manager = RwLock::new(DeviceManager::new(hv.clone(), None).await?);
 
-    // A stub ShareFs routes share-fs volumes (configmap/secret/projected/
-    // downwardAPI/hostPath) through the shared-fs path instead of the
-    // copy-to-rootfs fallback that needs a real Agent.
-    let share_fs: Option<Arc<dyn ShareFs>> = Some(Arc::new(StubShareFs::new()));
+    // With virtio-fs the shim shares configmap/secret/projected/downwardAPI/
+    // hostPath over a `ShareFs` (watchable-bind). Under `shared_fs = "none"` (the
+    // default Kata-CC config) there is no `ShareFs`: the shim copies the files
+    // into the container rootfs via the agent `CopyFile` RPC and rewrites the OCI
+    // mount to a $(sfprefix)-shaped guest path. Model whichever the deployment
+    // configures so the prediction matches the real CreateContainerRequest.
+    let share_fs: Option<Arc<dyn ShareFs>> = if fs_sharing {
+        Some(Arc::new(StubShareFs::new()))
+    } else {
+        None
+    };
     let agent: Arc<dyn Agent> = Arc::new(StubAgent);
 
     let ctx = VolumeContext {
@@ -867,6 +879,72 @@ mod tests {
         assert!(fs_sharing_supported(&config));
         config.shared_fs.shared_fs = Some("none".to_string());
         assert!(!fs_sharing_supported(&config));
+    }
+
+    // Under shared_fs="none" (the default Kata-CC config) a configMap is NOT a
+    // watchable-bind storage: with no ShareFs the shim runs the copy-to-rootfs
+    // branch (agent CopyFile, stubbed to Ok) and rewrites the OCI mount to a
+    // guest path `<cpath>/<cid>-<16 hex>-<dest_base>`, with NO storage. Proves
+    // the predictor can reproduce the shared_fs="none" mount config with no VM.
+    #[tokio::test]
+    async fn shared_fs_none_configmap_copies_to_rootfs_mount() {
+        let base = std::env::temp_dir().join(format!("gp-sfnone-cm-{}", std::process::id()));
+        let cm_src = base.join("kubernetes.io~configmap").join("my-cm");
+        std::fs::create_dir_all(&cm_src).unwrap();
+        std::fs::write(cm_src.join("key"), "value").unwrap();
+
+        let spec: oci_spec::runtime::Spec = serde_json::from_value(serde_json::json!({
+            "ociVersion": "1.0.0",
+            "mounts": [{
+                "destination": "/etc/config", "type": "bind",
+                "source": cm_src.to_string_lossy(), "options": ["ro"]
+            }]
+        }))
+        .unwrap();
+
+        let config = HypervisorConfig::default();
+        let hv: Arc<dyn Hypervisor> = Arc::new(DryRunHypervisor { config });
+        let device_manager = RwLock::new(DeviceManager::new(hv.clone(), None).await.unwrap());
+        // shared_fs="none": no ShareFs, so the copy-to-rootfs branch runs.
+        let share_fs: Option<Arc<dyn ShareFs>> = None;
+        let agent: Arc<dyn Agent> = Arc::new(StubAgent);
+        let ctx = VolumeContext {
+            share_fs: &share_fs,
+            d: &device_manager,
+            sid: "sb",
+            agent,
+            emptydir_mode: "",
+            fs_sharing_supported: false,
+            block_device_discard_supported: false,
+        };
+        let volumes = VolumeResource::new()
+            .handler_volumes(&ctx, "container0", &spec)
+            .await
+            .unwrap();
+
+        let mounts: Vec<_> = volumes
+            .iter()
+            .flat_map(|v| v.get_volume_mount().unwrap())
+            .collect();
+        let m = mounts
+            .iter()
+            .find(|m| m.destination().to_string_lossy() == "/etc/config")
+            .expect("configmap OCI mount");
+        let src = m.source().as_ref().unwrap().to_string_lossy().to_string();
+        assert!(
+            src.starts_with("/run/kata-containers/shared/containers/"),
+            "src={src}"
+        );
+        assert!(src.ends_with("-config"), "src={src}");
+        assert_eq!(m.typ().as_deref(), Some("bind"), "src={src}");
+        // No watchable-bind storage is produced under shared_fs="none".
+        let storage_count: usize = volumes
+            .iter()
+            .map(|v| v.get_storage().unwrap().len())
+            .sum();
+        assert_eq!(storage_count, 0, "expected no storage");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // A multi-layer erofs `rootfs_mounts` artifact (ext4 rw upper + erofs lower)
