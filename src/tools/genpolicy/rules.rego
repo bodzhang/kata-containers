@@ -1240,9 +1240,14 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
     # Single-layer verity block rootfs is likewise allowed by a dedicated clause
     # (pinned by its dm-verity root hash), not by p_storages.
     verity_rootfs_count := count([s | s := i_storages[_]; "X-kata.dmverity-enabled=true" in s.options; not "X-kata.multi-layer=true" in s.options])
-    print("allow_storages: p_count =", p_count, "i_count =", i_count, "img_pull_count =", img_pull_count, "erofs_ml_count =", erofs_ml_count, "verity_rootfs_count =", verity_rootfs_count)
+    # Per-container image-identity markers (drivers "dmverity-roothashes" and
+    # "guest-pull-images") are policy-only carriers of a container's allowed
+    # rootfs identity; the agent never sends them, so exclude them from the
+    # p_storages count balance. Zero for legacy genpolicy and the union modes.
+    marker_count := count([s | s := p_storages[_]; s.driver in {"dmverity-roothashes", "guest-pull-images"}])
+    print("allow_storages: p_count =", p_count, "i_count =", i_count, "img_pull_count =", img_pull_count, "erofs_ml_count =", erofs_ml_count, "verity_rootfs_count =", verity_rootfs_count, "marker_count =", marker_count)
 
-    p_count == i_count - img_pull_count - erofs_ml_count - verity_rootfs_count
+    p_count - marker_count == i_count - img_pull_count - erofs_ml_count - verity_rootfs_count
 
     every i_storage in i_storages {
         allow_storage(p_storages, i_storage, bundle_id, sandbox_id)
@@ -1271,22 +1276,36 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     i_storage.fs_group == null
     i_storage.shared == false
     count(i_storage.options) == 0
-    allow_guest_pull_image(i_storage)
+    allow_guest_pull_image(p_storages, i_storage)
     print("allow_storage with image_guest_pull: true")
 }
 
-# Pin the guest-pulled image reference to the appliance-predicted allowlist
-# (policy_data.guest_pull.allowed_images). With no allowlist configured (legacy
-# genpolicy, or the predictor was not run) fall back to the historical
-# allow-by-shape so existing policies keep working.
-allow_guest_pull_image(i_storage) if {
+# Pin the guest-pulled image reference. Order of precedence:
+#  1. per-container: this container's own `guest-pull-images` marker storage
+#     (tarfs style, `--per-container-image`);
+#  2. pod-wide union: policy_data.guest_pull.allowed_images;
+#  3. legacy allow-by-shape: only when NO pinning exists anywhere (empty union
+#     AND no per-container marker), so existing policies keep working.
+allow_guest_pull_image(p_storages, i_storage) if {
     count(object.get(policy_data, ["guest_pull", "allowed_images"], [])) == 0
+    not guest_pull_marker_present(p_storages)
     print("allow_guest_pull_image: no allowlist, allow by shape")
 }
-allow_guest_pull_image(i_storage) if {
+allow_guest_pull_image(p_storages, i_storage) if {
     some image in object.get(policy_data, ["guest_pull", "allowed_images"], [])
     i_storage.source == image
-    print("allow_guest_pull_image: pinned image =", image)
+    print("allow_guest_pull_image: pinned image (union) =", image)
+}
+allow_guest_pull_image(p_storages, i_storage) if {
+    some p_storage in p_storages
+    p_storage.driver == "guest-pull-images"
+    i_storage.source in p_storage.options
+    print("allow_guest_pull_image: pinned image (per-container)")
+}
+
+guest_pull_marker_present(p_storages) if {
+    some p_storage in p_storages
+    p_storage.driver == "guest-pull-images"
 }
 allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     print("allow_storage with scsi: start")
@@ -1334,6 +1353,25 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
 
     print("allow_storage erofs multi-layer lower: true")
 }
+# EROFS multi-layer lower, per-container (tarfs style): the root hash is pinned
+# against THIS container's own `dmverity-roothashes` marker storage rather than
+# the pod-wide union, so a container cannot present another same-pod container's
+# rootfs image. Emitted by the compiler with `--per-container-dmverity`.
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+    print("allow_storage erofs multi-layer lower (per-container): start")
+
+    "X-kata.multi-layer=true" in i_storage.options
+    "X-kata.overlay-lower" in i_storage.options
+    i_storage.fstype == "erofs"
+    "X-kata.dmverity-enabled=true" in i_storage.options
+
+    some p_storage in p_storages
+    p_storage.driver == "dmverity-roothashes"
+    some roothash in p_storage.options
+    concat("", ["X-kata.dmverity.roothash=", roothash]) in i_storage.options
+
+    print("allow_storage erofs multi-layer lower (per-container): true")
+}
 # Single-layer dm-verity block rootfs: one verity-protected block device mounted
 # read-only as the container rootfs (BlockRootfs), pinned by its dm-verity root
 # hash against the pod's allowlist. Distinguished from an EROFS lower layer by
@@ -1348,6 +1386,22 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     concat("", ["X-kata.dmverity.roothash=", roothash]) in i_storage.options
 
     print("allow_storage single-layer dm-verity: true")
+}
+# Single-layer dm-verity block rootfs, per-container (tarfs style): pinned
+# against THIS container's own `dmverity-roothashes` marker storage rather than
+# the pod-wide union. Emitted by the compiler with `--per-container-dmverity`.
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+    print("allow_storage single-layer dm-verity (per-container): start")
+
+    "X-kata.dmverity-enabled=true" in i_storage.options
+    not "X-kata.multi-layer=true" in i_storage.options
+
+    some p_storage in p_storages
+    p_storage.driver == "dmverity-roothashes"
+    some roothash in p_storage.options
+    concat("", ["X-kata.dmverity.roothash=", roothash]) in i_storage.options
+
+    print("allow_storage single-layer dm-verity (per-container): true")
 }
 
 # Validates all storage fields except driver and source.

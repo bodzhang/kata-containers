@@ -88,3 +88,40 @@ test_single_layer_dmverity_no_allowlist_denied if {
 	not allow_storages([], single_layer_verity("cafe1234"), "bid", "sid")
 		with data.agent_policy.policy_data as {}
 }
+
+# Per-container (tarfs style): the compiler injects a `dmverity-roothashes`
+# marker storage into THIS container's p_storages carrying only its own root
+# hashes, and the pod-wide union is left empty. The per-container clause matches
+# the lower against the marker; verity_marker_count keeps the count balanced.
+marker(hashes) := {
+	"driver": "dmverity-roothashes", "source": "", "fstype": "",
+	"fs_group": null, "shared": false, "driver_options": [],
+	"mount_point": "", "options": hashes,
+}
+
+# A lower whose root hash is in the container's own marker is admitted, with an
+# empty pod-wide union.
+test_erofs_dmverity_per_container_allowed if {
+	allow_storages([marker(["aa11"])], erofs_storages("aa11"), "bid", "sid")
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
+}
+
+# Cross-container isolation: container A (marker ["aa11"]) presenting container
+# B's image ("bb22") is rejected, even though bb22 is a valid pod image — the
+# union is empty, so only A's own hash is accepted.
+test_erofs_dmverity_per_container_isolation if {
+	not allow_storages([marker(["aa11"])], erofs_storages("bb22"), "bid", "sid")
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
+}
+
+# A single-layer verity rootfs pinned by the container's own marker is admitted.
+test_single_layer_dmverity_per_container_allowed if {
+	allow_storages([marker(["cafe1234"])], single_layer_verity("cafe1234"), "bid", "sid")
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
+}
+
+# ...and another container's single-layer hash is rejected.
+test_single_layer_dmverity_per_container_isolation if {
+	not allow_storages([marker(["cafe1234"])], single_layer_verity("deadbeef"), "bid", "sid")
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
+}

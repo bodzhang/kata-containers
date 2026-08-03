@@ -333,13 +333,36 @@ choice for operators who want to guarantee full coverage.
 
 ### Not yet driven (rationale)
 
-- **Per-container dm-verity allowlist.** The allowlist is pod-scoped (a union),
-  so a container could present another same-pod container's rootfs hash.
-  Tightening to per-container would require threading a container-scoped list
-  through `allow_storages`/`allow_storage`, but those are **shared** upstream
-  `rules.rego` functions (legacy genpolicy calls them too); changing their
-  signature would break that contract, so this is deferred pending an
-  additive per-container mechanism.
+- **Per-container rootfs image identity (now available, gated).** By default the
+  rootfs allowlists are pod-scoped unions (dm-verity root hashes in
+  `policy_data.dmverity.allowed_roothashes`, guest-pull digests in
+  `policy_data.guest_pull.allowed_images`), so a container could present another
+  same-pod container's image. `--per-container-image` (compiler flag) switches
+  to the **tarfs-style** per-container binding for **all three** rootfs identity
+  mechanisms — multi-layer erofs dm-verity, single-layer dm-verity block, and
+  guest-pull — by injecting each container's OWN identity as a synthetic marker
+  storage into that container's `ContainerPolicy.storages` (`dmverity-roothashes`
+  carrying its root hashes, `guest-pull-images` carrying its image digests) and
+  leaving the pod-wide unions empty. The `rules.rego` per-container clauses then
+  pin the presented value against `some p_storage in p_storages` rather than the
+  global union. This is done **without** changing the shared `allow_storages` /
+  `allow_storage` signature: the markers are excluded from the storage-count
+  balance via `marker_count`, which is zero (so behaviour is unchanged) for
+  legacy genpolicy and the default union mode. The guest-pull legacy
+  allow-by-shape fallback still fires only when *no* pinning exists anywhere
+  (empty union **and** no marker). The agent is unaffected — it still emits the
+  same `X-kata.dmverity.*` / `image_guest_pull` storages; only the policy
+  definition changes. Ordering/multiplicity of layers is still matched by set
+  membership (as in the union), so this tightens *scope* (per container) but not
+  layer order. The only keyless capture is the **sandbox/pause container** (no
+  `io.kubernetes.cri.container-name`), which gets no marker — but this is safe,
+  not a gap: the agent detects the sandbox (`is_sandbox`) and unpacks the trusted
+  built-in `/pause_bundle` from the attested guest image (`unpack_pause_image`),
+  **ignoring** the host-supplied `image_guest_pull` `source`, and the pause never
+  presents a dm-verity erofs/block storage. So the per-container mode's
+  allow-by-shape of the sandbox source is harmless (the source is never acted on)
+  and no per-sandbox binding is needed. The pod-wide union remains the **default**
+  purely for backward compatibility, not to cover the sandbox.
 - **Block/direct volume devices.** Block `volumeDevices[]` and direct-assigned
   volumes remain compiler-side `container_path` pins (see *Known gaps*): their
   handlers `stat` a real host `S_IFBLK` device, so the no-VM predictor cannot

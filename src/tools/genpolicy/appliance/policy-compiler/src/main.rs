@@ -32,6 +32,10 @@ struct Args {
     regex_policy_mode: String,
     predicted_storages: Option<PathBuf>,
     strict_storage_coverage: bool,
+    // Pin each container's rootfs image identity (dm-verity root hashes AND
+    // guest-pull image digests) per-container (tarfs style) instead of a
+    // pod-wide union (default false = union).
+    per_container_image: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -202,6 +206,9 @@ fn parse_args() -> Result<Args> {
         predicted_storages: values.get("--predicted-storages").cloned(),
         strict_storage_coverage: values
             .get("--strict-storage-coverage")
+            .is_some_and(|value| value.to_string_lossy() == "true"),
+        per_container_image: values
+            .get("--per-container-image")
             .is_some_and(|value| value.to_string_lossy() == "true"),
     })
 }
@@ -1010,6 +1017,17 @@ fn run(args: Args) -> Result<()> {
         Some(path) => collect_volume_storages(path, args.strict_storage_coverage)?,
         None => BTreeMap::new(),
     };
+    // Per-container image identity: each container's OWN rootfs root hashes and
+    // guest-pull image digests (keyed by CRI container name), injected below as
+    // `dmverity-roothashes` / `guest-pull-images` marker storages.
+    let dmverity_per_container = match (args.per_container_image, &args.predicted_storages) {
+        (true, Some(path)) => collect_dmverity_roothashes_per_container(path)?,
+        _ => BTreeMap::new(),
+    };
+    let guest_pull_per_container = match (args.per_container_image, &args.predicted_storages) {
+        (true, Some(path)) => collect_guest_pull_images_per_container(path)?,
+        _ => BTreeMap::new(),
+    };
     let volume_mounts = match &args.predicted_storages {
         Some(path) => collect_volume_mounts(path)?,
         None => BTreeMap::new(),
@@ -1063,14 +1081,26 @@ fn run(args: Args) -> Result<()> {
         // Inject the predictor's authoritative volume storages (templated to the
         // policy path variables) so storage-bearing containers get a working
         // policy instead of failing closed on an empty p_storages.
-        if let Some(storages) = capture
-            .annotations
-            .get("io.kubernetes.cri.container-name")
-            .and_then(|name| volume_storages.get(name))
-        {
+        let container_name = capture.annotations.get("io.kubernetes.cri.container-name");
+        if let Some(storages) = container_name.and_then(|name| volume_storages.get(name)) {
             container.storages = storages.clone();
-            report["injected_storages"] = json!(container.storages.len());
         }
+        // Per-container image identity (tarfs style): pin this container's own
+        // rootfs dm-verity root hashes and guest-pull image digests via marker
+        // storages, so the rules.rego per-container clauses match the
+        // container's image rather than the pod-wide union
+        // (`--per-container-image`).
+        if let Some(roothashes) = container_name.and_then(|name| dmverity_per_container.get(name)) {
+            if !roothashes.is_empty() {
+                container.storages.push(dmverity_marker_storage(roothashes));
+            }
+        }
+        if let Some(images) = container_name.and_then(|name| guest_pull_per_container.get(name)) {
+            if !images.is_empty() {
+                container.storages.push(guest_pull_marker_storage(images));
+            }
+        }
+        report["injected_storages"] = json!(container.storages.len());
         if args.regex_policy_mode == "legacy" {
             let checked = validate_legacy_service_env_coverage(
                 &capture,
@@ -1088,13 +1118,18 @@ fn run(args: Args) -> Result<()> {
     }
     apply_regex_policy_mode(&mut request_defaults, &args.regex_policy_mode)?;
     append_allow_env_regex(&mut request_defaults, &allow_env_regex)?;
-    let dmverity = match &args.predicted_storages {
-        Some(path) => collect_dmverity_roothashes(path)?,
-        None => DmVerityData::default(),
+    // In per-container mode the root hashes / image digests are injected as
+    // per-container marker storages (above), so the pod-wide unions are left
+    // empty and the rules.rego per-container clauses match instead.
+    let dmverity = match (args.per_container_image, &args.predicted_storages) {
+        (true, _) => DmVerityData::default(),
+        (false, Some(path)) => collect_dmverity_roothashes(path)?,
+        (false, None) => DmVerityData::default(),
     };
-    let guest_pull = match &args.predicted_storages {
-        Some(path) => collect_guest_pull_images(path)?,
-        None => GuestPullData::default(),
+    let guest_pull = match (args.per_container_image, &args.predicted_storages) {
+        (true, _) => GuestPullData::default(),
+        (false, Some(path)) => collect_guest_pull_images(path)?,
+        (false, None) => GuestPullData::default(),
     };
     let data = PolicyData {
         containers,
@@ -1194,6 +1229,76 @@ fn collect_dmverity_roothashes(path: &Path) -> Result<DmVerityData> {
     })
 }
 
+/// Per-container variant of [`collect_dmverity_roothashes`]: instead of a single
+/// pod-wide union, returns each container's OWN rootfs dm-verity root hashes
+/// (keyed by CRI container name), so the compiler can pin them per-container
+/// (tarfs style) rather than allowing any pod member's image for any container.
+/// Same coverage gate: a verity rootfs without a root hash fails generation.
+fn collect_dmverity_roothashes_per_container(
+    path: &Path,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let report: Value = serde_json::from_str(&fs::read_to_string(path)?)
+        .with_context(|| format!("parse predicted storages {}", path.display()))?;
+    let mut by_container: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for pred in report
+        .get("predictions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let Some(name) = pred.get("container_name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(storages) = pred
+            .get("rootfs")
+            .and_then(|r| r.get("storages"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for storage in storages {
+            let options: Vec<&str> = storage
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let roothash = options
+                .iter()
+                .find_map(|o| o.strip_prefix("X-kata.dmverity.roothash="));
+            let is_erofs_lower = storage.get("fs_type").and_then(Value::as_str) == Some("erofs")
+                && options.contains(&"X-kata.multi-layer=true")
+                && options.contains(&"X-kata.overlay-lower");
+            let verity_enabled = options.contains(&"X-kata.dmverity-enabled=true");
+            match roothash {
+                Some(hash) => {
+                    let entry = by_container.entry(name.to_string()).or_default();
+                    if !entry.iter().any(|h| h == hash) {
+                        entry.push(hash.to_string());
+                    }
+                }
+                None if verity_enabled || is_erofs_lower => bail!(
+                    "container {name} has a dm-verity rootfs without a root hash; \
+                     the generated policy would fail closed"
+                ),
+                None => {}
+            }
+        }
+    }
+    Ok(by_container)
+}
+
+/// A synthetic policy-only storage carrying a container's allowed dm-verity root
+/// hashes in `options`. It is never sent by the agent; the rules.rego
+/// per-container erofs clauses read the hashes from it, and `allow_storages`
+/// excludes it from the storage-count balance (`verity_marker_count`).
+fn dmverity_marker_storage(roothashes: &[String]) -> agent::Storage {
+    agent::Storage {
+        driver: "dmverity-roothashes".to_string(),
+        options: roothashes.to_vec(),
+        ..Default::default()
+    }
+}
+
 /// Collects the union of guest-pull image references from a predicted-storages
 /// report. Each container's `rootfs` storage with driver `image_guest_pull`
 /// contributes its `source` (the image reference from
@@ -1241,6 +1346,66 @@ fn collect_guest_pull_images(path: &Path) -> Result<GuestPullData> {
     Ok(GuestPullData {
         allowed_images: images.into_iter().collect(),
     })
+}
+
+/// Per-container variant of [`collect_guest_pull_images`]: each container's OWN
+/// guest-pull image reference(s) (keyed by CRI container name), so the compiler
+/// can pin the manifest digest per-container rather than allowing any pod
+/// member's image for any container. Same gate: a guest-pull rootfs without an
+/// image reference fails generation.
+fn collect_guest_pull_images_per_container(
+    path: &Path,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let report: Value = serde_json::from_str(&fs::read_to_string(path)?)
+        .with_context(|| format!("parse predicted storages {}", path.display()))?;
+    let mut by_container: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for pred in report
+        .get("predictions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let Some(name) = pred.get("container_name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(storages) = pred
+            .get("rootfs")
+            .and_then(|r| r.get("storages"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for storage in storages {
+            if storage.get("driver").and_then(Value::as_str) != Some("image_guest_pull") {
+                continue;
+            }
+            match storage.get("source").and_then(Value::as_str) {
+                Some(source) if !source.is_empty() => {
+                    let entry = by_container.entry(name.to_string()).or_default();
+                    if !entry.iter().any(|s| s == source) {
+                        entry.push(source.to_string());
+                    }
+                }
+                _ => bail!(
+                    "container {name} has a guest-pull rootfs without an image reference; \
+                     the generated policy would fail closed"
+                ),
+            }
+        }
+    }
+    Ok(by_container)
+}
+
+/// A synthetic policy-only storage carrying a container's allowed guest-pull
+/// image references in `options`. Never sent by the agent; the rules.rego
+/// per-container `image_guest_pull` clause reads it, and `allow_storages`
+/// excludes it from the storage-count balance.
+fn guest_pull_marker_storage(images: &[String]) -> agent::Storage {
+    agent::Storage {
+        driver: "guest-pull-images".to_string(),
+        options: images.to_vec(),
+        ..Default::default()
+    }
 }
 
 /// Templates a predicted volume storage so its concrete guest paths become the
@@ -1620,6 +1785,57 @@ mod tests {
     }
 
     #[test]
+    fn dmverity_roothashes_collected_per_container() {
+        let dir = std::env::temp_dir().join(format!("gp-dmv-pc-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // Two containers, each with its OWN erofs lower root hash. The
+        // per-container collector must NOT union them into one pool.
+        let report = json!({
+            "predictions": [
+                {
+                    "container_id": "c1", "container_name": "web",
+                    "rootfs": {"storages": [
+                        {"fs_type": "erofs", "options": ["ro", "X-kata.overlay-lower", "X-kata.multi-layer=true", "X-kata.dmverity.roothash=aa11"]}
+                    ]}
+                },
+                {
+                    "container_id": "c2", "container_name": "sidecar",
+                    "rootfs": {"storages": [
+                        {"fs_type": "erofs", "options": ["ro", "X-kata.overlay-lower", "X-kata.multi-layer=true", "X-kata.dmverity.roothash=bb22"]}
+                    ]}
+                }
+            ]
+        });
+        let path = write_report(&dir, "predicted.json", report);
+        let by_container = collect_dmverity_roothashes_per_container(&path).unwrap();
+        assert_eq!(by_container.get("web"), Some(&vec!["aa11".to_string()]));
+        assert_eq!(by_container.get("sidecar"), Some(&vec!["bb22".to_string()]));
+        // The marker storage carries the hashes in `options` under the synthetic
+        // driver the rules.rego per-container clause keys on.
+        let marker = dmverity_marker_storage(by_container.get("web").unwrap());
+        assert_eq!(marker.driver, "dmverity-roothashes");
+        assert_eq!(marker.options, vec!["aa11".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dmverity_per_container_coverage_gate_rejects_unpinned() {
+        let dir = std::env::temp_dir().join(format!("gp-dmv-pc-gate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let report = json!({
+            "predictions": [{
+                "container_id": "c1", "container_name": "web",
+                "rootfs": {"storages": [
+                    {"fs_type": "erofs", "options": ["ro", "X-kata.overlay-lower", "X-kata.multi-layer=true"]}
+                ]}
+            }]
+        });
+        let path = write_report(&dir, "predicted.json", report);
+        assert!(collect_dmverity_roothashes_per_container(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn dmverity_empty_when_no_rootfs() {
         let dir = std::env::temp_dir().join(format!("gp-dmv-empty-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -1719,6 +1935,39 @@ mod tests {
         });
         let path = write_report(&dir, "predicted.json", report);
         assert!(collect_guest_pull_images(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_pull_images_collected_per_container() {
+        let dir = std::env::temp_dir().join(format!("gp-gp-pc-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // Two containers, each with its OWN guest-pull image; must NOT be unioned.
+        let report = json!({
+            "predictions": [
+                {"container_id": "c1", "container_name": "web", "rootfs": {"storages": [{
+                    "driver": "image_guest_pull", "fs_type": "overlay",
+                    "source": "docker.io/library/nginx@sha256:aaaa", "options": []
+                }]}},
+                {"container_id": "c2", "container_name": "api", "rootfs": {"storages": [{
+                    "driver": "image_guest_pull", "fs_type": "overlay",
+                    "source": "ghcr.io/app/api@sha256:bbbb", "options": []
+                }]}}
+            ]
+        });
+        let path = write_report(&dir, "predicted.json", report);
+        let by_container = collect_guest_pull_images_per_container(&path).unwrap();
+        assert_eq!(
+            by_container.get("web"),
+            Some(&vec!["docker.io/library/nginx@sha256:aaaa".to_string()])
+        );
+        assert_eq!(
+            by_container.get("api"),
+            Some(&vec!["ghcr.io/app/api@sha256:bbbb".to_string()])
+        );
+        let marker = guest_pull_marker_storage(by_container.get("web").unwrap());
+        assert_eq!(marker.driver, "guest-pull-images");
+        assert_eq!(marker.options, vec!["docker.io/library/nginx@sha256:aaaa".to_string()]);
         let _ = fs::remove_dir_all(&dir);
     }
 

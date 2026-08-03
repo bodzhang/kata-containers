@@ -211,6 +211,33 @@ test_guest_pull_fallback_by_shape if {
 		with data.agent_policy.policy_data as {}
 }
 
+# Per-container (tarfs style): the compiler injects a `guest-pull-images` marker
+# carrying only THIS container's image digests, with the pod-wide union empty.
+guest_pull_marker(images) := {
+	"driver": "guest-pull-images", "source": "", "fstype": "",
+	"fs_group": null, "shared": false, "driver_options": [],
+	"mount_point": "", "options": images,
+}
+
+# The container's own image is admitted against its marker, union empty.
+test_guest_pull_per_container_allowed if {
+	allow_storages(
+		[guest_pull_marker(["docker.io/library/nginx:1.27"])],
+		[guest_pull_runtime("docker.io/library/nginx:1.27")], "bid", sandbox_id,
+	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+}
+
+# Cross-container isolation: presenting another container's image ("api") is
+# rejected even though it is a valid pod image, because the union is empty and
+# the marker is missing it. This also confirms the empty union does NOT fall
+# back to allow-by-shape while a marker is present.
+test_guest_pull_per_container_isolation if {
+	not allow_storages(
+		[guest_pull_marker(["docker.io/library/nginx:1.27"])],
+		[guest_pull_runtime("ghcr.io/app/api:2")], "bid", sandbox_id,
+	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+}
+
 # Runtime i_storage for a block-encrypted emptyDir as produced by the shim's
 # block_emptydir_volume handler: a virtio-blk device whose source is the guest
 # PCI address and whose mount_point is $(spath)/base64url(source). base64url("01")
