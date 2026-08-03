@@ -11,6 +11,7 @@
 // host mount state, then runs `handler_volumes` and emits predicted storages.
 
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,9 +23,10 @@ use tokio::sync::{Mutex, RwLock};
 use hypervisor::device::device_manager::DeviceManager;
 use hypervisor::device::DeviceType;
 use hypervisor::hypervisor_persist::HypervisorState;
-use hypervisor::{Hypervisor, MemoryConfig, VcpuThreadIds};
+use hypervisor::{Hypervisor, MemoryConfig, PciPath, VcpuThreadIds};
 use kata_types::capabilities::{Capabilities, CapabilityBits};
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
+use kata_types::device::{DRIVER_BLK_CCW_TYPE, DRIVER_BLK_PCI_TYPE, DRIVER_SCSI_TYPE};
 
 use agent::types::*;
 use agent::{Agent, AgentManager, HealthService};
@@ -86,9 +88,26 @@ impl Hypervisor for DryRunHypervisor {
     async fn resize_memory(&self, _new_mem_mb: u32) -> Result<(u32, MemoryConfig)> {
         unimplemented!()
     }
-    // Echo the device unchanged: the guest device path (/dev/vdX) is assigned
-    // deterministically by the device manager before attach, so no VM is needed.
+    // Echo the device unchanged, except: synthesize a deterministic guest
+    // block-device address so the block rootfs/volume handlers complete with no
+    // VM. The guest device path (/dev/vdX, virtio-blk-mmio) is already assigned
+    // by the device manager, but virtio-blk-pci / virtio-scsi / virtio-blk-ccw
+    // read pci_path / scsi_addr / ccw_addr, which only the real hypervisor sets.
+    // The exact value is irrelevant — the policy wildcards it via $(b64_device_id).
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {
+        if let DeviceType::BlockModern(ref block) = device {
+            let mut dev = block.lock().await;
+            let index = dev.config.index;
+            let driver = dev.config.driver_option.clone();
+            if driver == DRIVER_BLK_PCI_TYPE {
+                // Slot 0 is reserved, so derive a non-zero slot from the index.
+                dev.config.pci_path = Some(PciPath::try_from((index + 1) as u32)?);
+            } else if driver == DRIVER_SCSI_TYPE {
+                dev.config.scsi_addr = Some(format!("{}:{}", index >> 8, index & 0xff));
+            } else if driver == DRIVER_BLK_CCW_TYPE {
+                dev.config.ccw_addr = Some(format!("0.0.{:04x}", index));
+            }
+        }
         Ok(device)
     }
     async fn remove_device(&self, _device: DeviceType) -> Result<()> {
@@ -1118,11 +1137,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // A virtio-blk-pci deployment hits the pci_path gap: the erofs transform
-    // errors, and `predict_rootfs` surfaces that error (the caller captures it
-    // into the `error` field rather than dropping the volume prediction).
+    // A virtio-blk-pci deployment — the driver kata-CC confidential guests
+    // actually use — completes with no VM: the dry-run hypervisor synthesizes a
+    // deterministic PCI address, so `predict_rootfs` returns block storages
+    // whose source is a PciPath ("xx") slot rather than erroring on a missing
+    // pci_path.
     #[tokio::test]
-    async fn erofs_pci_driver_surfaces_error() {
+    async fn erofs_pci_driver_synthesizes_pci_path() {
         let dir = std::env::temp_dir().join(format!("gp-erofs-pci-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let erofs_src = dir.join("layer.erofs");
@@ -1145,7 +1166,7 @@ mod tests {
 
         let spec = oci_spec::runtime::Spec::default();
         let share_fs: Option<Arc<dyn ShareFs>> = None;
-        let result = predict_rootfs(
+        let rootfs = predict_rootfs(
             &rootfs_mounts,
             &spec,
             &share_fs,
@@ -1154,8 +1175,24 @@ mod tests {
             "erofs-sid",
             "erofs-cid",
         )
-        .await;
-        assert!(result.is_err(), "pci erofs rootfs should error under dry-run");
+        .await
+        .expect("pci erofs rootfs should predict under dry-run");
+        assert!(rootfs.error.is_none(), "error={:?}", rootfs.error);
+        let storages = &rootfs.storages;
+        assert_eq!(storages.len(), 2, "count={}", storages.len());
+        // Each block storage source is a PciPath slot ("xx"), non-zero.
+        let mut sources = Vec::new();
+        for s in storages {
+            let src = s.source.as_str();
+            assert_eq!(src.len(), 2, "source={src:?}");
+            assert!(
+                src.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "source={src:?}"
+            );
+            assert_ne!(src, "00", "slot 0 is reserved, source={src:?}");
+            sources.push(src.to_string());
+        }
+        assert_ne!(sources[0], sources[1], "sources={sources:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

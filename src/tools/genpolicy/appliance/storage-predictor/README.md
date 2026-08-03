@@ -215,9 +215,11 @@ Mitigation options (not yet implemented):
 ## Known gaps
 
 - **Device-backed classes** (block, encrypted `emptyDir`, direct volumes): the
-  dry-run hypervisor echoes devices and returns a default `hypervisor_config`, so
-  the device manager assigns the deterministic guest path `/dev/vdX` with no VM
-  (as exercised by the erofs rootfs device tests). Predictor-level prediction
+  dry-run hypervisor returns a default `hypervisor_config`, so the device manager
+  assigns the deterministic guest path `/dev/vdX`, and `add_device` synthesizes a
+  deterministic guest address (`pci_path` for `virtio-blk-pci`, `scsi_addr` for
+  `virtio-scsi`, `ccw_addr` for `virtio-blk-ccw`) so the block handlers complete
+  with no VM (as exercised by the erofs rootfs device tests). Predictor-level prediction
   through `handler_volumes` is still e2e-only, because `BlockVolume::new` `stat`s
   the real host block device and direct volumes read host mount-info metadata. The
   full `blockdev_info` (driver, aio, queues, sector sizes) and `emptydir_mode` are
@@ -265,8 +267,10 @@ Mitigation options (not yet implemented):
   from the deployment's Kata `configuration.toml`
   via `--kata-config` (`GENPOLICY_KATA_CONFIG`), loaded raw (no hypervisor-binary
   validation); otherwise `emptydir_mode` and the block driver are profile-sourced
-  from `profile.env`. `pci_path` is not reconstructed (acceptable for virtio-blk,
-  whose Agent source is the deterministic `/dev/vdX`).
+  from `profile.env`. The guest device address (`pci_path` / `scsi_addr` /
+  `ccw_addr`) is synthesized deterministically by the dry-run `add_device`; the
+  exact value is irrelevant because the generated policy wildcards it via the
+  base64url device id, so only its shape needs to be valid.
 - `fs_sharing_supported` (the `VolumeContext` flag that mirrors the shim's
   `capabilities.is_fs_sharing_supported()`) is derived from the sourced config's
   `shared_fs`: true unless `shared_fs = "none"`. It materially changes routing —
@@ -335,12 +339,15 @@ The predicted rootfs is emitted under the `rootfs` key of the output. Proven by
 the `dry_run_erofs_multi_layer_produces_layer_storages` unit test and the
 `predicts_erofs_multi_layer_rootfs` integration test.
 
-Driver constraint (same as the block path): the dry-run must use
-`virtio-blk-mmio` (via `--block-driver` / `--kata-config`), whose Agent source is
-the deterministic `virt_path` (`/dev/vdX`). `virtio-blk-pci` maps to the `blk`
-driver, whose Agent source is a backend-assigned `pci_path` that the dry-run
-`add_device` echo leaves `None` (`extract_block_device_info` then errors) — see
-the gaps below.
+All three CC block drivers work under the dry-run: `virtio-blk-mmio`'s Agent
+source is the deterministic `virt_path` (`/dev/vdX`), while `virtio-blk-pci`
+(`blk`), `virtio-scsi` (`scsi`), and `virtio-blk-ccw` (`blk-ccw`) get a
+deterministic `pci_path` / `scsi_addr` / `ccw_addr` synthesized by the dry-run
+`add_device`. Proven by the `predicts_erofs_multi_layer_rootfs_pci` integration
+test and the `erofs_pci_driver_synthesizes_pci_path` unit test. Confidential
+guests use `virtio-scsi` (QEMU) or `virtio-blk-pci` (CLH/dragonball); the
+enforced policy wildcards the address via the base64url device id, so the
+synthetic value only needs a valid shape.
 
 The **capture stage** that produces the artifact is `capture_rootfs_mounts.py`:
 

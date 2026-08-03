@@ -240,6 +240,89 @@ fn predicts_erofs_multi_layer_rootfs() {
     let _ = fs::remove_dir_all(&base);
 }
 
+// The same multi-layer erofs rootfs, but driven with `virtio-blk-pci` — the
+// driver kata-CC confidential guests actually use. The dry-run hypervisor
+// synthesizes deterministic PCI addresses so the block handler completes with
+// no VM, and each erofs/ext4 storage source becomes a PciPath ("xx") slot
+// rather than a guest /dev/vdX node. The policy wildcards this via device-id,
+// so only the shape (2 lowercase hex, non-zero slot) needs to be valid.
+#[test]
+fn predicts_erofs_multi_layer_rootfs_pci() {
+    let base = std::env::temp_dir().join(format!("gp-p2-erofs-pci-{}", std::process::id()));
+    fs::create_dir_all(&base).unwrap();
+    let erofs_src = base.join("layer.erofs");
+    fs::write(&erofs_src, b"erofs-image-bytes").unwrap();
+
+    let config = base.join("config.json");
+    let output = base.join("predicted.json");
+    let rootfs_mounts = base.join("rootfs-mounts.json");
+
+    fs::write(
+        &config,
+        serde_json::to_string(&serde_json::json!({ "ociVersion": "1.0.0", "mounts": [] })).unwrap(),
+    )
+    .unwrap();
+
+    let mounts = serde_json::json!([
+        {
+            "source": "/dev/loop0", "destination": "/", "fs_type": "ext4",
+            "options": ["rw"], "device_id": null, "host_shared_fs_path": null, "read_only": false
+        },
+        {
+            "source": erofs_src.to_string_lossy(), "destination": "/", "fs_type": "erofs",
+            "options": ["ro"], "device_id": null, "host_shared_fs_path": null, "read_only": true
+        },
+        {
+            "source": "overlay", "destination": "/", "fs_type": "overlay",
+            "options": [], "device_id": null, "host_shared_fs_path": null, "read_only": false
+        }
+    ]);
+    fs::write(&rootfs_mounts, serde_json::to_string(&mounts).unwrap()).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_storage-predictor");
+    let status = Command::new(bin)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--sid",
+            "erofs-pci-sb",
+            "--cid",
+            "erofs-pci-ctr",
+            "--emptydir-mode",
+            "",
+            "--block-driver",
+            "virtio-blk-pci",
+            "--rootfs-mounts",
+            rootfs_mounts.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "predictor exited with failure");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+    let storages = parsed["rootfs"]["storages"].as_array().unwrap();
+    assert_eq!(storages.len(), 2, "parsed={}", parsed);
+    // A PciPath renders as "xx" or "xx/yy" — 2 lowercase-hex chars per slot.
+    let is_pci_path = |src: &str| {
+        !src.is_empty()
+            && src.split('/').all(|slot| {
+                slot.len() == 2 && slot.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+    };
+    for s in storages {
+        let src = s["source"].as_str().unwrap();
+        assert!(is_pci_path(src), "source {src:?} is not a PciPath, parsed={parsed}");
+        assert_ne!(src, "00", "slot 0 is reserved, parsed={parsed}");
+    }
+    // Distinct devices get distinct slots.
+    assert_ne!(storages[0]["source"], storages[1]["source"], "parsed={parsed}");
+
+    let _ = fs::remove_dir_all(&base);
+}
+
 // A captured multi-layer erofs rootfs_mounts artifact whose erofs layers carry
 // `X-containerd.dmverity` annotations is transformed end-to-end by the binary
 // into GPT-partitioned rootfs storages carrying the dm-verity root hash, no VM.
