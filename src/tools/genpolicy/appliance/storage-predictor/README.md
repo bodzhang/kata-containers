@@ -232,10 +232,17 @@ Mitigation options (not yet implemented):
   host may present but does not pin device identity/content — under the CC model
   a raw block device is untrusted content anyway. The security-meaningful follow-up
   is dm-verity root-hash pinning of read-only *data* volumes (making them trusted
-  devices, so a swap for an untrusted device is denied), reusing the single-layer
-  rootfs mechanism. Beyond `container_path`, only a per-volume `device_id` is
-  surfaced (not full `agent::Device` objects); VFIO/GPU pinning (PCI address + CDI
-  correlation) is not yet reproduced.
+  devices, so a swap for an untrusted device is denied), but that is blocked
+  upstream: no runtime volume handler emits `X-kata.dmverity.*` for a data volume
+  (the `KataVirtualVolume.dm_verity` field is unused), and `is_block_volume`
+  requires a real `S_IFBLK` device so the no-VM predictor cannot reproduce it.
+- NVIDIA passthrough GPU (VFIO) is ALSO pinned, at parity with legacy genpolicy:
+  the compiler counts `nvidia.com/pgpu` resource limits per container and emits
+  one VFIO `agent::Device{container_path=<vfio prefix>, type, vm_path=""}` per GPU
+  plus the CDI-annotation `runtime_anno_pattern`, matched by the `rules.rego`
+  `allow_vfio_devices` clause (device number ↔ CDI annotation correlation, PCI
+  address regex). Both device kinds come from the workload YAML, so no predictor
+  or shim change is involved.
 - No authoritative CRI capture yet, so device requests not fully expressed in the
   OCI spec are not modeled, and the predictor depends on live host mount state
   rather than captured per-source metadata.

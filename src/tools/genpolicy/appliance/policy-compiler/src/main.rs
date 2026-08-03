@@ -158,6 +158,8 @@ struct WorkloadContainerPolicy {
     sandbox_name_pattern: Option<String>,
     // Block-device volume paths (`spec.containers[].volumeDevices[].devicePath`).
     volume_device_paths: Vec<String>,
+    // NVIDIA passthrough GPU (pGPU) count from the container's resource limits.
+    nvidia_pgpu_count: usize,
 }
 
 #[derive(Debug, Default)]
@@ -327,6 +329,7 @@ fn validate_legacy_service_env_coverage(
 fn collect_workload_policy(
     document: &serde_yaml::Value,
     policy: &mut WorkloadPolicy,
+    pgpu_resource_keys: &[String],
 ) -> Result<()> {
     let kind = document
         .get("kind")
@@ -338,7 +341,7 @@ fn collect_workload_policy(
             .and_then(serde_yaml::Value::as_sequence)
             .ok_or_else(|| anyhow!("List has no items"))?;
         for item in items {
-            collect_workload_policy(item, policy)?;
+            collect_workload_policy(item, policy, pgpu_resource_keys)?;
         }
         return Ok(());
     }
@@ -373,6 +376,9 @@ fn collect_workload_policy(
                 .flatten()
                 .map(|d| d.devicePath.clone())
                 .collect(),
+            nvidia_pgpu_count: container
+                .get_nvidia_pgpu_count(pgpu_resource_keys)
+                .unwrap_or(0),
         };
         if let Some(previous) = policy.containers.get(&container.name) {
             if previous != &container_policy {
@@ -390,13 +396,13 @@ fn collect_workload_policy(
     Ok(())
 }
 
-fn load_workload_policy(path: &Path) -> Result<WorkloadPolicy> {
+fn load_workload_policy(path: &Path, pgpu_resource_keys: &[String]) -> Result<WorkloadPolicy> {
     let contents = fs::read_to_string(path)?;
     let mut policy = WorkloadPolicy::default();
     for document in serde_yaml::Deserializer::from_str(&contents) {
         let value = serde_yaml::Value::deserialize(document)?;
         if value != serde_yaml::Value::Null {
-            collect_workload_policy(&value, &mut policy)?;
+            collect_workload_policy(&value, &mut policy, pgpu_resource_keys)?;
         }
     }
     Ok(policy)
@@ -699,6 +705,7 @@ fn compile_container(
     exec_commands: Vec<Vec<String>>,
     sandbox_name_pattern: Option<&str>,
     volume_device_paths: &[String],
+    nvidia_pgpu_count: usize,
 ) -> Result<(ContainerPolicy, Value)> {
     let container_type = capture
         .annotations
@@ -752,6 +759,18 @@ fn compile_container(
             Path: path.clone(),
         });
     }
+    // NVIDIA passthrough GPU (parity with legacy genpolicy): one VFIO device per
+    // requested pGPU, pinned by container_path prefix + device type + empty
+    // vm_path; the actual PCI address and device number are correlated at
+    // enforcement against the CDI annotations via the runtime_anno_pattern below.
+    let vfio = &settings.devices.vfio;
+    for _ in 0..nvidia_pgpu_count {
+        devices.push(agent::Device {
+            container_path: vfio.device_path.clone(),
+            type_: vfio.nvidia.gpu_gk_device_type.clone(),
+            ..Default::default()
+        });
+    }
     let linux = KataLinux {
         Namespaces: policy::get_kata_namespaces(sandbox, false),
         MaskedPaths: capture.linux.masked_paths.clone(),
@@ -785,6 +804,14 @@ fn compile_container(
         runtime_anno_patterns.insert(
             "^io\\.kubernetes\\.container\\.terminationMessagePolicy$".to_string(),
             "^(File|FallbackToLogsOnError)$".to_string(),
+        );
+    }
+    // Allow the CDI VFIO annotation keys/values the device plugin injects for the
+    // requested pGPUs (correlated against the VFIO devices by allow_vfio_devices).
+    if nvidia_pgpu_count > 0 {
+        runtime_anno_patterns.insert(
+            vfio.anno_key_regex.clone(),
+            vfio.nvidia.gpu_anno_value_regex.clone(),
         );
     }
     let policy = ContainerPolicy {
@@ -945,7 +972,10 @@ fn run(args: Args) -> Result<()> {
     let captures = load_captures(&args.tagged_dir, ".tagged.json")?;
     let raw_captures = load_captures(&args.raw_dir, ".config.json")?;
     let regexes = load_regexes(&args.tag_manifest)?;
-    let workload_policy = load_workload_policy(&args.workload)?;
+    let workload_policy = load_workload_policy(
+        &args.workload,
+        &settings.devices.vfio.nvidia.pgpu_resource_keys,
+    )?;
     let sandbox_name_pattern = match workload_policy.sandbox_name_patterns.len()
     {
         0 => None,
@@ -980,6 +1010,9 @@ fn run(args: Args) -> Result<()> {
         let volume_device_paths = container_workload_policy
             .map(|policy| policy.volume_device_paths.clone())
             .unwrap_or_default();
+        let nvidia_pgpu_count = container_workload_policy
+            .map(|policy| policy.nvidia_pgpu_count)
+            .unwrap_or(0);
         let (container, mut report) =
             compile_container(
                 &name,
@@ -991,6 +1024,7 @@ fn run(args: Args) -> Result<()> {
                 exec_commands,
                 container_sandbox_name_pattern,
                 &volume_device_paths,
+                nvidia_pgpu_count,
             )?;
         let mut container = container;
         // Inject the predictor's authoritative volume storages (templated to the
@@ -1876,7 +1910,7 @@ spec:
         .unwrap();
         let mut policy = WorkloadPolicy::default();
 
-        collect_workload_policy(&document, &mut policy).unwrap();
+        collect_workload_policy(&document, &mut policy, &[]).unwrap();
 
         assert_eq!(
             policy.containers["workload"].exec_commands,
@@ -1916,12 +1950,37 @@ spec:
         .unwrap();
         let mut policy = WorkloadPolicy::default();
 
-        collect_workload_policy(&document, &mut policy).unwrap();
+        collect_workload_policy(&document, &mut policy, &[]).unwrap();
 
         assert_eq!(
             policy.containers["workload"].volume_device_paths,
             vec!["/dev/xvdb".to_string(), "/dev/xvdc".to_string()]
         );
+    }
+
+    #[test]
+    fn workload_nvidia_pgpu_count_parsed() {
+        let document: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpupod
+spec:
+  containers:
+    - name: workload
+      image: example.invalid/workload
+      resources:
+        limits:
+          nvidia.com/pgpu: 2
+"#,
+        )
+        .unwrap();
+        let mut policy = WorkloadPolicy::default();
+
+        collect_workload_policy(&document, &mut policy, &["nvidia.com/pgpu".to_string()]).unwrap();
+
+        assert_eq!(policy.containers["workload"].nvidia_pgpu_count, 2);
     }
 
     #[test]
@@ -1958,7 +2017,7 @@ items:
         .unwrap();
         let mut policy = WorkloadPolicy::default();
 
-        let error = collect_workload_policy(&document, &mut policy)
+        let error = collect_workload_policy(&document, &mut policy, &[])
             .unwrap_err()
             .to_string();
 

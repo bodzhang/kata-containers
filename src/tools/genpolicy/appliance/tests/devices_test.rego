@@ -7,8 +7,8 @@ package agent_policy
 # under the CC model. Run via `opa test`.
 #
 # allow_devices splits volume vs VFIO devices using policy_data.devices.vfio; the
-# VFIO device_path here never matches the volume paths under test.
-policy_data := json.unmarshal(`{"devices": {"vfio": {"device_path": "/dev/vfio/"}}}`)
+# VFIO device_path here mirrors genpolicy-settings.json.
+policy_data := json.unmarshal(`{"devices": {"vfio": {"device_path": "/dev/vfio/devices/vfio"}}}`)
 
 oci := {"Annotations": {}}
 
@@ -52,4 +52,61 @@ test_multiple_volume_devices_allowed if {
 # A container with no devices is admitted (unchanged baseline).
 test_no_devices_allowed if {
 	allow_devices([], [], oci)
+}
+
+# --- VFIO / NVIDIA passthrough GPU (parity with legacy genpolicy) ---
+
+# The policy device the compiler emits per requested pGPU: the container_path
+# prefix, the device type, and an empty vm_path.
+vfio_policy_device := {"container_path": "/dev/vfio/devices/vfio", "type_": "vfio-pci-gk", "vm_path": ""}
+
+# A runtime VFIO device: prefix + device number suffix, id "vfio<n>", a PCI-address
+# option, matched/correlated against the CDI annotation for the same number.
+vfio_request_device(n, pci) := {
+	"container_path": concat("", ["/dev/vfio/devices/vfio", n]),
+	"id": concat("", ["vfio", n]),
+	"type_": "vfio-pci-gk",
+	"vm_path": "",
+	"options": [pci],
+}
+
+gpu_oci(n) := {"Annotations": {concat("", ["cdi.k8s.io/vfio", n]): "nvidia.com/gpu=0"}}
+
+# A single requested pGPU is admitted when the VFIO device + CDI annotation correlate.
+test_vfio_gpu_allowed if {
+	allow_devices(
+		[vfio_policy_device],
+		[vfio_request_device("0", "0000:00:05.0=10/de")],
+		gpu_oci("0"),
+	)
+}
+
+# A malformed PCI-address option is rejected.
+test_vfio_gpu_bad_pci_denied if {
+	not allow_devices(
+		[vfio_policy_device],
+		[vfio_request_device("0", "not-a-pci-address")],
+		gpu_oci("0"),
+	)
+}
+
+# A request presenting more VFIO devices than the policy allows is rejected.
+test_vfio_gpu_count_mismatch_denied if {
+	not allow_devices(
+		[vfio_policy_device],
+		[
+			vfio_request_device("0", "0000:00:05.0=10/de"),
+			vfio_request_device("1", "0000:00:06.0=10/df"),
+		],
+		{"Annotations": {"cdi.k8s.io/vfio0": "nvidia.com/gpu=0", "cdi.k8s.io/vfio1": "nvidia.com/gpu=1"}},
+	)
+}
+
+# The device number must correlate with the CDI annotation suffix.
+test_vfio_gpu_cdi_mismatch_denied if {
+	not allow_devices(
+		[vfio_policy_device],
+		[vfio_request_device("0", "0000:00:05.0=10/de")],
+		gpu_oci("1"),
+	)
 }
