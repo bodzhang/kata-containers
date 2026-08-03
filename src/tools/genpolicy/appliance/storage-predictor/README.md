@@ -399,12 +399,24 @@ diverges from a real CC config (copy-to-rootfs under `shared_fs = "none"`).
   upstream's `need_local_volume` is `!fs_sharing_supported && … && is_disk_empty_dir`,
   so with virtio-fs a disk-backed `emptyDir`/`local` volume is shared over
   virtio-fs (no `Storage`), while under `shared_fs = "none"` (block-only / many
-  CoCo profiles) it yields a `local` `Storage`. Caveat: under `shared_fs = "none"`
-  the real shim has **no** `ShareFs`, so ConfigMap/Secret volumes take the
-  copy-to-rootfs path; the predictor keeps the virtio-fs stub (to avoid the
-  copy-path's real-Agent dependency), so those are still modeled as `watchable-bind`
-  rather than copy-to-rootfs. `block_device_discard_supported` is left false (it
-  only affects the e2e-only block-volume path).
+  CoCo profiles) it yields a `local` `Storage`. Caveat (fidelity, **fails
+  closed**): under `shared_fs = "none"` the real shim has **no** `ShareFs`, so
+  ConfigMap/Secret volumes take a different mechanism entirely — `ShareFsVolume`'s
+  `None` branch **copies** the files into the guest rootfs via the agent
+  `copy_file` RPC and emits **no `Storage`** (just an OCI bind mount to the copied
+  guest path, plus an `FsWatcher` that re-copies on change). The predictor keeps
+  the virtio-fs stub (reproducing the copy-to-rootfs path needs a real Agent,
+  which the no-VM run stubs out), so it still models those as `watchable-bind`.
+  The generated policy then pins a `watchable-bind` storage the runtime never
+  produces, and does **not** authorize the actual `CopyFile` RPCs / bind mount, so
+  ConfigMap/Secret **fail closed** on a `shared_fs = "none"` deployment — a
+  fidelity bug, not a bypass. (A related, milder fidelity point: even with
+  virtio-fs, a ConfigMap/Secret with **> 8 files** is not "watchable"
+  (`is_watchable_mount` caps the count at 8) and the shim emits a plain
+  `virtio-fs-mount` with no `Storage` rather than `watchable-bind`; the predictor
+  classifies by the **live** host file count, so this depends on capture
+  fidelity.) `block_device_discard_supported` is left false (it only affects the
+  e2e-only block-volume path).
 
 ## Rootfs prediction (design)
 
