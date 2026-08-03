@@ -409,10 +409,12 @@ The **capture stage** that produces the artifact is `capture_rootfs_mounts.py`:
    Go-runtime dm-verity model exists via `KataVirtualVolume` `image_raw_block` /
    `layer_raw_block` / `*_nydus_block` carrying `DmVerityInfo`.
 
-For a `virtio-blk-pci` deployment the erofs transform hits the `pci_path` gap and
-`predict_rootfs` fails; that failure is captured into the output's
-`rootfs.error` field (see `erofs_pci_driver_surfaces_error`) so the container's
-volume prediction is never dropped.
+A `virtio-blk-pci` deployment works with no VM: the dry-run `add_device`
+synthesizes a deterministic `pci_path` for each layer (see **Dry-run block
+device address synthesis** below), so the erofs transform completes and each
+layer's Agent `source` is a `PciPath` slot (`"xx"`) instead of `/dev/vdX`. Proven
+by `predicts_erofs_multi_layer_rootfs_pci` (binary) and
+`erofs_pci_driver_synthesizes_pci_path` (unit).
 
 ### Single-layer block / dm-verity rootfs — implemented
 
@@ -425,17 +427,45 @@ so a single verity-protected block image is pinned by its root hash exactly like
 an erofs lower layer. `is_block_rootfs` needs a **real** source that stats as a
 block device (`S_IFBLK`) or a loop-backed regular file (`S_IFREG` + the `loop`
 option); the predictor test uses the loop-file form so the whole path runs with
-no VM (`dry_run_single_layer_dmverity_emits_roothash`). Use `virtio-blk-mmio`
-(the `mmioblk` driver, deterministic `/dev/vdX` source) to avoid the
-`virtio-blk-pci` `pci_path` gap noted below.
+no VM (`dry_run_single_layer_dmverity_emits_roothash`). Any CC block driver
+works (`virtio-blk-mmio` `mmioblk` uses the deterministic `/dev/vdX` source;
+`virtio-blk-pci`/`virtio-scsi`/`virtio-blk-ccw` get a synthesized address — see
+**Dry-run block device address synthesis** below).
 
-**Known dry-run gaps for the block/erofs device paths:**
+### Dry-run block device address synthesis
 
-- `extract_block_device_info` / `BlockRootfs` set `storage.source` from
-  `device.config.pci_path` for `virtio-blk-pci` (the `blk` driver); the dry-run
-  `add_device` echo leaves `pci_path = None`, so that driver needs the hypervisor's
-  PCI-topology assignment reproduced. Use `virtio-blk-mmio` (the `mmioblk` driver),
-  whose Agent source is the deterministic `virt_path` (`/dev/vdX`).
+Block-backed handlers (`BlockRootfs`, `ErofsMultiLayerRootfs`,
+`BlockEmptyDirVolume`, `block_volume`) set the Agent `storage.source` from the
+guest device address the hypervisor backend assigns during attach, which varies
+by driver: `virtio-blk-mmio` (`mmioblk`) uses `config.virt_path` (`/dev/vdX`),
+but `virtio-blk-pci` (`blk`) reads `config.pci_path`, `virtio-scsi` (`scsi`)
+reads `config.scsi_addr`, and `virtio-blk-ccw` (`blk-ccw`) reads
+`config.ccw_addr`. Only `virt_path` is assigned by the device manager before
+attach; the other three are populated by the real hypervisor's device-attach
+round-trip, which the dry-run has no VM to perform.
+
+The dry-run `DryRunHypervisor::add_device` therefore synthesizes them
+deterministically from the device index, for `DeviceType::BlockModern` devices:
+
+| driver (`driver_option`) | field set | value |
+| --- | --- | --- |
+| `blk` (`virtio-blk-pci`) | `pci_path` | `PciPath::try_from(index + 1)` — slot 0 is reserved, renders as `"01"`, `"02"`… |
+| `scsi` (`virtio-scsi`) | `scsi_addr` | `"<index>>8>:<index&0xff>"` (SCSI-id:LUN) |
+| `blk-ccw` (`virtio-blk-ccw`) | `ccw_addr` | `"0.0.<index:04x>"` |
+| `mmioblk` (`virtio-blk-mmio`) | — | untouched; `virt_path` already assigned |
+
+Because `add_device` receives the `Arc<Mutex<BlockDeviceModern>>` the handler
+holds, the mutation flows back into the handler's `storage.source`. The value
+need only be *shape-valid*, not runtime-exact: the generated policy wildcards the
+source via the base64url device id (`$(spath)/$(b64_device_id)`), and a `PciPath`
+renders as `"xx"` which matches the `rules.rego` `blk`/`scsi` device-id clauses.
+This is a predictor-only change — no core Kata behavior is altered — and it lets
+the block/erofs paths run under the drivers CC confidential guests actually use
+(QEMU `virtio-scsi`, CLH/dragonball `virtio-blk-pci`, s390 `virtio-blk-ccw`),
+which forbid `virtio-blk-mmio`.
+
+**Remaining dry-run gaps for the block/erofs device paths:**
+
 - `ErofsMultiLayerRootfs::new` stats each erofs source file (`get_erofs_layer_size`
   in GPT mode, `generate_merged_erofs_vmdk` in fsmerge mode) and creates a host
   rootfs directory (side effect), so the captured artifact's `source` paths must
