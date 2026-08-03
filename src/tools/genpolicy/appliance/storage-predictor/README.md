@@ -354,18 +354,23 @@ diverges from a real CC config (copy-to-rootfs under `shared_fs = "none"`).
   `allow_vfio_devices` clause (device number ↔ CDI annotation correlation, PCI
   address regex). Both device kinds come from the workload YAML, so no predictor
   or shim change is involved.
-- No authoritative CRI capture yet, so device requests not fully expressed in the
-  OCI spec are not modeled, and the predictor depends on live host mount state
-  rather than captured per-source metadata.
-- Input-spec fidelity (runc vs kata handler): the predictor consumes containerd's
-  bundle `config.json` captured from the runc handler. containerd generates that
-  bundle from the runtime-agnostic CRI `ContainerConfig`, and the kata handler runs
-  the same `handler_volumes` over the same bundle (see
-  `virt_container/.../container_manager/container.rs`), so the container
-  volume-mount list (emptyDir, ConfigMap, Secret, hostPath, local, ephemeral, shm)
-  is representative regardless of handler. Residual, non-repo-verifiable risk: a
-  containerd kata-handler-specific spec opt that adds/removes/retypes a container
-  mount; standard CRI mount generation is handler-agnostic.
+- **Input-spec fidelity (runc-captured bundle vs the kata handler).** The
+  predictor consumes containerd's OCI bundle `config.json` captured from the
+  **runc** handler. containerd builds that bundle from the runtime-agnostic CRI
+  `ContainerConfig`, and the kata handler runs the same `handler_volumes` over the
+  same bundle (see `virt_container/.../container_manager/container.rs`), so the
+  container volume-mount list (emptyDir, ConfigMap, Secret, hostPath, local,
+  ephemeral, shm) is representative regardless of handler — this is what makes the
+  *dry-run the real mutation pipeline* design choice sound. Two residual,
+  non-repo-verifiable risks remain: (1) a containerd kata-handler-specific spec
+  option that adds/removes/retypes a container mount (standard CRI mount
+  generation is handler-agnostic); and (2) the shim's mount-**rewriting** step
+  (`update_ephemeral_storage_type`) reads live host mount state, so the predictor
+  must run while the workload's host volumes are still mounted rather than from
+  fully captured per-source metadata. An authoritative capture of the kata-handler
+  bundle (or the CRI `ContainerConfig`) would close both. Device requests are
+  unaffected: the policy's device set is pinned from the YAML (see the
+  `volumeDevices` / VFIO bullets above), not derived from the captured spec.
 - Rootfs snapshotter: kata produces the container rootfs via `handler_rootfs`
   from the snapshotter mounts. The predictor models every rootfs shape that
   applies to confidential guests: **guest-pull** (`--guest-pull-rootfs`),
