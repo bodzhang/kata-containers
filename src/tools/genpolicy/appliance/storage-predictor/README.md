@@ -10,33 +10,111 @@ consumes `storages-devices-predicted.json` to pin the container rootfs (by EROFS
 dm-verity root hash, or by guest-pull image reference) and to inject each
 container's volume `storages` into the generated `policy.rego`, so storage-bearing
 workloads get a working, tightly-scoped policy instead of failing closed.
-Predicted **devices** remain audit-only — the generated `devices` list is still
-empty (see *Known gaps*). See *Driving policy generation* below.
+Predicted **devices** remain audit-only: the policy's device *set*
+(`volumeDevices`, VFIO/NVIDIA GPU) is pinned by the compiler from the workload
+YAML — the authority for device intent — not from the no-VM predictor (see
+*Design* and *Known gaps*). See *Driving policy generation* below.
 
 ## Design
 
-- **Real shim code, no drift.** The predictor links the `runtime-rs` `resource`
-  crate and invokes `VolumeResource::handler_volumes`, so storage/device encoding
-  is the shim's own logic. A reimplementation in `genpolicy` or appliance code
-  would diverge — the legacy `genpolicy` model already omits hugepage, block,
-  direct-volume, and all device synthesis.
-- **VM boot skipped at the `Hypervisor` seam.** Volume synthesis is separable from
-  VM lifecycle. The predictor supplies a no-op *dry-run* `Hypervisor` and a stub
-  `Agent`; the guest device path (`/dev/vdX`) comes from the device manager's
-  deterministic index allocation, not from live hotplug.
-- **Shim mount rewriting reproduced.** Before dispatch it runs
-  `kata_sys_util::k8s::update_ephemeral_storage_type`, which rewrites containerd
-  mount types (`bind`/`tmpfs`) into Kata types (`ephemeral`/`local`). That
-  rewriting inspects live host mount state (`mountinfo`/`stat`), so the predictor
-  must run **inside the appliance while the workload's host volumes are still
-  mounted**.
+### What "storage" is in a Kata-CC UVM, and who decides it
+
+A confidential Kata guest (UVM) never sees the Kubernetes volume spec. It sees a
+kata-agent `CreateContainerRequest` carrying a list of **`storages`** (rootfs
+layers, emptyDir/configMap/secret volumes, …) and **`devices`**, each fully
+concrete: a driver, a guest source (`/dev/vdX`, a PCI/SCSI address, a shared-fs
+tag), a mount point, options, `fs_group`. That concrete shape is the product of a
+pipeline of authorities, each of which adds to or *mutates* the storage:
+
+| Authority | Trust (CoCo) | What it decides |
+|---|---|---|
+| **Workload YAML** (author) | trusted *intent* | the volume/device **set** (emptyDir, configMap, secret, projected, hostPath, PVC `volumeDevices`), the **image** (must be digest-pinned), `securityContext.fsGroup`, hugepage / `nvidia.com/pgpu` requests |
+| **Kubelet / K8s** | untrusted (host) | materializes volumes on the host — creates the emptyDir dir and sets its **GID** from `fsGroup`, projects secret/configMap files — and emits the CRI `ContainerConfig` |
+| **containerd** (CRI + snapshotter) | untrusted (host) | lowers CRI → OCI bundle `config.json` (a runtime-agnostic **bind/tmpfs** mount list), and the **snapshotter** produces the rootfs mounts (overlay for runc; erofs / guest-pull / block for kata) |
+| **Kata-CC shim** (`runtime-rs`) | trusted code, **host-controlled config** | the step where concrete Agent storage is *born*: rewrites bind/tmpfs → `ephemeral`/`local`, plugs block devices, applies `emptydir_mode` (shared-fs / local / **block-encrypted** / block-plain), computes guest paths, dm-verity options, `fs_group`, the guest-pull `KataVirtualVolume` |
+| **Kata-CC agent** (in-TEE) | trusted, **enforces** | receives the request and checks every storage/device against the attested policy |
+
+Two facts drive every design choice below:
+
+1. **Only the shim's output (row 4) is enforceable**, because that is exactly
+   what the agent (row 5) sees. The YAML (row 1) is authoritative for *intent*
+   but not for the guest storage *shape* — rows 2–4 mutate it (a YAML `emptyDir`
+   becomes a `tmpfs` `ephemeral` storage, or an `ext4` `blk` device, depending on
+   configuration the YAML never states).
+2. **Part of the shape is decided by host-controlled Kata configuration, not by
+   the YAML** — `shared_fs`, the block driver, and `emptydir_mode` live in the
+   deployment's `configuration.toml`, so the *same* YAML yields *different*
+   storages on different CC profiles.
+
+### Threat model the storage policy addresses
+
+Under Confidential Containers the **host is untrusted** (hypervisor, containerd,
+kubelet, node OS); the guest kernel, agent, and the attested policy are trusted.
+A malicious host controls the `CreateContainerRequest`, so the storage policy
+exists to bind that request to the workload author's intent and deny host
+tampering:
+
+- **rootfs substitution** — the host serves a different image → defended by
+  guest-pull **digest** pinning and erofs / single-layer **dm-verity root-hash**
+  pinning.
+- **volume injection / redirection** — the host adds a storage, or repoints an
+  existing one's source/mount_point to exfiltrate or inject data → defended by
+  pinning each storage's `driver`, `source`, `mount_point`, `options`, `fs_group`.
+- **trusted-device swap** — the host swaps a verity-protected device for an
+  untrusted one → defended by pinning the root hash (device *identity*).
+- **extra devices** — defended by pinning the device *set*.
+
+Explicitly **out of scope**: the *content* of host-supplied block `volumeDevices`
+(baseline-untrusted under CoCo — the guest treats them as untrusted input), host
+denial-of-service, and side channels. That scoping is why, e.g., raw block
+volumes are pinned only by `container_path` (bounding the set) rather than by
+content.
+
+### Design choices that follow
+
+- **Dry-run the real mutation pipeline; don't reimplement it.** Because only the
+  shim's output is enforceable and rows 2–4 mutate the YAML, the predictor
+  captures the OCI bundle **after** containerd's CRI→OCI lowering (from the runc
+  handler, which is CRI-equivalent — see *Known gaps*) and runs the shim's own
+  `VolumeResource::handler_volumes` / `handler_rootfs`. Legacy `genpolicy`
+  instead *reimplements* row 4 in a separate model, which drifts (it omits
+  hugepage, block, direct-volume, and all device synthesis); linking the real
+  `runtime-rs` `resource` crate removes that drift by construction.
+- **Skip the VM at the `Hypervisor` seam.** Storage synthesis is separable from
+  VM lifecycle, so the predictor supplies a no-op *dry-run* `Hypervisor` and a
+  stub `Agent`; guest device paths come from the device manager's deterministic
+  index allocation and a synthesized PCI/SCSI address (see *Dry-run block device
+  address synthesis*), not from live hotplug.
+- **Feed the shim the deployment's Kata-CC configuration.** Since the storage
+  shape depends on `shared_fs` / block driver / `emptydir_mode` (host-controlled
+  config, not YAML), the predictor sources the *same* `configuration.toml`
+  (`--kata-config`) so its prediction matches the CC shim the workload will
+  actually run under.
+- **Keep the YAML as the authority for intent.** What a no-VM run cannot (or
+  should not) derive is pinned from the YAML by the compiler instead: image
+  **digests** are enforced at YAML validation (`submit_workload.py`), and the
+  volume/device **set** (`volumeDevices`, `nvidia.com/pgpu`) is pinned from the
+  manifest.
+- **Reproduce only the unavoidable host-side rewriting.** The shim's
+  `kata_sys_util::k8s::update_ephemeral_storage_type` rewrites containerd
+  `bind`/`tmpfs` mounts into Kata `ephemeral`/`local` types and inspects live host
+  mount state (`mountinfo`/`stat`), so the predictor must run **inside the
+  appliance while the workload's host volumes are still mounted**. The one path
+  that cannot be reused as-is (`VirtiofsShareMount`, entangled with virtiofsd) is
+  *mirrored*, with the drift surface documented (see *Drift risk*).
+- **Predict without gating; gate in the compiler.** The predictor records
+  per-container failures and never blocks generation; gating (the dm-verity
+  coverage gate, the opt-in `--strict-storage-coverage` gate) happens downstream
+  where the policy is assembled (see *Driving policy generation*).
 - **Serialization mirror.** `agent::types::Storage`/`Device` are not `Serialize`,
   so the tool maps them to local serializable structs for the JSON output.
-- **Non-gating predictor.** The predictor stage records per-container prediction
-  failures and never blocks policy generation itself. Gating happens downstream
-  in the compiler: the EROFS dm-verity coverage gate always fails on an unpinned
-  erofs lower, and the opt-in `--strict-storage-coverage` gate fails on an
-  unsupported volume class (see *Driving policy generation*).
+
+Guided by this framing, the **Known gaps** below fall into three kinds: (a)
+mutations the no-VM predictor cannot yet reproduce (real `S_IFBLK` block volumes,
+the snapshotter capture stage); (b) paths the **threat model excludes**, which
+are therefore deliberately not modeled (nydus host-share rootfs); and (c)
+fidelity caveats where a stub diverges from a real CC config (copy-to-rootfs
+under `shared_fs = "none"`).
 
 ## Usage
 
@@ -232,6 +310,14 @@ Mitigation options (not yet implemented):
 - Add an alignment test that fails if the upstream storage shape changes.
 
 ## Known gaps
+
+Read against the *Design* summary: an item matters only if it affects a storage
+the shim actually produces for a CC workload (row 4) and that the threat model
+cares about. Each entry is one of — **pinned at parity** (already enforced, no
+gap: raw `volumeDevices`, VFIO GPU); **not-yet-reproducible** no-VM (real
+`S_IFBLK` block volumes, the snapshotter capture stage); **excluded by the
+threat model** (nydus host-share rootfs); or a **fidelity caveat** where a stub
+diverges from a real CC config (copy-to-rootfs under `shared_fs = "none"`).
 
 - **Device-backed classes** (block emptyDir, block/direct volumes): the
   dry-run hypervisor returns a default `hypervisor_config`, so the device manager
