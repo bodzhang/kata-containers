@@ -560,7 +560,11 @@ fn sandbox_process(settings: &Settings, capture: &CapturedSpec) -> KataProcess {
     process
 }
 
-fn normalize_mounts(capture: &CapturedSpec, template: &KataSpec) -> Result<Vec<KataMount>> {
+fn normalize_mounts(
+    capture: &CapturedSpec,
+    template: &KataSpec,
+    predicted_mounts: &BTreeMap<String, KataMount>,
+) -> Result<Vec<KataMount>> {
     let templates: BTreeMap<_, _> = template
         .Mounts
         .iter()
@@ -592,6 +596,15 @@ fn normalize_mounts(capture: &CapturedSpec, template: &KataSpec) -> Result<Vec<K
             }
             validate_guest_mount_source(&mount)?;
             mounts.push(mount);
+        } else if let Some(predicted) = predicted_mounts.get(&captured.destination) {
+            // Predictor-authoritative shared-fs mount (configMap / secret /
+            // projected / downwardAPI / hostPath): the shim rewrote the captured
+            // host bind source to a Kata shared-fs guest path, so use the
+            // templated regex mount the predictor drove (random UUID segment
+            // wildcarded, name pinned) — this is what the runtime
+            // CreateContainerRequest carries and what rules.rego allow_mount matches.
+            validate_guest_mount_source(predicted)?;
+            mounts.push(predicted.clone());
         } else if captured.type_ != "bind" {
             mounts.push(KataMount {
                 destination: captured.destination.clone(),
@@ -624,7 +637,10 @@ fn validate_guest_mount_source(mount: &KataMount) -> Result<()> {
         return Ok(());
     }
 
-    if !mount.source.starts_with("$(sfprefix)") {
+    // Confined to the Kata shared-filesystem domain: either the legacy
+    // $(sfprefix) scheme or the runtime-rs `^$(cpath)/[watchable/]sandbox-...`
+    // scheme the predictor drives for configMap/secret/shared-fs mounts.
+    if !mount.source.starts_with("$(sfprefix)") && !mount.source.starts_with("^$(cpath)/") {
         bail!(
             "externally backed mount {} is not confined to the Kata shared-filesystem domain: {}",
             mount.destination,
@@ -707,6 +723,7 @@ fn compile_container(
     sandbox_name_pattern: Option<&str>,
     volume_device_paths: &[String],
     nvidia_pgpu_count: usize,
+    predicted_mounts: &BTreeMap<String, KataMount>,
 ) -> Result<(ContainerPolicy, Value)> {
     let container_type = capture
         .annotations
@@ -786,7 +803,7 @@ fn compile_container(
             Path: template.Root.Path.clone(),
             Readonly: capture.root.readonly,
         },
-        Mounts: normalize_mounts(capture, template)?,
+        Mounts: normalize_mounts(capture, template, predicted_mounts)?,
         Hooks: None,
         Annotations: annotations,
         Linux: linux,
@@ -993,6 +1010,10 @@ fn run(args: Args) -> Result<()> {
         Some(path) => collect_volume_storages(path, args.strict_storage_coverage)?,
         None => BTreeMap::new(),
     };
+    let volume_mounts = match &args.predicted_storages {
+        Some(path) => collect_volume_mounts(path)?,
+        None => BTreeMap::new(),
+    };
     for (identity, (name, capture)) in captures {
         let raw_capture = raw_captures
             .get(&identity)
@@ -1014,6 +1035,16 @@ fn run(args: Args) -> Result<()> {
         let nvidia_pgpu_count = container_workload_policy
             .map(|policy| policy.nvidia_pgpu_count)
             .unwrap_or(0);
+        // Predictor-authoritative shared-fs OCI mounts (configMap/secret/
+        // projected/downwardAPI/hostPath), keyed by destination, so
+        // normalize_mounts emits the Kata guest-path mount instead of failing
+        // closed on the captured runc host-path bind mount.
+        let predicted_mounts = capture
+            .annotations
+            .get("io.kubernetes.cri.container-name")
+            .and_then(|name| volume_mounts.get(name))
+            .cloned()
+            .unwrap_or_default();
         let (container, mut report) =
             compile_container(
                 &name,
@@ -1026,6 +1057,7 @@ fn run(args: Args) -> Result<()> {
                 container_sandbox_name_pattern,
                 &volume_device_paths,
                 nvidia_pgpu_count,
+                &predicted_mounts,
             )?;
         let mut container = container;
         // Inject the predictor's authoritative volume storages (templated to the
@@ -1370,6 +1402,93 @@ fn watchable_shared_name(source: &str) -> Option<String> {
 /// policy is never silently loosened. When `strict` is set, an unsupported
 /// class is a hard error instead — the coverage gate operators can enable to
 /// refuse generating a policy that would fail closed at runtime.
+/// Templates a predicted shared-filesystem bind mount (configMap / secret /
+/// projected / downwardAPI / hostPath) into a policy `KataMount`. The shim
+/// rewrites the captured host bind source to a Kata shared-fs guest path
+/// (`.../[watchable/]sandbox-<8 hex>-<name>`), so — mirroring the watchable
+/// storage templating — the random UUID segment is wildcarded (`[0-9a-f]{8}`),
+/// the volume name is pinned, and the concrete shared-dir prefix becomes
+/// `$(cpath)`, which `rules.rego`'s `mount_source_allows` substitutes at
+/// enforcement. Returns `None` for a mount whose source is not a recognizable
+/// runtime-rs shared path, so the caller keeps failing closed on unknown shapes.
+fn template_volume_mount(mount: &Value) -> Result<Option<KataMount>> {
+    let field = |name: &str| mount.get(name).and_then(Value::as_str).unwrap_or_default();
+    let destination = field("destination");
+    let type_ = field("type");
+    let source = field("source");
+    // Only shared-fs bind mounts are rewritten this way; anything else is left
+    // to the caller (which fails closed on an un-normalized bind mount).
+    if destination.is_empty() || type_ != "bind" {
+        return Ok(None);
+    }
+    let Some(name) = watchable_shared_name(source) else {
+        return Ok(None);
+    };
+    let escaped = regex::escape(&name);
+    // Watchable configMap/secret land under `.../watchable/`; other shared-fs
+    // binds directly under the passthrough shared dir.
+    let templated_source = if source.contains("/watchable/") {
+        format!("^$(cpath)/watchable/sandbox-[0-9a-f]{{8}}-{escaped}$")
+    } else {
+        format!("^$(cpath)/sandbox-[0-9a-f]{{8}}-{escaped}$")
+    };
+    let options = mount
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+        .unwrap_or_default();
+    Ok(Some(KataMount {
+        destination: destination.to_string(),
+        type_: type_.to_string(),
+        source: templated_source,
+        options,
+    }))
+}
+
+/// Reads the predicted-storages report and templates each container's volume
+/// MOUNTS (the OCI bind mounts the shim rewrote to Kata shared-fs guest paths),
+/// keyed by CRI container name then mount destination, for injection into the
+/// policy OCI mounts by `normalize_mounts`. Mounts whose source is not a
+/// recognizable shared path are skipped (the container keeps failing closed on
+/// that mount, exactly as without a predicted report).
+fn collect_volume_mounts(path: &Path) -> Result<BTreeMap<String, BTreeMap<String, KataMount>>> {
+    let report: Value = serde_json::from_str(&fs::read_to_string(path)?)
+        .with_context(|| format!("parse predicted storages {}", path.display()))?;
+    let mut by_container = BTreeMap::new();
+    for pred in report
+        .get("predictions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let Some(name) = pred.get("container_name").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut templated = BTreeMap::new();
+        for volume in pred
+            .get("volumes")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            for mount in volume
+                .get("mounts")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                if let Some(m) = template_volume_mount(mount)? {
+                    templated.insert(m.destination.clone(), m);
+                }
+            }
+        }
+        if !templated.is_empty() {
+            by_container.insert(name.to_string(), templated);
+        }
+    }
+    Ok(by_container)
+}
+
 fn collect_volume_storages(
     path: &Path,
     strict: bool,
@@ -1682,6 +1801,90 @@ mod tests {
             "mount_point": "/run/kata-containers/foo"
         });
         assert!(template_volume_storage(&storage).unwrap().is_none());
+    }
+
+    #[test]
+    fn watchable_configmap_mount_templated_with_hash_wildcard() {
+        // The shim rewrites the container's configMap bind mount source to the
+        // watchable guest path; the compiler wildcards the UUID segment and pins
+        // the name, keeping the destination/type/options for the agent's
+        // allow_mount check.
+        let mount = json!({
+            "destination": "/etc/config",
+            "type": "bind",
+            "source": "/run/kata-containers/shared/containers/passthrough/watchable/sandbox-86d776af-my-cm",
+            "options": ["rbind", "rprivate", "ro"]
+        });
+        let templated = template_volume_mount(&mount).unwrap().unwrap();
+        assert_eq!(templated.destination, "/etc/config");
+        assert_eq!(templated.type_, "bind");
+        assert_eq!(
+            templated.source,
+            "^$(cpath)/watchable/sandbox-[0-9a-f]{8}-my\\-cm$"
+        );
+        assert_eq!(
+            templated.options,
+            vec!["rbind".to_string(), "rprivate".to_string(), "ro".to_string()]
+        );
+    }
+
+    #[test]
+    fn non_watchable_shared_fs_mount_templated() {
+        // A non-watchable shared-fs bind (no /watchable/ segment) lands directly
+        // under the passthrough shared dir.
+        let mount = json!({
+            "destination": "/data",
+            "type": "bind",
+            "source": "/run/kata-containers/shared/containers/passthrough/sandbox-deadbeef-vol",
+            "options": ["rbind", "rprivate"]
+        });
+        let templated = template_volume_mount(&mount).unwrap().unwrap();
+        assert_eq!(templated.source, "^$(cpath)/sandbox-[0-9a-f]{8}-vol$");
+    }
+
+    #[test]
+    fn non_bind_or_unrecognized_mount_is_skipped() {
+        // A non-bind mount is not a shared-fs rewrite.
+        let tmpfs = json!({
+            "destination": "/tmp", "type": "tmpfs", "source": "tmpfs", "options": []
+        });
+        assert!(template_volume_mount(&tmpfs).unwrap().is_none());
+        // A bind mount whose source is not the runtime-rs shared-path shape is
+        // left to fail closed (returns None).
+        let odd = json!({
+            "destination": "/x", "type": "bind",
+            "source": "/var/lib/kubelet/pods/abc/volumes/kubernetes.io~configmap/cm",
+            "options": ["ro"]
+        });
+        assert!(template_volume_mount(&odd).unwrap().is_none());
+    }
+
+    #[test]
+    fn volume_mounts_collected_by_container_name() {
+        let dir = std::env::temp_dir().join(format!("gp-vmnt-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let report = json!({
+            "predictions": [{
+                "container_name": "app",
+                "volumes": [{
+                    "mounts": [{
+                        "destination": "/etc/config", "type": "bind",
+                        "source": "/run/kata-containers/shared/containers/passthrough/watchable/sandbox-86d776af-my-cm",
+                        "options": ["rbind", "rprivate", "ro"]
+                    }],
+                    "storages": []
+                }]
+            }]
+        });
+        let path = write_report(&dir, "predicted.json", report);
+        let by_container = collect_volume_mounts(&path).unwrap();
+        let app = by_container.get("app").expect("app container mounts");
+        let mount = app.get("/etc/config").expect("configmap mount");
+        assert_eq!(
+            mount.source,
+            "^$(cpath)/watchable/sandbox-[0-9a-f]{8}-my\\-cm$"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

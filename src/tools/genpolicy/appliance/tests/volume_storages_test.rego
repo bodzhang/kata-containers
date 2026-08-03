@@ -297,3 +297,49 @@ test_block_plain_emptydir_scsi_allowed if {
 	allow_storages([block_plain_scsi_policy], [block_plain_scsi_runtime], "bid", sandbox_id)
 }
 
+# --- ConfigMap/Secret OCI mount (watchable-bind) enforcement ---
+# The shim rewrites the container's configMap bind mount source to the watchable
+# guest path; the compiler templates it into a policy OCI mount whose source
+# wildcards the random UUID segment and pins the name. rules.rego allow_mount
+# (check_mount 2 -> mount_source_allows, substituting $(cpath)) must accept the
+# runtime mount.
+configmap_mount_policy(name) := {"Mounts": [{
+	"destination": "/etc/config", "type_": "bind",
+	"source": concat("", ["^$(cpath)/watchable/sandbox-[0-9a-f]{8}-", name, "$"]),
+	"options": ["rbind", "rprivate", "ro"],
+}]}
+
+configmap_mount_runtime(name) := {
+	"destination": "/etc/config", "type_": "bind",
+	"source": concat("", [
+		"/run/kata-containers/shared/containers/passthrough/watchable/sandbox-86d776af-", name,
+	]),
+	"options": ["rbind", "rprivate", "ro"],
+}
+
+configmap_mount_allowed(p_oci, i_mount) if {
+	allow_mount(p_oci, i_mount, [], "bid", sandbox_id) == 0
+}
+
+# The configMap mount is admitted: the random hash is wildcarded and the name
+# pinned via $(cpath) substitution.
+test_watchable_configmap_mount_allowed if {
+	configmap_mount_allowed(configmap_mount_policy("my-cm"), configmap_mount_runtime("my-cm"))
+}
+
+# The name is pinned: a different configMap name is rejected (the host cannot
+# redirect the container mount to another volume).
+test_watchable_configmap_mount_wrong_name_denied if {
+	not configmap_mount_allowed(configmap_mount_policy("my-cm"), configmap_mount_runtime("evil-cm"))
+}
+
+# The mount options are pinned exactly: an rw runtime mount is rejected against
+# an ro policy mount.
+test_watchable_configmap_mount_wrong_options_denied if {
+	not configmap_mount_allowed(
+		configmap_mount_policy("my-cm"),
+		json.patch(configmap_mount_runtime("my-cm"), [{"op": "replace", "path": "/options", "value": ["rbind", "rprivate", "rw"]}]),
+	)
+}
+
+
