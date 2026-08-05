@@ -8,6 +8,22 @@ license = { workspace = true }
 name = "createreq-capture"
 path = "src/main.rs"
 
+[[bin]]
+name = "containerd-shim-kata-capture-v2"
+path = "src/bin/capture-shim.rs"
+required-features = ["runtime-rs-capture"]
+
+[features]
+runtime-rs-capture = [
+	"dep:containerd-shim-protos",
+	"dep:go-flag",
+	"dep:libc",
+	"dep:protobuf",
+	"dep:runtimes",
+	"dep:service",
+	"dep:sha2",
+]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -15,11 +31,18 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 oci-spec = { workspace = true }
+go-flag = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+protobuf = { workspace = true, optional = true }
+containerd-shim-protos = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 
 agent = { workspace = true }
 hypervisor = { workspace = true }
 resource = { workspace = true }
 common = { workspace = true }
 virt_container = { workspace = true }
+runtimes = { workspace = true, optional = true }
+service = { workspace = true, optional = true }
 kata-types = { workspace = true }
 logging = { workspace = true }

@@ -15,9 +15,10 @@ This directory implements the versioned clean-room pipeline described in
   host. The VM (or host, if you skip the VM) must expose a unified cgroup v2
   hierarchy (`stat -fc %T /sys/fs/cgroup` reports `cgroup2fs`) for
   `--cgroupns=host`.
-- The base pipeline boots a throwaway Kubernetes control plane and runs each
-  workload under **runc/overlayfs** (no guest VM is booted), so it needs no
-  special kernel features or hardware virtualization beyond the above.
+- The base pipeline boots a throwaway Kubernetes control plane and routes the
+  `kata` RuntimeClass through an appliance-owned runtime-rs capture shim. The
+  shim uses a dry-run hypervisor and recording Agent, so no guest VM is booted
+  and no hardware virtualization is required.
 
 ### EROFS dm-verity rootfs capture (experimental, opt-in)
 
@@ -71,6 +72,18 @@ Build the profile image:
 ```bash
 make image
 ```
+
+The default image uses the integrated runtime-rs capture shim and records live
+create and exec requests. To build the upstream-compatible runc capture path,
+which does not require the runtime-rs constructor additions, run:
+
+```bash
+make image CAPTURE_BACKEND=runc
+```
+
+The runc backend captures OCI bundles during the Kubernetes run and replays
+them through the standalone no-VM `createreq-capture` tool. It captures final
+create requests but does not observe live probe `ExecProcessRequest` calls.
 
 Run it inside a disposable Linux VM:
 
@@ -231,7 +244,7 @@ policy data for operations absent from container creation, such as exec probes.
 ### Encrypted `emptyDir` fidelity boundary
 
 For `emptydir_mode = "block-encrypted"`, the appliance has high fidelity at the
-policy-relevant shim/Agent boundary. `createreq-capture` runs the production
+policy-relevant shim/Agent boundary. The capture shim runs the production
 runtime-rs block-`emptyDir` handler, including sparse backing-file creation,
 block-device synthesis, storage construction, mount rewriting, and propagation
 of `fsGroup`. The captured `CreateContainerRequest` therefore contains the same

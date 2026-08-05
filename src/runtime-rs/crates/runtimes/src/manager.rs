@@ -284,10 +284,18 @@ impl std::fmt::Debug for RuntimeHandlerManager {
 
 impl RuntimeHandlerManager {
     pub fn new(id: &str, msg_sender: Sender<Message>) -> Result<Self> {
+        Self::new_with_runtime_instance(id, msg_sender, None)
+    }
+
+    pub fn new_with_runtime_instance(
+        id: &str,
+        msg_sender: Sender<Message>,
+        runtime_instance: Option<RuntimeInstance>,
+    ) -> Result<Self> {
+        let mut inner = RuntimeHandlerManagerInner::new(id, msg_sender)?;
+        inner.runtime_instance = runtime_instance.map(Arc::new);
         Ok(Self {
-            inner: Arc::new(RwLock::new(RuntimeHandlerManagerInner::new(
-                id, msg_sender,
-            )?)),
+            inner: Arc::new(RwLock::new(inner)),
         })
     }
 

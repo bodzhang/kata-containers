@@ -56,12 +56,31 @@ impl ServiceManager {
         namespace: &str,
         task_server_fd: RawFd,
     ) -> Result<Self> {
+        let (sender, receiver) = channel::<Message>(MESSAGE_BUFFER_SIZE);
+        let rt_mgr = RuntimeHandlerManager::new(id, sender).context("new runtime handler")?;
+        Self::new_with_runtime_handler(
+            containerd_binary,
+            address,
+            namespace,
+            task_server_fd,
+            Arc::new(rt_mgr),
+            receiver,
+        )
+        .await
+    }
+
+    // TODO: who manages lifecycle for `task_server_fd`?
+    pub async fn new_with_runtime_handler(
+        containerd_binary: &str,
+        address: &str,
+        namespace: &str,
+        task_server_fd: RawFd,
+        handler: Arc<RuntimeHandlerManager>,
+        receiver: Receiver<Message>,
+    ) -> Result<Self> {
         // Regist service logger for later use.
         logging::register_subsystem_logger("runtimes", "service");
 
-        let (sender, receiver) = channel::<Message>(MESSAGE_BUFFER_SIZE);
-        let rt_mgr = RuntimeHandlerManager::new(id, sender).context("new runtime handler")?;
-        let handler = Arc::new(rt_mgr);
         // SAFETY: containerd passes a valid unix listener fd when starting the shim.
         let server = unsafe { Server::new().add_unix_listener(task_server_fd)? };
         let event_publisher = new_event_publisher(namespace)

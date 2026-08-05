@@ -52,7 +52,13 @@ python3 "${appliance_root}/scripts/submit_workload.py" \
 	--images-output "${output_dir}/requested-images.txt" \
 	--validate-only
 
-install -D -m 0644 "${appliance_root}/config/containerd.toml" /etc/containerd/config.toml
+containerd_config="${appliance_root}/config/containerd.toml"
+case "${GENPOLICY_CAPTURE_BACKEND:-runtime-rs}" in
+runc) ;;
+runtime-rs) containerd_config="${appliance_root}/config/containerd-runtime-rs.toml" ;;
+*) fail "unsupported capture backend: ${GENPOLICY_CAPTURE_BACKEND}" ;;
+esac
+install -D -m 0644 "${containerd_config}" /etc/containerd/config.toml
 install -D -m 0644 "${appliance_root}/config/kubelet.yaml" /etc/kubernetes/kubelet.yaml
 install -D -m 0644 "${appliance_root}/config/10-genpolicy.conflist" /etc/cni/net.d/10-genpolicy.conflist
 install -D -m 0755 "${appliance_root}/scripts/runc-capture" /usr/local/bin/runc-capture
@@ -139,6 +145,7 @@ metadata:
 handler: kata
 EOF
 
+export GENPOLICY_CAPTURE_OUTPUT="${output_dir}"
 containerd --config /etc/containerd/config.toml \
 	>"${output_dir}/logs/containerd.log" 2>&1 &
 pids+=("$!")
@@ -330,33 +337,32 @@ python3 "${appliance_root}/scripts/predict_storages.py" \
 	2>"${output_dir}/logs/storage-predictor.log" ||
 	echo "storage prediction failed; see logs/storage-predictor.log" >&2
 
-# Capture the authoritative agent CreateContainerRequest by driving the real
-# runtime-rs shim container-create path with a dry-run hypervisor and recording
-# agent (no VM). The runc OCI captures are only inputs to this stage; the policy
-# compiler consumes the resulting requests.
-mkdir -p "${output_dir}/createcontainer-requests"
-direct_vol_arg=()
-[[ -n "${GENPOLICY_DIRECT_VOLUME_MOUNTS:-}" && -f "${GENPOLICY_DIRECT_VOLUME_MOUNTS}" ]] &&
-	direct_vol_arg=(--direct-volume-mounts "${GENPOLICY_DIRECT_VOLUME_MOUNTS}")
-for spec in "${output_dir}"/raw/*.config.json; do
-	name="$(basename "${spec}" .config.json)"
-	meta="${spec%.config.json}.meta.json"
-	cid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["container_id"])' "${meta}")"
-	bundle="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("bundle",""))' "${meta}")"
-	rootfs_mounts_arg=()
-	[[ -f "${output_dir}/raw/${name}.rootfs-mounts.json" ]] &&
-		rootfs_mounts_arg=(--rootfs-mounts "${output_dir}/raw/${name}.rootfs-mounts.json")
-	/usr/local/bin/createreq-capture \
-		--container-id "${cid}" \
-		--bundle "${bundle:-/tmp/${cid}}" \
-		--spec "${spec}" \
-		--kata-config "${GENPOLICY_KATA_CONFIG}" \
-		"${rootfs_mounts_arg[@]}" \
-		"${direct_vol_arg[@]}" \
-		--output "${output_dir}/createcontainer-requests/${name}.json" \
-		2>>"${output_dir}/logs/createreq-capture.log" ||
-		fail "createreq-capture failed for ${name}; see logs/createreq-capture.log"
-done
+if [[ "${GENPOLICY_CAPTURE_BACKEND:-runtime-rs}" == "runc" ]]; then
+	mkdir -p "${output_dir}/createcontainer-requests"
+	direct_vol_arg=()
+	[[ -n "${GENPOLICY_DIRECT_VOLUME_MOUNTS:-}" && -f "${GENPOLICY_DIRECT_VOLUME_MOUNTS}" ]] &&
+		direct_vol_arg=(--direct-volume-mounts "${GENPOLICY_DIRECT_VOLUME_MOUNTS}")
+	for spec in "${output_dir}"/raw/*.config.json; do
+		name="$(basename "${spec}" .config.json)"
+		meta="${spec%.config.json}.meta.json"
+		cid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["container_id"])' "${meta}")"
+		bundle="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("bundle",""))' "${meta}")"
+		rootfs_mounts_arg=()
+		[[ -f "${output_dir}/raw/${name}.rootfs-mounts.json" ]] &&
+			rootfs_mounts_arg=(--rootfs-mounts "${output_dir}/raw/${name}.rootfs-mounts.json")
+		/usr/local/bin/createreq-capture \
+			--container-id "${cid}" \
+			--bundle "${bundle:-/tmp/${cid}}" \
+			--spec "${spec}" \
+			--kata-config "${GENPOLICY_KATA_CONFIG}" \
+			"${rootfs_mounts_arg[@]}" \
+			"${direct_vol_arg[@]}" \
+			--output "${output_dir}/createcontainer-requests/${name}.json" \
+			2>>"${output_dir}/logs/createreq-capture.log" ||
+			fail "createreq-capture failed for ${name}; see logs/createreq-capture.log"
+	done
+fi
+
 request_captures=$(find "${output_dir}/createcontainer-requests" -type f -name '*.json' | wc -l)
 [[ "${request_captures}" -eq "${expected_captures}" ]] ||
 	fail "expected ${expected_captures} CreateContainerRequest captures, found ${request_captures}"

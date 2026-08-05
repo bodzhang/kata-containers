@@ -40,6 +40,11 @@ test -s "${temporary}/output/workload-policy.yaml"
 test -s "${temporary}/output/policy-balanced.rego"
 test -s "${temporary}/output/policy-mode-report.json"
 test "$(find "${temporary}/output/tagged-requests" -type f -name '*.json' | wc -l)" -ge 2
+if [[ "${CAPTURE_BACKEND:-runtime-rs}" == "runtime-rs" ]]; then
+    test "$(find "${temporary}/output/execprocess-requests" -type f -name '*.json' | wc -l)" -ge 1
+    grep -R -q '"/bin/busybox"' "${temporary}/output/execprocess-requests"
+    grep -R -q '"true"' "${temporary}/output/execprocess-requests"
+fi
 grep -R -q '{{GENPOLICY_DYNAMIC:' "${temporary}/output/tagged-requests"
 grep -q 'policy_data :=' "${temporary}/output/policy.rego"
 grep -q 'io.katacontainers.config.hypervisor.cc_init_data' \

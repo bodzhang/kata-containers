@@ -3,6 +3,7 @@ SHELL := /bin/bash
 include profile.env
 
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+CAPTURE_BACKEND ?= runtime-rs
 IMAGE ?= genpolicy-appliance:$(PROFILE_NAME)
 REFERENCE_IMAGE ?= $(IMAGE)-legacy-reference
 REPO_ROOT := $(abspath ../../../..)
@@ -16,6 +17,7 @@ image:
 	@test -n "$(CONTAINER_ENGINE)" || { echo "docker or podman is required"; exit 1; }
 	$(CONTAINER_ENGINE) build \
 		--file $(CURDIR)/Dockerfile \
+		--build-arg CAPTURE_BACKEND=$(CAPTURE_BACKEND) \
 		--build-arg KUBERNETES_VERSION=$(KUBERNETES_VERSION) \
 		--build-arg CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
 		--build-arg EROFS_CONTAINERD_VERSION=$(EROFS_CONTAINERD_VERSION) \
@@ -29,6 +31,7 @@ reference-image:
 	$(CONTAINER_ENGINE) build \
 		--file $(CURDIR)/Dockerfile \
 		--target legacy-reference \
+		--build-arg CAPTURE_BACKEND=$(CAPTURE_BACKEND) \
 		--build-arg KUBERNETES_VERSION=$(KUBERNETES_VERSION) \
 		--build-arg CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
 		--build-arg EROFS_CONTAINERD_VERSION=$(EROFS_CONTAINERD_VERSION) \
@@ -38,5 +41,6 @@ reference-image:
 		--tag $(REFERENCE_IMAGE) $(REPO_ROOT)
 
 e2e: image reference-image
-	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" IMAGE="$(IMAGE)" \
+	CAPTURE_BACKEND="$(CAPTURE_BACKEND)" \
+		CONTAINER_ENGINE="$(CONTAINER_ENGINE)" IMAGE="$(IMAGE)" \
 		REFERENCE_IMAGE="$(REFERENCE_IMAGE)" ./tests/e2e.sh

@@ -66,14 +66,16 @@ compiler; see [policy-compiler/DESIGN.md](policy-compiler/DESIGN.md).
    defaulting.
 6. Let kubelet produce the real CRI sandbox and container requests.
 7. Let containerd produce the OCI runtime specification.
-8. Capture each final bundle `config.json` through a runc wrapper immediately
-   before runc consumes it.
+8. Route the `kata` RuntimeClass through the appliance capture shim, which
+  reuses runtime-rs task services and container/resource managers behind a
+  dry-run hypervisor and recording Agent.
 9. Predict the Kata Agent `storages` and `devices` the workload would produce
    by running the real `runtime-rs` shim handlers behind a no-VM dry-run
    `Hypervisor`, and emit `storages-devices-predicted.json` (see
    [Storage and device prediction](#storage-and-device-prediction)) for audit.
-10. Drive the real runtime-rs container-create path and require one final Agent
-    `CreateContainerRequest` capture per expected sandbox or container.
+10. Require one final Agent `CreateContainerRequest` capture per expected
+  sandbox or container. Record probe and lifecycle `ExecProcessRequest`
+  calls from the same live shim service.
 11. Tag deployment-variable values in each request's nested OCI and emit a
     manifest with request-rooted JSON pointers.
 12. Compile policy from paired raw/tagged requests using the appliance-local
@@ -281,13 +283,23 @@ provide fixtures for them or retain explicit regex/allowlist policy rules.
 
 ## OCI capture
 
-containerd 1.7 invokes `io.containerd.runc.v2`, which invokes the configured
-runc binary after writing the bundle's `config.json`. The profile config sets
-`BinaryName` to `runc-capture`. The wrapper copies `config.json` and invocation
-metadata to `/output/raw` and then execs the real pinned runc.
+containerd 1.7 invokes `io.containerd.kata-capture.v2` for Pods selecting the
+`kata` RuntimeClass. The appliance-owned shim receives containerd's final OCI
+bundle and routes normal task requests through runtime-rs. Its recording Agent
+writes the amended OCI from each final `CreateContainerRequest` to
+`/output/raw` together with container metadata. This runtime-rs backend is the
+default build and also records live `ExecProcessRequest` calls.
 
-This captures the specification at the last stable boundary before execution
-without patching containerd.
+This captures the OCI and Agent request at the policy enforcement boundary
+without patching containerd or booting a VM.
+
+An explicit `CAPTURE_BACKEND=runc` compatibility build does not compile the
+integrated shim and therefore does not depend on its runtime-rs constructor
+APIs. It uses `runc-capture` to retain final OCI bundles during the Kubernetes
+run, then passes those bundles through the standalone no-VM
+`createreq-capture` tool. That path produces final create-request policy inputs
+but cannot observe live probe or lifecycle exec requests; those commands remain
+sourced from the trusted workload YAML.
 
 ## Storage and device prediction
 
@@ -323,19 +335,20 @@ artifacts. Neither is a compiler input. The final Agent-visible request is
 captured as one artifact so OCI, storages, devices, and request flags cannot
 drift across independently modeled sources.
 
-The `createreq-capture` tool closes that gap by driving the **real** shim
-container-create path with no VM. It builds the pinned `runtime-rs`
-`ResourceManager` and public `VirtContainerManager` behind the same no-op
-dry-run `Hypervisor`, injects a **recording `Agent`**, and calls
-`VirtContainerManager::create_container(config, spec)`. That runs the shim's own
-`Container::create` — rootfs, volume, and device handlers, spec amendment, and
-namespace normalization — and hands the assembled `agent::CreateContainerRequest`
-to the recording agent, which serializes it (`createcontainer-request.json`)
-instead of sending it over ttrpc. OCI spec, storages, and devices are then a
-single authoritative artifact produced by real shim code, with no
-compiler-side normalization template. This uses only the crate's public
-`VirtContainerManager`; the sole change to `virt_container` is a one-line
-re-export of that manager.
+The appliance capture shim closes that gap by handling containerd task requests
+through the **real** runtime-rs service and container-create path with no VM. It
+builds the pinned `ResourceManager` and public `VirtContainerManager` behind a
+dry-run `Hypervisor`, injects a **recording `Agent`**, and seeds that runtime
+instance into the normal `RuntimeHandlerManager` and `ServiceManager`. The
+shim's own `Container::create` performs rootfs, volume, and device handling,
+spec amendment, and namespace normalization before handing the assembled
+`agent::CreateContainerRequest` to the recording Agent. OCI, storages, devices,
+and request flags are therefore one authoritative artifact produced by real
+shim code, with no compiler-side normalization template. The same Agent records
+`ExecProcessRequest` calls generated by kubelet probes and lifecycle hooks.
+The shim enables runtime-rs's existing `force_guest_pull` experiment so the
+native snapshotter's host bind rootfs is converted by `ResourceManager` into the
+same guest-pull virtual volume that the confidential deployment uses.
 
 Three properties follow from running the real code:
 

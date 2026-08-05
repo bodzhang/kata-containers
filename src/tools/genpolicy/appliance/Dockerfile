@@ -1,3 +1,5 @@
+ARG CAPTURE_BACKEND=runtime-rs
+
 FROM registry.k8s.io/pause:3.10 AS pause
 FROM busybox:1.36.1 AS busybox
 FROM docker.io/library/registry:2.8.3 AS registry
@@ -48,12 +50,26 @@ RUN sed 's/@COMMIT_INFO@/genpolicy-appliance/' \
         --package kata-storage-predictor \
         --package kata-createreq-capture
 
+FROM policy-builder AS capture-backend-runc
+RUN mkdir -p /capture-backend
+
+FROM policy-builder AS capture-backend-runtime-rs
+RUN cargo build --locked --release \
+        --package kata-createreq-capture \
+        --features runtime-rs-capture \
+        --bin containerd-shim-kata-capture-v2 \
+    && mkdir -p /capture-backend \
+    && cp target/release/containerd-shim-kata-capture-v2 /capture-backend/
+
+FROM capture-backend-${CAPTURE_BACKEND} AS capture-backend
+
 FROM policy-builder AS legacy-builder
 
 RUN cargo build --locked --release --package genpolicy
 
 FROM debian:bookworm-slim AS appliance-runtime
 
+ARG CAPTURE_BACKEND=runtime-rs
 ARG TARGETARCH=amd64
 ARG KUBERNETES_VERSION=v1.33.13
 ARG CONTAINERD_VERSION=v1.7.29
@@ -132,6 +148,7 @@ COPY --from=policy-builder /workspace/target/release/storage-predictor \
     /usr/local/bin/storage-predictor
 COPY --from=policy-builder /workspace/target/release/createreq-capture \
     /usr/local/bin/createreq-capture
+COPY --from=capture-backend /capture-backend/ /usr/local/bin/
 COPY src/tools/genpolicy/appliance /opt/genpolicy/appliance
 COPY src/tools/genpolicy/rules.rego /opt/genpolicy/policy/rules.rego
 COPY src/tools/genpolicy/genpolicy-settings.json /opt/genpolicy/policy/settings/genpolicy-settings.json
@@ -157,6 +174,7 @@ RUN set -eux; \
 
 ENV PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV GENPOLICY_APPLIANCE_ROOT=/opt/genpolicy/appliance
+ENV GENPOLICY_CAPTURE_BACKEND=${CAPTURE_BACKEND}
 
 ENTRYPOINT ["/opt/genpolicy/appliance/scripts/entrypoint.sh"]
 
