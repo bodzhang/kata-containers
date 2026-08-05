@@ -28,22 +28,35 @@ erofs_storages(roothash) := [
 	},
 ]
 
+erofs_storages_at(roothash, mount_point) := [
+	json.patch(storage, [{"op": "replace", "path": "/mount_point", "value": mount_point}]) |
+	storage := erofs_storages(roothash)[_]
+]
+
 # A lower layer whose root hash is in this container's marker is admitted.
 test_erofs_dmverity_allowed if {
-	allow_storages([marker(["aa11"])], erofs_storages("aa11"), "bid", "sid")
+	allow_storages([marker(["aa11"])], erofs_storages("aa11"), "foo", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }
 
 # A root hash not in this container's marker is rejected.
 test_erofs_dmverity_wrong_roothash_denied if {
-	not allow_storages([marker(["aa11"])], erofs_storages("deadbeef"), "bid", "sid")
+	not allow_storages([marker(["aa11"])], erofs_storages("deadbeef"), "foo", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
+}
+
+test_erofs_dmverity_wrong_mount_point_denied if {
+	not allow_storages(
+		[marker(["aa11"])],
+		erofs_storages_at("aa11", "/run/kata-containers/other/rootfs"),
+		"foo", "sid",
+	) with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }
 
 # A legacy pod-wide allowlist cannot authorize a root hash without a
 # per-container marker.
 test_erofs_dmverity_global_allowlist_denied if {
-	not allow_storages([], erofs_storages("aa11"), "bid", "sid")
+	not allow_storages([], erofs_storages("aa11"), "foo", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": ["aa11"]}}
 }
 
@@ -55,7 +68,7 @@ test_erofs_without_verity_denied if {
 		"mount_point": "/run/kata-containers/foo/rootfs",
 		"options": ["ro", "X-kata.overlay-lower", "X-kata.multi-layer=true"],
 	}]
-	not allow_storages([], storages, "bid", "sid")
+	not allow_storages([], storages, "foo", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": ["aa11"]}}
 }
 
@@ -74,19 +87,28 @@ single_layer_verity(roothash) := [{
 
 # A single-layer verity rootfs whose hash is in this container's marker is admitted.
 test_single_layer_dmverity_allowed if {
-	allow_storages([marker(["cafe1234"])], single_layer_verity("cafe1234"), "bid", "sid")
+	allow_storages([marker(["cafe1234"])], single_layer_verity("cafe1234"), "foo", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }
 
 # A single-layer verity rootfs with a hash absent from the marker is rejected.
 test_single_layer_dmverity_wrong_roothash_denied if {
-	not allow_storages([marker(["cafe1234"])], single_layer_verity("deadbeef"), "bid", "sid")
+	not allow_storages([marker(["cafe1234"])], single_layer_verity("deadbeef"), "foo", "sid")
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
+}
+
+test_single_layer_dmverity_wrong_mount_point_denied if {
+	storages := [json.patch(
+		single_layer_verity("cafe1234")[0],
+		[{"op": "replace", "path": "/mount_point", "value": "/run/kata-containers/other/rootfs"}],
+	)]
+	not allow_storages([marker(["cafe1234"])], storages, "foo", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }
 
 # A legacy global allowlist cannot authorize a single-layer rootfs.
 test_single_layer_dmverity_global_allowlist_denied if {
-	not allow_storages([], single_layer_verity("cafe1234"), "bid", "sid")
+	not allow_storages([], single_layer_verity("cafe1234"), "foo", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": ["cafe1234"]}}
 }
 
@@ -102,7 +124,7 @@ marker(hashes) := {
 # A lower whose root hash is in the container's own marker is admitted, with an
 # empty pod-wide union.
 test_erofs_dmverity_per_container_allowed if {
-	allow_storages([marker(["aa11"])], erofs_storages("aa11"), "bid", "sid")
+	allow_storages([marker(["aa11"])], erofs_storages("aa11"), "foo", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }
 
@@ -110,18 +132,18 @@ test_erofs_dmverity_per_container_allowed if {
 # B's image ("bb22") is rejected, even though bb22 is a valid pod image — the
 # union is empty, so only A's own hash is accepted.
 test_erofs_dmverity_per_container_isolation if {
-	not allow_storages([marker(["aa11"])], erofs_storages("bb22"), "bid", "sid")
+	not allow_storages([marker(["aa11"])], erofs_storages("bb22"), "foo", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }
 
 # A single-layer verity rootfs pinned by the container's own marker is admitted.
 test_single_layer_dmverity_per_container_allowed if {
-	allow_storages([marker(["cafe1234"])], single_layer_verity("cafe1234"), "bid", "sid")
+	allow_storages([marker(["cafe1234"])], single_layer_verity("cafe1234"), "foo", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }
 
 # ...and another container's single-layer hash is rejected.
 test_single_layer_dmverity_per_container_isolation if {
-	not allow_storages([marker(["cafe1234"])], single_layer_verity("deadbeef"), "bid", "sid")
+	not allow_storages([marker(["cafe1234"])], single_layer_verity("deadbeef"), "foo", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }

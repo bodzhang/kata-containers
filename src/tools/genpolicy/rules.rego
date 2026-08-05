@@ -1203,6 +1203,8 @@ mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id) if {
 
     regex4 := replace(regex3, "$(bundle-id)", bundle_id)
     print("mount_source_allows 1: regex4 =", regex4)
+    startswith(regex4, "^")
+    endswith(regex4, "$")
     regex.match(regex4, i_mount.source)
 
     print("mount_source_allows 1: true")
@@ -1219,6 +1221,8 @@ mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id) if {
 
     regex4 := replace(regex3, "$(sandbox-id)", sandbox_id)
     print("mount_source_allows 2: regex4 =", regex4)
+    startswith(regex4, "^")
+    endswith(regex4, "$")
     regex.match(regex4, i_mount.source)
 
     print("mount_source_allows 2: true")
@@ -1276,6 +1280,9 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     i_storage.fs_group == null
     i_storage.shared == false
     count(i_storage.options) == 0
+    count(i_storage.driver_options) == 1
+    startswith(i_storage.driver_options[0], "image_guest_pull=")
+    allow_rootfs_mount_point(i_storage, bundle_id)
     allow_guest_pull_image(p_storages, i_storage)
     print("allow_storage with image_guest_pull: true")
 }
@@ -1315,6 +1322,7 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     "X-kata.multi-layer=true" in i_storage.options
     "X-kata.overlay-upper" in i_storage.options
     i_storage.fstype == "ext4"
+    allow_rootfs_storage_base(i_storage, bundle_id)
 
     print("allow_storage erofs multi-layer upper: true")
 }
@@ -1327,6 +1335,7 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     "X-kata.overlay-lower" in i_storage.options
     i_storage.fstype == "erofs"
     "X-kata.dmverity-enabled=true" in i_storage.options
+    allow_rootfs_storage_base(i_storage, bundle_id)
 
     some p_storage in p_storages
     p_storage.driver == "dmverity-roothashes"
@@ -1343,6 +1352,7 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
 
     "X-kata.dmverity-enabled=true" in i_storage.options
     not "X-kata.multi-layer=true" in i_storage.options
+    allow_rootfs_storage_base(i_storage, bundle_id)
 
     some p_storage in p_storages
     p_storage.driver == "dmverity-roothashes"
@@ -1350,6 +1360,16 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     concat("", ["X-kata.dmverity.roothash=", roothash]) in i_storage.options
 
     print("allow_storage single-layer dm-verity (per-container): true")
+}
+
+allow_rootfs_storage_base(i_storage, bundle_id) if {
+    i_storage.fs_group == null
+    i_storage.shared == false
+    allow_rootfs_mount_point(i_storage, bundle_id)
+}
+
+allow_rootfs_mount_point(i_storage, bundle_id) if {
+    i_storage.mount_point == concat("", ["/run/kata-containers/", bundle_id, "/rootfs"])
 }
 
 # Validates all storage fields except driver and source.
@@ -1391,6 +1411,8 @@ allow_storage_source(p_storage, i_storage, bundle_id) if {
     source4 := replace(source3, "$(bundle-id)", bundle_id)
 
     print("allow_storage_source 2: source =", source4)
+    startswith(source4, "^")
+    endswith(source4, "$")
     regex.match(source4, i_storage.source)
 
     print("allow_storage_source 2: true")

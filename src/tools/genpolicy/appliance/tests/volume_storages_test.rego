@@ -166,6 +166,18 @@ test_watchable_bind_wrong_name_denied if {
 	)
 }
 
+test_literal_storage_source_is_not_regex if {
+	p_storage := {"source": "literal.name"}
+	i_storage := {"source": "literalXname"}
+	not allow_storage_source(p_storage, i_storage, "bid")
+}
+
+test_literal_mount_source_is_not_regex if {
+	p_mount := {"source": "/run/literal.name"}
+	i_mount := {"source": "/run/literalXname"}
+	not mount_source_allows(p_mount, i_mount, "bid", sandbox_id)
+}
+
 # A hugepage-backed emptyDir (hugetlbfs) is admitted by the new clause.
 test_hugepage_storage_allowed if {
 	allow_storages(
@@ -195,13 +207,13 @@ guest_pull_runtime(image) := {
 # A legacy global allowlist cannot authorize guest-pull without a per-container
 # marker.
 test_guest_pull_global_allowlist_denied if {
-	not allow_storages([], [guest_pull_runtime("evil.example/malware:latest")], "bid", sandbox_id)
+	not allow_storages([], [guest_pull_runtime("evil.example/malware:latest")], "cid", sandbox_id)
 		with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": ["evil.example/malware:latest"]}}
 }
 
 # Missing per-container identity fails closed instead of allowing by shape.
 test_guest_pull_without_marker_denied if {
-	not allow_storages([], [guest_pull_runtime("docker.io/library/nginx:1.27")], "bid", sandbox_id)
+	not allow_storages([], [guest_pull_runtime("docker.io/library/nginx:1.27")], "cid", sandbox_id)
 		with data.agent_policy.policy_data as {}
 }
 
@@ -217,7 +229,29 @@ guest_pull_marker(images) := {
 test_guest_pull_per_container_allowed if {
 	allow_storages(
 		[guest_pull_marker(["docker.io/library/nginx:1.27"])],
-		[guest_pull_runtime("docker.io/library/nginx:1.27")], "bid", sandbox_id,
+		[guest_pull_runtime("docker.io/library/nginx:1.27")], "cid", sandbox_id,
+	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+}
+
+test_guest_pull_wrong_mount_point_denied if {
+	storage := json.patch(
+		guest_pull_runtime("docker.io/library/nginx:1.27"),
+		[{"op": "replace", "path": "/mount_point", "value": "/run/kata-containers/other/rootfs"}],
+	)
+	not allow_storages(
+		[guest_pull_marker(["docker.io/library/nginx:1.27"])],
+		[storage], "cid", sandbox_id,
+	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+}
+
+test_guest_pull_missing_driver_metadata_denied if {
+	storage := json.patch(
+		guest_pull_runtime("docker.io/library/nginx:1.27"),
+		[{"op": "replace", "path": "/driver_options", "value": []}],
+	)
+	not allow_storages(
+		[guest_pull_marker(["docker.io/library/nginx:1.27"])],
+		[storage], "cid", sandbox_id,
 	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
 }
 
@@ -228,7 +262,7 @@ test_guest_pull_per_container_allowed if {
 test_guest_pull_per_container_isolation if {
 	not allow_storages(
 		[guest_pull_marker(["docker.io/library/nginx:1.27"])],
-		[guest_pull_runtime("ghcr.io/app/api:2")], "bid", sandbox_id,
+		[guest_pull_runtime("ghcr.io/app/api:2")], "cid", sandbox_id,
 	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
 }
 

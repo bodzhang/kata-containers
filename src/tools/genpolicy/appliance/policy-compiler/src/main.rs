@@ -109,13 +109,18 @@ struct CapturedLinuxDevice {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct CapturedCreateRequest {
     container_id: String,
+    exec_id: String,
     sandbox_pidns: bool,
     oci: Option<CapturedSpec>,
     storages: Vec<Value>,
     devices: Vec<CapturedAgentDevice>,
+    shared_mounts: Vec<Value>,
+    stdin_port: Option<u32>,
+    stdout_port: Option<u32>,
+    stderr_port: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -356,6 +361,21 @@ fn validate_create_request_pair(
             raw.container_id
         );
     }
+    validate_supported_create_request_fields(basename, raw)?;
+    validate_supported_create_request_fields(basename, tagged)?;
+    if tagged.exec_id != raw.exec_id
+        || tagged.sandbox_pidns != raw.sandbox_pidns
+        || tagged.storages != raw.storages
+        || tagged.devices != raw.devices
+        || tagged.shared_mounts != raw.shared_mounts
+        || tagged.stdin_port != raw.stdin_port
+        || tagged.stdout_port != raw.stdout_port
+        || tagged.stderr_port != raw.stderr_port
+    {
+        bail!(
+            "tagged create request {basename} changed request-level fields outside nested OCI"
+        );
+    }
     let tagged_oci = tagged
         .oci
         .as_ref()
@@ -376,6 +396,44 @@ fn validate_create_request_pair(
                 actual,
                 expected
             );
+        }
+    }
+    Ok(())
+}
+
+fn validate_create_request_sets(
+    tagged: &BTreeMap<String, CapturedCreateRequest>,
+    raw: &BTreeMap<String, CapturedCreateRequest>,
+) -> Result<()> {
+    let tagged_names: BTreeSet<_> = tagged.keys().collect();
+    let raw_names: BTreeSet<_> = raw.keys().collect();
+    if tagged_names != raw_names {
+        let missing_tagged: Vec<_> = raw_names.difference(&tagged_names).copied().collect();
+        let missing_raw: Vec<_> = tagged_names.difference(&raw_names).copied().collect();
+        bail!(
+            "CreateContainerRequest capture sets differ: missing tagged {missing_tagged:?}, missing raw {missing_raw:?}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_supported_create_request_fields(
+    basename: &str,
+    request: &CapturedCreateRequest,
+) -> Result<()> {
+    if !request.exec_id.is_empty() {
+        bail!("create request {basename} has unsupported non-empty exec_id");
+    }
+    if !request.shared_mounts.is_empty() {
+        bail!("create request {basename} has unsupported shared_mounts");
+    }
+    for (name, port) in [
+        ("stdin_port", request.stdin_port),
+        ("stdout_port", request.stdout_port),
+        ("stderr_port", request.stderr_port),
+    ] {
+        if port.is_some() {
+            bail!("create request {basename} has unsupported {name}");
         }
     }
     Ok(())
@@ -1128,6 +1186,7 @@ fn run(args: Args) -> Result<()> {
     let settings = Settings::new(args.settings.to_str().unwrap());
     let tagged_requests = load_create_requests(&args.tagged_requests_dir, ".tagged.json")?;
     let raw_requests = load_create_requests(&args.raw_requests_dir, ".json")?;
+    validate_create_request_sets(&tagged_requests, &raw_requests)?;
     let regexes = load_regexes(&args.tag_manifest)?;
     let workload_policy = load_workload_policy(
         &args.workload,
@@ -1925,6 +1984,71 @@ mod tests {
         .unwrap();
 
         assert!(validate_create_request_pair("container", &tagged, &raw).is_err());
+    }
+
+    #[test]
+    fn create_request_pair_rejects_unsupported_request_fields() {
+        for request in [
+            CapturedCreateRequest {
+                exec_id: "exec".to_string(),
+                ..Default::default()
+            },
+            CapturedCreateRequest {
+                shared_mounts: vec![json!({"name": "shared"})],
+                ..Default::default()
+            },
+            CapturedCreateRequest {
+                stdout_port: Some(1),
+                ..Default::default()
+            },
+        ] {
+            assert!(validate_supported_create_request_fields("container", &request).is_err());
+        }
+    }
+
+    #[test]
+    fn create_request_pair_rejects_request_level_changes() {
+        let oci = CapturedSpec::default();
+        let tagged = CapturedCreateRequest {
+            container_id: "container".to_string(),
+            oci: Some(oci.clone()),
+            sandbox_pidns: true,
+            ..Default::default()
+        };
+        let raw = CapturedCreateRequest {
+            container_id: "container".to_string(),
+            oci: Some(oci),
+            ..Default::default()
+        };
+
+        assert!(validate_create_request_pair("container", &tagged, &raw).is_err());
+    }
+
+    #[test]
+    fn create_request_sets_require_exact_basename_match() {
+        let tagged = BTreeMap::from([(
+            "container".to_string(),
+            CapturedCreateRequest::default(),
+        )]);
+        let raw = BTreeMap::from([
+            (
+                "container".to_string(),
+                CapturedCreateRequest::default(),
+            ),
+            ("extra".to_string(), CapturedCreateRequest::default()),
+        ]);
+
+        assert!(validate_create_request_sets(&tagged, &raw).is_err());
+    }
+
+    #[test]
+    fn create_request_deserialization_rejects_unknown_top_level_fields() {
+        let result = serde_json::from_value::<CapturedCreateRequest>(json!({
+            "container_id": "container",
+            "unknown_request_field": true
+        }));
+
+        assert!(result.is_err());
     }
 
     #[test]

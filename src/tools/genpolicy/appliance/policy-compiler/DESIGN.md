@@ -221,17 +221,17 @@ distinguish literal values, structured substitutions, and intentional regexes.
   the storage shape and correlates its mount point to the base64url encoding of
   the runtime device source rather than accepting an arbitrary path.
 - Guest-pull image references and dm-verity root hashes are exact per-container
-  identities carried by policy-only marker storages.
+  identities carried by policy-only marker storages. Dedicated rootfs clauses
+  also bind the storage mount point to
+  `/run/kata-containers/<bundle-id>/rootfs`; guest-pull additionally requires
+  the runtime's single `image_guest_pull=...` driver-option envelope.
 
-There is one current representation hazard: `rules.rego` has generic fallback
-branches that call `regex.match` on `p_mount.source` and `p_storage.source` even
-when the compiler intended the value as a literal. Standard guest-local sources
-such as `tmpfs`, `local`, and `nodev` contain no regex metacharacters and are not
-broadened in practice, while external patterns need these branches. The policy
-schema should nevertheless distinguish literal sources from regex sources, or
-the compiler must escape all literal sources before they reach a regex branch.
-Until then, newly supported source forms containing regex metacharacters require
-an explicit negative test proving that near-matches are denied.
+The policy schema does not encode a distinct literal-versus-regex source type.
+To prevent literals containing regex metacharacters from being broadened,
+`rules.rego` permits the generic source-regex fallback only when the expanded
+policy source is explicitly anchored with `^` and `$`. Exact literal equality
+is handled by a separate rule. New source patterns therefore require both
+anchors and a negative near-match test.
 
 ### Annotations
 
@@ -321,21 +321,23 @@ denied.
 | `devices` | Raw request devices are copied into the container policy. Workload YAML is consulted only for additional policy checks already defined by the shared GenPolicy model, such as declared `volumeDevices` paths and NVIDIA pGPU count. |
 | `sandbox_pidns` | Copied exactly from the raw request. |
 | `container_id` | Used to pair captures and report errors; runtime bundle/container identity is correlated through OCI annotations and root paths rather than pinned to the dry-run ID. |
-| `exec_id` | Captured but not represented by the compiler. |
-| `shared_mounts` | Captured but not represented by the compiler. |
-| `stdin_port`, `stdout_port`, `stderr_port` | Captured but not represented by the compiler. |
+| `exec_id` | Captured and required to be empty; non-empty values fail generation because the field is not represented in policy. |
+| `shared_mounts` | Captured and required to be empty; non-empty values fail generation because policy-bound sharing is not implemented. |
+| `stdin_port`, `stdout_port`, `stderr_port` | Captured and required to be absent; configured ports fail generation because they are not represented in policy. |
 
 These unsupported fields are a fail-closed requirement, not merely a
 documentation concern: generation must reject non-default values until policy
-data and Rego rules represent them. The current deserializer ignores those
-fields, so this rejection is an outstanding implementation gap.
+data and Rego rules represent them. The top-level request deserializer also
+rejects unknown fields so a newly added request field cannot be silently
+discarded.
 
-Raw and tagged files are paired by basename. Current validation checks
-`container_id` and the CRI container type/name annotations. The stronger
-contract is to prove that request-level fields are byte-for-byte equivalent and
-that every nested OCI difference corresponds to an occurrence recorded in
+Raw and tagged directories must contain exactly the same basename set. Pair
+validation requires equal `container_id`, request-level storages, devices,
+flags, unsupported fields, and CRI container type/name annotations. The
+remaining stronger contract is to prove that every nested OCI difference
+corresponds to the exact occurrence and original-value digest recorded in
 `dynamic-tags.json`. Until that validation exists, the tagger and its output
-directory are part of the trusted compiler input path.
+directory remain part of the trusted compiler input path.
 
 ### Non-OCI policy fields
 
@@ -430,7 +432,7 @@ a production Agent.
 | Versioned semantic source classes and trusted external-root registry | Not implemented. Policy data does not carry the proposed `external-shared`, `guest-local`, `block-hotplug`, `device-hotplug`, `cdh-trusted`, or `forbidden-uvm` classes. |
 | Race-resistant source and destination confinement | Not implemented. Existing bind handling uses path canonicalization; it does not resolve and mount through a shared fd-relative `openat2()` confinement layer. |
 | Authorize the effective request after CDI, CDH, storage, namespace, hook, and sealed-secret transformations | Not implemented. Authorization currently precedes those transformations. |
-| Policy-bound cross-container `shared_mounts` | Not implemented. The compiler does not represent captured `shared_mounts`, and Agent cloning is not tied to a policy-declared sharable-mount identity. |
+| Policy-bound cross-container `shared_mounts` | Not implemented. The compiler rejects non-empty captured `shared_mounts`, and Agent cloning is not tied to a policy-declared sharable-mount identity. |
 | Trusted hotplug/device-registry correlation | Partial. Existing request policy constrains supported device fields, but the proposed end-to-end transport and resolved guest-device identity contract is not implemented. |
 
 #### Source-domain contract
@@ -644,6 +646,12 @@ Automated validation must prove that:
 - the encoded annotation decodes to the exact emitted `policy.rego`;
 - duplicate equivalent captures are deterministic and conflicting duplicates
   fail;
+- raw and tagged capture basename sets and request-level fields match exactly;
+- unknown request fields and unsupported non-default `exec_id`, `shared_mounts`,
+  or stdio ports fail generation;
+- per-container guest-pull and dm-verity rootfs storages reject another bundle's
+  rootfs mount point;
+- literal mount and storage sources reject regex near-matches;
 - unsupported non-OCI policy requirements fail with an actionable error.
 
 `policy-oci-diff.json` records the selected capture and the source or
