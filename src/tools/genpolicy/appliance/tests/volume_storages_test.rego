@@ -192,27 +192,21 @@ guest_pull_runtime(image) := {
 	"mount_point": "/run/kata-containers/cid/rootfs",
 }
 
-# A guest-pull rootfs is admitted when its image is on the predicted allowlist.
-test_guest_pull_allowed_by_allowlist if {
-	allow_storages([], [guest_pull_runtime("docker.io/library/nginx:1.27")], "bid", sandbox_id)
-		with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": ["docker.io/library/nginx:1.27"]}}
-}
-
-# A guest-pull image not on the allowlist is rejected.
-test_guest_pull_wrong_image_denied if {
+# A legacy global allowlist cannot authorize guest-pull without a per-container
+# marker.
+test_guest_pull_global_allowlist_denied if {
 	not allow_storages([], [guest_pull_runtime("evil.example/malware:latest")], "bid", sandbox_id)
-		with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": ["docker.io/library/nginx:1.27"]}}
+		with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": ["evil.example/malware:latest"]}}
 }
 
-# With no allowlist (predictor not run / legacy genpolicy) guest-pull is allowed
-# by shape, preserving the historical behavior.
-test_guest_pull_fallback_by_shape if {
-	allow_storages([], [guest_pull_runtime("docker.io/library/nginx:1.27")], "bid", sandbox_id)
+# Missing per-container identity fails closed instead of allowing by shape.
+test_guest_pull_without_marker_denied if {
+	not allow_storages([], [guest_pull_runtime("docker.io/library/nginx:1.27")], "bid", sandbox_id)
 		with data.agent_policy.policy_data as {}
 }
 
-# Per-container (tarfs style): the compiler injects a `guest-pull-images` marker
-# carrying only THIS container's image digests, with the pod-wide union empty.
+# The compiler injects a `guest-pull-images` marker carrying only this
+# container's image digests.
 guest_pull_marker(images) := {
 	"driver": "guest-pull-images", "source": "", "fstype": "",
 	"fs_group": null, "shared": false, "driver_options": [],

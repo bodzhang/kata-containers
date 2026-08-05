@@ -65,7 +65,7 @@ def apply_kata_runtime_behavior(spec: dict) -> None:
 
 
 def add_derived_values(
-    spec: dict, metadata: dict, values: list[dict]
+    spec: dict, container_id: str, values: list[dict]
 ) -> list[dict]:
     result = list(values)
     annotations = spec.get("annotations") or {}
@@ -98,7 +98,6 @@ def add_derived_values(
             )
             known.add((tag, value))
 
-    container_id = metadata.get("container_id")
     if container_id and ("container.id", container_id) not in known:
         result.append(
             {
@@ -181,7 +180,7 @@ def replace_string(
         )
 
     match = TERMINATION_LOG_SOURCE.match(updated)
-    if parts[-1:] == ["source"] and match:
+    if parts[:1] == ["oci"] and parts[-1:] == ["source"] and match:
         if regex_policy_mode != "legacy":
             return updated
         tag = "termination-log.id"
@@ -202,7 +201,7 @@ def replace_string(
         )
 
     if (
-        parts == ["annotations", "nerdctl/network-namespace"]
+        parts == ["oci", "annotations", "nerdctl/network-namespace"]
         and NETWORK_NAMESPACE.match(updated)
     ):
         tag = "network.namespace"
@@ -277,7 +276,7 @@ def transform(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--raw-dir", required=True, type=Path)
+    parser.add_argument("--raw-requests-dir", required=True, type=Path)
     parser.add_argument("--dynamic-values", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--manifest", required=True, type=Path)
@@ -293,29 +292,26 @@ def main() -> None:
     occurrences = defaultdict(list)
     definitions: dict[str, dict] = {}
 
-    captures = sorted(args.raw_dir.glob("*.config.json"))
+    captures = sorted(args.raw_requests_dir.glob("*.json"))
     if not captures:
-        raise SystemExit("no OCI config captures found")
+        raise SystemExit("no CreateContainerRequest captures found")
 
     for capture in captures:
-        metadata_path = capture.with_name(
-            capture.name.removesuffix(".config.json") + ".meta.json"
-        )
-        metadata = (
-            json.loads(metadata_path.read_text(encoding="utf-8"))
-            if metadata_path.exists()
-            else {}
-        )
-        spec = json.loads(capture.read_text(encoding="utf-8"))
+        request = json.loads(capture.read_text(encoding="utf-8"))
+        spec = request.get("oci")
+        if not isinstance(spec, dict):
+            raise SystemExit(f"{capture.name}: CreateContainerRequest has no OCI spec")
         try:
             apply_kata_runtime_behavior(spec)
         except ValueError as error:
             raise SystemExit(f"{capture.name}: {error}") from error
-        exact_values = add_derived_values(spec, metadata, base_values)
-        output_name = capture.name.replace(".config.json", ".tagged.json")
-        tagged = transform(
+        exact_values = add_derived_values(
+            spec, request.get("container_id", ""), base_values
+        )
+        output_name = capture.name.removesuffix(".json") + ".tagged.json"
+        request["oci"] = transform(
             spec,
-            [],
+            ["oci"],
             f"tagged/{output_name}",
             exact_values,
             occurrences,
@@ -323,7 +319,7 @@ def main() -> None:
             args.regex_policy_mode,
         )
         (args.output_dir / output_name).write_text(
-            json.dumps(tagged, indent=2, sort_keys=True) + "\n",
+            json.dumps(request, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
 

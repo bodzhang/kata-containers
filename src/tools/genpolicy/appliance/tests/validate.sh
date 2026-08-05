@@ -22,6 +22,7 @@ done
 
 grep -Fq "ARG KUBERNETES_VERSION=${KUBERNETES_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "ARG CONTAINERD_VERSION=${CONTAINERD_VERSION}" "${appliance_dir}/Dockerfile"
+grep -Fq "ARG EROFS_CONTAINERD_VERSION=${EROFS_CONTAINERD_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "ARG RUNC_VERSION=${RUNC_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "ARG ETCD_VERSION=${ETCD_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "ARG CNI_PLUGINS_VERSION=${CNI_PLUGINS_VERSION}" "${appliance_dir}/Dockerfile"
@@ -42,6 +43,7 @@ fi
 	cd "${appliance_dir}/../../../.."
 	cargo test --locked --package genpolicy-oci-compiler
 	cargo test --locked --package kata-storage-predictor
+	cargo test --locked --package kata-createreq-capture
 )
 
 echo "appliance validation passed"

@@ -44,6 +44,7 @@ members = [
   "src/tools/genpolicy",
   "src/tools/genpolicy/appliance/policy-compiler",
   "src/tools/genpolicy/appliance/storage-predictor",
+  "src/tools/genpolicy/appliance/createreq-capture",
   "src/tools/kata-ctl",
   "src/tools/trace-forwarder",
 

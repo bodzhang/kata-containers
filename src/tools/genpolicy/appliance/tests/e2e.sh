@@ -15,12 +15,15 @@ trap 'rm -rf "${temporary}"' EXIT
 mkdir -p "${temporary}/input/images" "${temporary}/output"
 cp "${script_dir}/fixtures/complex-workload.yaml" \
 	"${temporary}/input/workload.yaml"
+cp "${script_dir}/fixtures/configuration.toml" \
+    "${temporary}/input/configuration.toml"
 
 "${engine}" run --rm --entrypoint /bin/sh "${image}" -c \
 	'command -v genpolicy-oci-compiler >/dev/null && ! command -v genpolicy >/dev/null'
 
 "${engine}" run --rm --privileged --network=none \
 	-e GENPOLICY_BALANCED=1 \
+    -e GENPOLICY_KATA_CONFIG=/input/configuration.toml \
 	--cgroupns=host \
 	-v "${temporary}/input:/input:ro" \
 	-v "${temporary}/output:/output" \
@@ -36,8 +39,8 @@ test -s "${temporary}/output/pods.json"
 test -s "${temporary}/output/workload-policy.yaml"
 test -s "${temporary}/output/policy-balanced.rego"
 test -s "${temporary}/output/policy-mode-report.json"
-test "$(find "${temporary}/output/tagged" -type f -name '*.json' | wc -l)" -ge 2
-grep -R -q '{{GENPOLICY_DYNAMIC:' "${temporary}/output/tagged"
+test "$(find "${temporary}/output/tagged-requests" -type f -name '*.json' | wc -l)" -ge 2
+grep -R -q '{{GENPOLICY_DYNAMIC:' "${temporary}/output/tagged-requests"
 grep -q 'policy_data :=' "${temporary}/output/policy.rego"
 grep -q 'io.katacontainers.config.hypervisor.cc_init_data' \
 	"${temporary}/output/workload-policy.yaml"
@@ -85,7 +88,18 @@ assert (
     ]
 )
 assert "{{GENPOLICY_DYNAMIC:" not in json.dumps(final)
-assert all(not container["storages"] for container in final_data["containers"])
+expected_guest_pull_images = {
+    "sandbox": ["pause"],
+    "workload": ["genpolicy.local:5000/busybox:1.36.1"],
+    "sidecar": ["genpolicy.local:5000/busybox:1.36.1"],
+}
+for container in final_data["containers"]:
+    annotations = container["OCI"]["Annotations"]
+    identity = annotations.get("io.kubernetes.cri.container-name", "sandbox")
+    assert len(container["storages"]) == 1
+    marker = container["storages"][0]
+    assert marker["driver"] == "guest-pull-images"
+    assert marker["options"] == expected_guest_pull_images[identity]
 assert final_data["sandbox"]["storages"]
 pause = next(
     container
@@ -136,7 +150,7 @@ assert (
 )
 assert "POD_UID=$(pod-uid)" in balanced_workload["OCI"]["Process"]["Env"]
 provenance = json.loads((output / "provenance.json").read_text())
-assert provenance["outputs"]["raw_oci"]
+assert len(provenance["outputs"]["raw_create_requests"]) == 3
 assert "policy-balanced.rego" in provenance["outputs"]["generated"]
 comparison = mode_report["comparisons"]["legacy-reference-vs-oci-legacy"]
 assert comparison["rules_equal_ignoring_trailing_whitespace"]

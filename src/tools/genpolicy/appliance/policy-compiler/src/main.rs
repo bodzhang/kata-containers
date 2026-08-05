@@ -19,8 +19,8 @@ const POD_UID_MARKER: &str = "{{GENPOLICY_DYNAMIC:pod.uid}}";
 
 #[derive(Debug)]
 struct Args {
-    raw_dir: PathBuf,
-    tagged_dir: PathBuf,
+    raw_requests_dir: PathBuf,
+    tagged_requests_dir: PathBuf,
     tag_manifest: PathBuf,
     rules: PathBuf,
     settings: PathBuf,
@@ -30,12 +30,7 @@ struct Args {
     annotation_output: PathBuf,
     annotated_yaml_output: PathBuf,
     regex_policy_mode: String,
-    predicted_storages: Option<PathBuf>,
     strict_storage_coverage: bool,
-    // Pin each container's rootfs image identity (dm-verity root hashes AND
-    // guest-pull image digests) per-container (tarfs style) instead of a
-    // pod-wide union (default false = union).
-    per_container_image: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -102,6 +97,56 @@ struct CapturedMount {
 struct CapturedLinux {
     masked_paths: Vec<String>,
     readonly_paths: Vec<String>,
+    devices: Vec<CapturedLinuxDevice>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+struct CapturedLinuxDevice {
+    #[serde(rename = "type")]
+    type_: String,
+    path: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+struct CapturedCreateRequest {
+    container_id: String,
+    sandbox_pidns: bool,
+    oci: Option<CapturedSpec>,
+    storages: Vec<Value>,
+    devices: Vec<CapturedAgentDevice>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+struct CapturedAgentDevice {
+    id: String,
+    field_type: String,
+    vm_path: String,
+    container_path: String,
+    options: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct CreateRequestPolicyData {
+    volume_storages: Vec<agent::Storage>,
+    volume_mounts: BTreeMap<String, KataMount>,
+    dmverity_roothashes: Vec<String>,
+    guest_pull_images: Vec<String>,
+}
+
+impl From<&CapturedAgentDevice> for agent::Device {
+    fn from(device: &CapturedAgentDevice) -> Self {
+        Self {
+            id: device.id.clone(),
+            type_: device.field_type.clone(),
+            vm_path: device.vm_path.clone(),
+            container_path: device.container_path.clone(),
+            options: device.options.clone(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,17 +173,15 @@ struct PolicyData {
     guest_pull: GuestPullData,
 }
 
-/// Pod-scoped allowlist of EROFS dm-verity root hashes, consumed by the
-/// `allow_storage` erofs-lower clause in rules.rego.
+/// Retained in the policy schema for compatibility. Root hashes are emitted
+/// only in each container's `dmverity-roothashes` marker storage.
 #[derive(Debug, Default, Serialize)]
 struct DmVerityData {
     allowed_roothashes: Vec<String>,
 }
 
-/// Pod-scoped allowlist of guest-pull image references, consumed by the
-/// `image_guest_pull` `allow_storage` clause in rules.rego. When empty the
-/// clause falls back to the historical allow-by-shape (backward compatible with
-/// policies that carry no predicted guest-pull data).
+/// Retained in the policy schema for compatibility. Image references are
+/// emitted only in each container's `guest-pull-images` marker storage.
 #[derive(Debug, Default, Serialize)]
 struct GuestPullData {
     allowed_images: Vec<String>,
@@ -189,8 +232,8 @@ fn parse_args() -> Result<Args> {
             .ok_or_else(|| anyhow!("{name} is required"))
     };
     Ok(Args {
-        raw_dir: required("--raw-dir")?,
-        tagged_dir: required("--tagged-dir")?,
+        raw_requests_dir: required("--raw-requests-dir")?,
+        tagged_requests_dir: required("--tagged-requests-dir")?,
         tag_manifest: required("--tag-manifest")?,
         rules: required("--rules")?,
         settings: required("--settings")?,
@@ -203,12 +246,8 @@ fn parse_args() -> Result<Args> {
             .get("--regex-policy-mode")
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| "legacy".to_string()),
-        predicted_storages: values.get("--predicted-storages").cloned(),
         strict_storage_coverage: values
             .get("--strict-storage-coverage")
-            .is_some_and(|value| value.to_string_lossy() == "true"),
-        per_container_image: values
-            .get("--per-container-image")
             .is_some_and(|value| value.to_string_lossy() == "true"),
     })
 }
@@ -266,6 +305,80 @@ fn load_captures(
         bail!("no tagged OCI captures found");
     }
     Ok(captures)
+}
+
+fn load_create_requests(
+    directory: &Path,
+    suffix: &str,
+) -> Result<BTreeMap<String, CapturedCreateRequest>> {
+    let mut paths: Vec<_> = fs::read_dir(directory)
+        .with_context(|| format!("read {}", directory.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(suffix))
+        })
+        .collect();
+    paths.sort();
+
+    let mut requests = BTreeMap::new();
+    for path in paths {
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("invalid create request filename {}", path.display()))?;
+        let basename = filename
+            .strip_suffix(suffix)
+            .ok_or_else(|| anyhow!("invalid create request filename {filename}"))?
+            .to_string();
+        let request: CapturedCreateRequest = serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("parse create request {}", path.display()))?;
+        if requests.insert(basename.clone(), request).is_some() {
+            bail!("duplicate create request basename {basename}");
+        }
+    }
+    if requests.is_empty() {
+        bail!("no CreateContainerRequest captures found in {}", directory.display());
+    }
+    Ok(requests)
+}
+
+fn validate_create_request_pair(
+    basename: &str,
+    tagged: &CapturedCreateRequest,
+    raw: &CapturedCreateRequest,
+) -> Result<()> {
+    if tagged.container_id != raw.container_id {
+        bail!(
+            "tagged create request {basename} container_id {:?} does not match raw request {:?}",
+            tagged.container_id,
+            raw.container_id
+        );
+    }
+    let tagged_oci = tagged
+        .oci
+        .as_ref()
+        .ok_or_else(|| anyhow!("tagged create request {basename} has no OCI spec"))?;
+    let raw_oci = raw
+        .oci
+        .as_ref()
+        .ok_or_else(|| anyhow!("raw create request {basename} has no OCI spec"))?;
+    for key in [
+        "io.kubernetes.cri.container-type",
+        "io.kubernetes.cri.container-name",
+    ] {
+        let expected = raw_oci.annotations.get(key);
+        let actual = tagged_oci.annotations.get(key);
+        if actual != expected {
+            bail!(
+                "tagged create request {basename} annotation {key} {:?} does not match raw request {:?}",
+                actual,
+                expected
+            );
+        }
+    }
+    Ok(())
 }
 
 fn expand_env_regex(pattern: &str, common: &policy::CommonData) -> String {
@@ -899,9 +1012,28 @@ fn safe_termination_message_path(
         && components.last().is_some_and(|value| {
             value.len() == 8 && value.chars().all(|character| character.is_ascii_hexdigit())
         });
+    let container_id = capture
+        .root
+        .path
+        .strip_prefix("/run/kata-containers/")
+        .and_then(|path| path.strip_suffix("/rootfs"));
+    let copied_source = container_id.is_some_and(|container_id| {
+        let prefix = format!(
+            "/run/kata-containers/shared/containers/{container_id}-"
+        );
+        mount.source
+            .strip_prefix(&prefix)
+            .and_then(|suffix| suffix.strip_suffix("-termination-log"))
+            .is_some_and(|random| {
+                random.len() == 16
+                    && random
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit())
+            })
+    });
     let required_options = ["rbind", "rprivate", "rw"];
     if mount.type_ != "bind"
-        || !external_kubelet_source
+        || !(external_kubelet_source || copied_source)
         || !required_options
             .iter()
             .all(|required| mount.options.iter().any(|option| option == required))
@@ -994,8 +1126,8 @@ fn write_annotated_yaml(input: &Path, output: &Path, annotation: &str) -> Result
 
 fn run(args: Args) -> Result<()> {
     let settings = Settings::new(args.settings.to_str().unwrap());
-    let captures = load_captures(&args.tagged_dir, ".tagged.json")?;
-    let raw_captures = load_captures(&args.raw_dir, ".config.json")?;
+    let tagged_requests = load_create_requests(&args.tagged_requests_dir, ".tagged.json")?;
+    let raw_requests = load_create_requests(&args.raw_requests_dir, ".json")?;
     let regexes = load_regexes(&args.tag_manifest)?;
     let workload_policy = load_workload_policy(
         &args.workload,
@@ -1013,30 +1145,28 @@ fn run(args: Args) -> Result<()> {
     let mut allow_env_regex = Vec::new();
     let mut containers = Vec::new();
     let mut reports = Vec::new();
-    let volume_storages = match &args.predicted_storages {
-        Some(path) => collect_volume_storages(path, args.strict_storage_coverage)?,
-        None => BTreeMap::new(),
-    };
-    // Per-container image identity: each container's OWN rootfs root hashes and
-    // guest-pull image digests (keyed by CRI container name), injected below as
-    // `dmverity-roothashes` / `guest-pull-images` marker storages.
-    let dmverity_per_container = match (args.per_container_image, &args.predicted_storages) {
-        (true, Some(path)) => collect_dmverity_roothashes_per_container(path)?,
-        _ => BTreeMap::new(),
-    };
-    let guest_pull_per_container = match (args.per_container_image, &args.predicted_storages) {
-        (true, Some(path)) => collect_guest_pull_images_per_container(path)?,
-        _ => BTreeMap::new(),
-    };
-    let volume_mounts = match &args.predicted_storages {
-        Some(path) => collect_volume_mounts(path)?,
-        None => BTreeMap::new(),
-    };
-    for (identity, (name, capture)) in captures {
-        let raw_capture = raw_captures
-            .get(&identity)
-            .map(|(_, capture)| capture)
-            .ok_or_else(|| anyhow!("no raw OCI capture for {identity:?}"))?;
+    let mut seen_identities = BTreeMap::new();
+    for (basename, tagged_request) in tagged_requests {
+        let raw_request = raw_requests
+            .get(&basename)
+            .ok_or_else(|| anyhow!("no raw CreateContainerRequest for {basename}"))?;
+        validate_create_request_pair(&basename, &tagged_request, raw_request)?;
+        let capture = tagged_request
+            .oci
+            .as_ref()
+            .ok_or_else(|| anyhow!("tagged create request {basename} has no OCI spec"))?;
+        let raw_capture = raw_request
+            .oci
+            .as_ref()
+            .ok_or_else(|| anyhow!("raw create request {basename} has no OCI spec"))?;
+        let request_data = create_request_policy_data(raw_request, args.strict_storage_coverage)?;
+        let identity = identity(capture)?;
+        if let Some(previous) = seen_identities.insert(identity.clone(), tagged_request.clone()) {
+            if previous != tagged_request {
+                bail!("inconsistent duplicate CreateContainerRequest captures for {identity:?}");
+            }
+            continue;
+        }
         let container_workload_policy = capture
             .annotations
             .get("io.kubernetes.cri.container-name")
@@ -1053,20 +1183,11 @@ fn run(args: Args) -> Result<()> {
         let nvidia_pgpu_count = container_workload_policy
             .map(|policy| policy.nvidia_pgpu_count)
             .unwrap_or(0);
-        // Predictor-authoritative shared-fs OCI mounts (configMap/secret/
-        // projected/downwardAPI/hostPath), keyed by destination, so
-        // normalize_mounts emits the Kata guest-path mount instead of failing
-        // closed on the captured runc host-path bind mount.
-        let predicted_mounts = capture
-            .annotations
-            .get("io.kubernetes.cri.container-name")
-            .and_then(|name| volume_mounts.get(name))
-            .cloned()
-            .unwrap_or_default();
+        let request_mounts = request_data.volume_mounts.clone();
         let (container, mut report) =
             compile_container(
-                &name,
-                &capture,
+                &basename,
+                capture,
                 &settings,
                 &regexes,
                 &mut allow_env_regex,
@@ -1075,35 +1196,34 @@ fn run(args: Args) -> Result<()> {
                 container_sandbox_name_pattern,
                 &volume_device_paths,
                 nvidia_pgpu_count,
-                &predicted_mounts,
+                &request_mounts,
             )?;
         let mut container = container;
-        // Inject the predictor's authoritative volume storages (templated to the
-        // policy path variables) so storage-bearing containers get a working
-        // policy instead of failing closed on an empty p_storages.
-        let container_name = capture.annotations.get("io.kubernetes.cri.container-name");
-        if let Some(storages) = container_name.and_then(|name| volume_storages.get(name)) {
-            container.storages = storages.clone();
-        }
-        // Per-container image identity (tarfs style): pin this container's own
+        // The captured request is authoritative for final Agent storages,
+        // devices, mounts, sandbox_pidns, and rootfs identity.
+        container.storages = request_data.volume_storages;
+        container.devices = raw_request.devices.iter().map(agent::Device::from).collect();
+        container.sandbox_pidns = raw_request.sandbox_pidns;
+        let roothashes = request_data.dmverity_roothashes;
+        let images = request_data.guest_pull_images;
+        // Per-container image identity: pin this container's own
         // rootfs dm-verity root hashes and guest-pull image digests via marker
-        // storages, so the rules.rego per-container clauses match the
-        // container's image rather than the pod-wide union
-        // (`--per-container-image`).
-        if let Some(roothashes) = container_name.and_then(|name| dmverity_per_container.get(name)) {
-            if !roothashes.is_empty() {
-                container.storages.push(dmverity_marker_storage(roothashes));
-            }
+        // storages. A pod-wide union would let one container present another
+        // same-pod container's rootfs identity, so no union mode exists.
+        if !roothashes.is_empty() {
+            container.storages.push(dmverity_marker_storage(&roothashes));
         }
-        if let Some(images) = container_name.and_then(|name| guest_pull_per_container.get(name)) {
-            if !images.is_empty() {
-                container.storages.push(guest_pull_marker_storage(images));
-            }
+        if !images.is_empty() {
+            container.storages.push(guest_pull_marker_storage(&images));
         }
+        report["create_request"] = json!({
+            "capture": basename,
+            "authoritative": true
+        });
         report["injected_storages"] = json!(container.storages.len());
         if args.regex_policy_mode == "legacy" {
             let checked = validate_legacy_service_env_coverage(
-                &capture,
+                capture,
                 raw_capture,
                 &request_defaults,
                 &settings.common,
@@ -1118,19 +1238,10 @@ fn run(args: Args) -> Result<()> {
     }
     apply_regex_policy_mode(&mut request_defaults, &args.regex_policy_mode)?;
     append_allow_env_regex(&mut request_defaults, &allow_env_regex)?;
-    // In per-container mode the root hashes / image digests are injected as
-    // per-container marker storages (above), so the pod-wide unions are left
-    // empty and the rules.rego per-container clauses match instead.
-    let dmverity = match (args.per_container_image, &args.predicted_storages) {
-        (true, _) => DmVerityData::default(),
-        (false, Some(path)) => collect_dmverity_roothashes(path)?,
-        (false, None) => DmVerityData::default(),
-    };
-    let guest_pull = match (args.per_container_image, &args.predicted_storages) {
-        (true, _) => GuestPullData::default(),
-        (false, Some(path)) => collect_guest_pull_images(path)?,
-        (false, None) => GuestPullData::default(),
-    };
+    // Rootfs identities live only in each container's marker storage. The
+    // legacy global fields remain empty and are not authorization inputs.
+    let dmverity = DmVerityData::default();
+    let guest_pull = GuestPullData::default();
     let data = PolicyData {
         containers,
         common: settings.common,
@@ -1174,65 +1285,8 @@ fn run(args: Args) -> Result<()> {
 /// verity-protected rootfs storage must carry a root hash, otherwise the
 /// generated policy would deny that container at runtime — so fail generation
 /// instead.
-fn collect_dmverity_roothashes(path: &Path) -> Result<DmVerityData> {
-    let report: Value = serde_json::from_str(&fs::read_to_string(path)?)
-        .with_context(|| format!("parse predicted storages {}", path.display()))?;
-    let mut roots = BTreeSet::new();
-    for pred in report
-        .get("predictions")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-    {
-        let Some(storages) = pred
-            .get("rootfs")
-            .and_then(|r| r.get("storages"))
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-        for storage in storages {
-            let options: Vec<&str> = storage
-                .get("options")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
-            let roothash = options
-                .iter()
-                .find_map(|o| o.strip_prefix("X-kata.dmverity.roothash="));
-            // A dm-verity-protected rootfs storage: either a multi-layer erofs
-            // lower layer, or a single-layer verity block rootfs (BlockRootfs),
-            // both identified by the guest-facing `X-kata.dmverity.*` options.
-            let is_erofs_lower = storage.get("fs_type").and_then(Value::as_str) == Some("erofs")
-                && options.contains(&"X-kata.multi-layer=true")
-                && options.contains(&"X-kata.overlay-lower");
-            let verity_enabled = options.contains(&"X-kata.dmverity-enabled=true");
-            match roothash {
-                Some(hash) => {
-                    roots.insert(hash.to_string());
-                }
-                // Coverage gate: a verity rootfs without a root hash would fail
-                // closed at runtime, so refuse to generate the policy.
-                None if verity_enabled || is_erofs_lower => bail!(
-                    "container {} has a dm-verity rootfs without a root hash; \
-                     the generated policy would fail closed",
-                    pred.get("container_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("?")
-                ),
-                None => {}
-            }
-        }
-    }
-    Ok(DmVerityData {
-        allowed_roothashes: roots.into_iter().collect(),
-    })
-}
-
-/// Per-container variant of [`collect_dmverity_roothashes`]: instead of a single
-/// pod-wide union, returns each container's OWN rootfs dm-verity root hashes
-/// (keyed by CRI container name), so the compiler can pin them per-container
-/// (tarfs style) rather than allowing any pod member's image for any container.
+/// Returns each container's own rootfs dm-verity hashes, keyed by CRI container
+/// name, so no container can use another pod member's rootfs identity.
 /// Same coverage gate: a verity rootfs without a root hash fails generation.
 fn collect_dmverity_roothashes_per_container(
     path: &Path,
@@ -1299,60 +1353,8 @@ fn dmverity_marker_storage(roothashes: &[String]) -> agent::Storage {
     }
 }
 
-/// Collects the union of guest-pull image references from a predicted-storages
-/// report. Each container's `rootfs` storage with driver `image_guest_pull`
-/// contributes its `source` (the image reference from
-/// `io.kubernetes.cri.image-name`). The rules.rego `image_guest_pull` clause
-/// pins the pulled image to this allowlist; an empty allowlist leaves the
-/// historical allow-by-shape behavior intact. Digest pinning is enforced
-/// separately by `enforce_image_digest` over the captured OCI specs, which
-/// covers every rootfs solution rather than just guest pull.
-fn collect_guest_pull_images(path: &Path) -> Result<GuestPullData> {
-    let report: Value = serde_json::from_str(&fs::read_to_string(path)?)
-        .with_context(|| format!("parse predicted storages {}", path.display()))?;
-    let mut images = BTreeSet::new();
-    for pred in report
-        .get("predictions")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-    {
-        let Some(storages) = pred
-            .get("rootfs")
-            .and_then(|r| r.get("storages"))
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-        let cid = pred
-            .get("container_id")
-            .and_then(Value::as_str)
-            .unwrap_or("?");
-        for storage in storages {
-            if storage.get("driver").and_then(Value::as_str) != Some("image_guest_pull") {
-                continue;
-            }
-            match storage.get("source").and_then(Value::as_str) {
-                Some(source) if !source.is_empty() => {
-                    images.insert(source.to_string());
-                }
-                _ => bail!(
-                    "container {cid} has a guest-pull rootfs without an image reference; \
-                     the generated policy would fail closed"
-                ),
-            }
-        }
-    }
-    Ok(GuestPullData {
-        allowed_images: images.into_iter().collect(),
-    })
-}
-
-/// Per-container variant of [`collect_guest_pull_images`]: each container's OWN
-/// guest-pull image reference(s) (keyed by CRI container name), so the compiler
-/// can pin the manifest digest per-container rather than allowing any pod
-/// member's image for any container. Same gate: a guest-pull rootfs without an
-/// image reference fails generation.
+/// Returns each container's own guest-pull image references, keyed by CRI
+/// container name. A missing reference fails generation.
 fn collect_guest_pull_images_per_container(
     path: &Path,
 ) -> Result<BTreeMap<String, Vec<String>>> {
@@ -1406,6 +1408,98 @@ fn guest_pull_marker_storage(images: &[String]) -> agent::Storage {
         options: images.to_vec(),
         ..Default::default()
     }
+}
+
+fn is_rootfs_storage(storage: &Value, root_path: &str) -> bool {
+    if storage.get("driver").and_then(Value::as_str) == Some("image_guest_pull") {
+        return true;
+    }
+    if storage.get("mount_point").and_then(Value::as_str) == Some(root_path) {
+        return true;
+    }
+    storage
+        .get("options")
+        .and_then(Value::as_array)
+        .is_some_and(|options| {
+            options.iter().filter_map(Value::as_str).any(|option| {
+                option.starts_with("X-kata.dmverity.")
+                    || option.starts_with("X-kata.multi-layer=")
+                    || option == "X-kata.overlay-lower"
+                    || option == "X-kata.overlay-upper"
+            })
+        })
+}
+
+fn create_request_policy_data(
+    request: &CapturedCreateRequest,
+    strict: bool,
+) -> Result<CreateRequestPolicyData> {
+    let oci = request
+        .oci
+        .as_ref()
+        .ok_or_else(|| anyhow!("create request {} has no OCI spec", request.container_id))?;
+    let mut data = CreateRequestPolicyData::default();
+    let mut roothashes = BTreeSet::new();
+    let mut images = BTreeSet::new();
+
+    for storage in &request.storages {
+        if is_rootfs_storage(storage, &oci.root.path) {
+            let options: Vec<&str> = storage
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if let Some(hash) = options
+                .iter()
+                .find_map(|option| option.strip_prefix("X-kata.dmverity.roothash="))
+            {
+                roothashes.insert(hash.to_string());
+            } else if options.iter().any(|option| {
+                *option == "X-kata.dmverity-enabled=true" || *option == "X-kata.overlay-lower"
+            }) {
+                bail!(
+                    "create request {} has a dm-verity rootfs without a root hash",
+                    request.container_id
+                );
+            }
+            if storage.get("driver").and_then(Value::as_str) == Some("image_guest_pull") {
+                let source = storage
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .filter(|source| !source.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "create request {} has a guest-pull rootfs without an image reference",
+                            request.container_id
+                        )
+                    })?;
+                images.insert(source.to_string());
+            }
+            continue;
+        }
+
+        match template_volume_storage(storage)? {
+            Some(storage) => data.volume_storages.push(storage),
+            None if strict => bail!(
+                "create request {} has an unsupported volume storage class (driver={}, fs_type={})",
+                request.container_id,
+                storage.get("driver").and_then(Value::as_str).unwrap_or("?"),
+                storage.get("fs_type").and_then(Value::as_str).unwrap_or("?")
+            ),
+            None => eprintln!(
+                "warning: create request {} has an unsupported volume storage class; it is omitted and will fail closed at runtime",
+                request.container_id
+            ),
+        }
+    }
+    for mount in &oci.mounts {
+        if let Some(mount) = template_volume_mount(&serde_json::to_value(mount)?)? {
+            data.volume_mounts.insert(mount.destination.clone(), mount);
+        }
+    }
+    data.dmverity_roothashes = roothashes.into_iter().collect();
+    data.guest_pull_images = images.into_iter().collect();
+    Ok(data)
 }
 
 /// Templates a predicted volume storage so its concrete guest paths become the
@@ -1748,40 +1842,89 @@ mod tests {
     }
 
     #[test]
-    fn dmverity_roothashes_collected_from_erofs_lowers() {
-        let dir = std::env::temp_dir().join(format!("gp-dmv-ok-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let report = json!({
-            "predictions": [{
-                "container_id": "c1",
-                "rootfs": {"storages": [
-                    {"fs_type": "ext4", "options": ["rw", "X-kata.overlay-upper", "X-kata.multi-layer=true"]},
-                    {"fs_type": "erofs", "options": ["ro", "X-kata.overlay-lower", "X-kata.multi-layer=true", "X-kata.dmverity.roothash=aa11"]},
-                    {"fs_type": "erofs", "options": ["ro", "X-kata.overlay-lower", "X-kata.multi-layer=true", "X-kata.dmverity.roothash=bb22"]}
-                ]}
-            }]
-        });
-        let path = write_report(&dir, "predicted.json", report);
-        let dmv = collect_dmverity_roothashes(&path).unwrap();
-        assert_eq!(dmv.allowed_roothashes, vec!["aa11".to_string(), "bb22".to_string()]);
-        let _ = fs::remove_dir_all(&dir);
+    fn create_request_data_collects_rootfs_identity_and_volume_storage() {
+        let request: CapturedCreateRequest = serde_json::from_value(json!({
+            "container_id": "cid",
+            "oci": {
+                "root": {"path": "/run/kata/rootfs"},
+                "mounts": []
+            },
+            "storages": [
+                {
+                    "driver": "blk", "fs_type": "erofs", "mount_point": "/run/kata/lower/0",
+                    "options": ["X-kata.multi-layer=true", "X-kata.overlay-lower", "X-kata.dmverity.roothash=abc"]
+                },
+                {
+                    "driver": "image_guest_pull", "source": "registry.example/app@sha256:123",
+                    "mount_point": "/run/kata/rootfs", "options": []
+                },
+                {
+                    "driver": "ephemeral", "source": "tmpfs", "fs_type": "tmpfs",
+                    "mount_point": "/run/kata-containers/sandbox/ephemeral/cache",
+                    "options": ["nosuid", "nodev"], "shared": true
+                }
+            ]
+        }))
+        .unwrap();
+
+        let data = create_request_policy_data(&request, true).unwrap();
+        assert_eq!(data.dmverity_roothashes, vec!["abc"]);
+        assert_eq!(data.guest_pull_images, vec!["registry.example/app@sha256:123"]);
+        assert_eq!(data.volume_storages.len(), 1);
+        assert_eq!(data.volume_storages[0].fstype, "tmpfs");
+        assert_eq!(
+            data.volume_storages[0].mount_point,
+            "^/run/kata\\-containers/sandbox/ephemeral/cache$"
+        );
     }
 
     #[test]
-    fn dmverity_coverage_gate_rejects_unpinned_erofs_lower() {
-        let dir = std::env::temp_dir().join(format!("gp-dmv-gate-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let report = json!({
-            "predictions": [{
-                "container_id": "c1",
-                "rootfs": {"storages": [
-                    {"fs_type": "erofs", "options": ["ro", "X-kata.overlay-lower", "X-kata.multi-layer=true"]}
-                ]}
-            }]
-        });
-        let path = write_report(&dir, "predicted.json", report);
-        assert!(collect_dmverity_roothashes(&path).is_err());
-        let _ = fs::remove_dir_all(&dir);
+    fn create_request_device_dump_converts_to_agent_device() {
+        let captured = CapturedAgentDevice {
+            id: "device-id".to_string(),
+            field_type: "blk".to_string(),
+            vm_path: "/dev/vdb".to_string(),
+            container_path: "/dev/data".to_string(),
+            options: vec!["ro".to_string()],
+        };
+        let device = agent::Device::from(&captured);
+        assert_eq!(device.id, "device-id");
+        assert_eq!(device.type_, "blk");
+        assert_eq!(device.vm_path, "/dev/vdb");
+        assert_eq!(device.container_path, "/dev/data");
+        assert_eq!(device.options, vec!["ro"]);
+    }
+
+    #[test]
+    fn create_request_loader_matches_capture_basename() {
+        let root = std::env::temp_dir().join(format!("gp-request-load-{}", std::process::id()));
+        let requests = root.join("requests");
+        fs::create_dir_all(&requests).unwrap();
+        fs::write(
+            requests.join("container.json"),
+            serde_json::to_vec(&json!({"container_id": "cid", "oci": {}})).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_create_requests(&requests, ".json").unwrap();
+        assert_eq!(loaded.get("container").unwrap().container_id, "cid");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_request_pair_rejects_container_id_mismatch() {
+        let tagged: CapturedCreateRequest = serde_json::from_value(json!({
+            "container_id": "wrong",
+            "oci": {"annotations": {"io.kubernetes.cri.container-type": "container"}}
+        }))
+        .unwrap();
+        let raw: CapturedCreateRequest = serde_json::from_value(json!({
+            "container_id": "expected",
+            "oci": {"annotations": {"io.kubernetes.cri.container-type": "container"}}
+        }))
+        .unwrap();
+
+        assert!(validate_create_request_pair("container", &tagged, &raw).is_err());
     }
 
     #[test]
@@ -1836,23 +1979,12 @@ mod tests {
     }
 
     #[test]
-    fn dmverity_empty_when_no_rootfs() {
-        let dir = std::env::temp_dir().join(format!("gp-dmv-empty-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let report = json!({ "predictions": [{ "container_id": "c1", "volumes": [] }] });
-        let path = write_report(&dir, "predicted.json", report);
-        let dmv = collect_dmverity_roothashes(&path).unwrap();
-        assert!(dmv.allowed_roothashes.is_empty());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn dmverity_roothash_collected_from_single_layer_block() {
         let dir = std::env::temp_dir().join(format!("gp-dmv-slv-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let report = json!({
             "predictions": [{
-                "container_id": "c1",
+                "container_id": "c1", "container_name": "web",
                 "rootfs": {"storages": [{
                     "fs_type": "ext4", "driver": "mmioblk", "source": "/dev/vda",
                     "options": ["ro", "X-kata.dmverity-enabled=true", "X-kata.dmverity.roothash=cafe1234"]
@@ -1860,8 +1992,8 @@ mod tests {
             }]
         });
         let path = write_report(&dir, "predicted.json", report);
-        let dmv = collect_dmverity_roothashes(&path).unwrap();
-        assert_eq!(dmv.allowed_roothashes, vec!["cafe1234".to_string()]);
+        let by_container = collect_dmverity_roothashes_per_container(&path).unwrap();
+        assert_eq!(by_container["web"], vec!["cafe1234".to_string()]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1871,7 +2003,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let report = json!({
             "predictions": [{
-                "container_id": "c1",
+                "container_id": "c1", "container_name": "web",
                 "rootfs": {"storages": [{
                     "fs_type": "ext4", "driver": "mmioblk",
                     "options": ["ro", "X-kata.dmverity-enabled=true"]
@@ -1879,48 +2011,7 @@ mod tests {
             }]
         });
         let path = write_report(&dir, "predicted.json", report);
-        assert!(collect_dmverity_roothashes(&path).is_err());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn guest_pull_images_collected_from_rootfs() {
-        let dir = std::env::temp_dir().join(format!("gp-gp-ok-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let report = json!({
-            "predictions": [
-                {"container_id": "c1", "rootfs": {"storages": [{
-                    "driver": "image_guest_pull", "fs_type": "overlay",
-                    "source": "docker.io/library/nginx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "options": []
-                }]}},
-                {"container_id": "c2", "rootfs": {"storages": [{
-                    "driver": "image_guest_pull", "fs_type": "overlay",
-                    "source": "ghcr.io/app/api@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "options": []
-                }]}}
-            ]
-        });
-        let path = write_report(&dir, "predicted.json", report);
-        let gp = collect_guest_pull_images(&path).unwrap();
-        assert_eq!(
-            gp.allowed_images,
-            vec![
-                "docker.io/library/nginx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                "ghcr.io/app/api@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()
-            ]
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn guest_pull_empty_when_no_guest_pull_rootfs() {
-        let dir = std::env::temp_dir().join(format!("gp-gp-empty-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let report = json!({ "predictions": [{ "container_id": "c1", "volumes": [] }] });
-        let path = write_report(&dir, "predicted.json", report);
-        let gp = collect_guest_pull_images(&path).unwrap();
-        assert!(gp.allowed_images.is_empty());
+        assert!(collect_dmverity_roothashes_per_container(&path).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1929,12 +2020,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gp-gp-gate-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let report = json!({
-            "predictions": [{"container_id": "c1", "rootfs": {"storages": [{
+            "predictions": [{"container_id": "c1", "container_name": "web", "rootfs": {"storages": [{
                 "driver": "image_guest_pull", "fs_type": "overlay", "source": "", "options": []
             }]}}]
         });
         let path = write_report(&dir, "predicted.json", report);
-        assert!(collect_guest_pull_images(&path).is_err());
+        assert!(collect_guest_pull_images_per_container(&path).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2717,6 +2808,58 @@ items:
             safe_termination_message_path(&capture, "balanced").unwrap(),
             "^/dev/termination\\-log$"
         );
+    }
+
+    #[test]
+    fn termination_message_path_accepts_final_copy_to_guest_mount() {
+        let container_id = "a".repeat(64);
+        let capture = CapturedSpec {
+            root: CapturedRoot {
+                path: format!("/run/kata-containers/{container_id}/rootfs"),
+                ..Default::default()
+            },
+            mounts: vec![CapturedMount {
+                destination: "/dev/termination-log".to_string(),
+                source: format!(
+                    "/run/kata-containers/shared/containers/{container_id}-0123456789abcdef-termination-log"
+                ),
+                type_: "bind".to_string(),
+                options: vec![
+                    "rbind".to_string(),
+                    "rprivate".to_string(),
+                    "rw".to_string(),
+                ],
+            }],
+            ..Default::default()
+        };
+
+        assert!(safe_termination_message_path(&capture, "balanced").is_ok());
+    }
+
+    #[test]
+    fn termination_message_path_rejects_other_containers_copy() {
+        let capture = CapturedSpec {
+            root: CapturedRoot {
+                path: format!("/run/kata-containers/{}/rootfs", "a".repeat(64)),
+                ..Default::default()
+            },
+            mounts: vec![CapturedMount {
+                destination: "/dev/termination-log".to_string(),
+                source: format!(
+                    "/run/kata-containers/shared/containers/{}-0123456789abcdef-termination-log",
+                    "b".repeat(64)
+                ),
+                type_: "bind".to_string(),
+                options: vec![
+                    "rbind".to_string(),
+                    "rprivate".to_string(),
+                    "rw".to_string(),
+                ],
+            }],
+            ..Default::default()
+        };
+
+        assert!(safe_termination_message_path(&capture, "balanced").is_err());
     }
 
     #[test]

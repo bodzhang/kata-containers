@@ -50,9 +50,8 @@ def main() -> None:
     tagged = {
         path.name: sha256(path) for path in sorted(args.tagged_dir.glob("*.json"))
     }
-    raw = {
-        path.name: sha256(path)
-        for path in sorted(args.raw_dir.glob("*.config.json"))
+    raw_create_requests = {
+        path.name: sha256(path) for path in sorted(args.raw_dir.glob("*.json"))
     }
     result = {
         "artifacts": artifacts,
@@ -60,11 +59,11 @@ def main() -> None:
         "outputs": {
             "dynamic-tags.json": sha256(args.tag_manifest),
             "generated": generated,
-            "raw_oci": raw,
+            "raw_create_requests": raw_create_requests,
             "tagged": tagged,
         },
         "profile": parse_profile(args.profile),
-        "schema_version": 1,
+        "schema_version": 2,
     }
     args.output.write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"

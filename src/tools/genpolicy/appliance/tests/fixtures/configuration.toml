@@ -1,0 +1,7 @@
+[hypervisor.qemu]
+shared_fs = "none"
+block_device_driver = "virtio-blk-pci"
+
+[runtime]
+hypervisor_name = "qemu"
+emptydir_mode = "shared-fs"

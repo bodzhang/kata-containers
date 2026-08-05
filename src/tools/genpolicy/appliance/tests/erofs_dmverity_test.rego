@@ -28,22 +28,23 @@ erofs_storages(roothash) := [
 	},
 ]
 
-# A lower layer whose root hash is on the pod allowlist is admitted.
+# A lower layer whose root hash is in this container's marker is admitted.
 test_erofs_dmverity_allowed if {
-	allow_storages([], erofs_storages("aa11"), "bid", "sid")
-		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": ["aa11", "cc33"]}}
+	allow_storages([marker(["aa11"])], erofs_storages("aa11"), "bid", "sid")
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }
 
-# A root hash not on the allowlist is rejected.
+# A root hash not in this container's marker is rejected.
 test_erofs_dmverity_wrong_roothash_denied if {
-	not allow_storages([], erofs_storages("deadbeef"), "bid", "sid")
-		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": ["aa11"]}}
+	not allow_storages([marker(["aa11"])], erofs_storages("deadbeef"), "bid", "sid")
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }
 
-# No allowlist at all -> rejected (fail closed).
-test_erofs_dmverity_no_allowlist_denied if {
+# A legacy pod-wide allowlist cannot authorize a root hash without a
+# per-container marker.
+test_erofs_dmverity_global_allowlist_denied if {
 	not allow_storages([], erofs_storages("aa11"), "bid", "sid")
-		with data.agent_policy.policy_data as {}
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": ["aa11"]}}
 }
 
 # An erofs lower without dm-verity enabled is rejected.
@@ -71,28 +72,27 @@ single_layer_verity(roothash) := [{
 	],
 }]
 
-# A single-layer verity rootfs whose root hash is allowlisted is admitted.
+# A single-layer verity rootfs whose hash is in this container's marker is admitted.
 test_single_layer_dmverity_allowed if {
-	allow_storages([], single_layer_verity("cafe1234"), "bid", "sid")
-		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": ["cafe1234"]}}
+	allow_storages([marker(["cafe1234"])], single_layer_verity("cafe1234"), "bid", "sid")
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }
 
-# A single-layer verity rootfs with an unlisted root hash is rejected.
+# A single-layer verity rootfs with a hash absent from the marker is rejected.
 test_single_layer_dmverity_wrong_roothash_denied if {
-	not allow_storages([], single_layer_verity("deadbeef"), "bid", "sid")
+	not allow_storages([marker(["cafe1234"])], single_layer_verity("deadbeef"), "bid", "sid")
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
+}
+
+# A legacy global allowlist cannot authorize a single-layer rootfs.
+test_single_layer_dmverity_global_allowlist_denied if {
+	not allow_storages([], single_layer_verity("cafe1234"), "bid", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": ["cafe1234"]}}
 }
 
-# No allowlist -> single-layer verity rootfs rejected (fail closed).
-test_single_layer_dmverity_no_allowlist_denied if {
-	not allow_storages([], single_layer_verity("cafe1234"), "bid", "sid")
-		with data.agent_policy.policy_data as {}
-}
-
-# Per-container (tarfs style): the compiler injects a `dmverity-roothashes`
+# The compiler injects a `dmverity-roothashes`
 # marker storage into THIS container's p_storages carrying only its own root
-# hashes, and the pod-wide union is left empty. The per-container clause matches
-# the lower against the marker; verity_marker_count keeps the count balanced.
+# hashes. The marker count is excluded from the Agent storage count balance.
 marker(hashes) := {
 	"driver": "dmverity-roothashes", "source": "", "fstype": "",
 	"fs_group": null, "shared": false, "driver_options": [],

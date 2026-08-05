@@ -3687,6 +3687,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kata-createreq-capture"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "anyhow",
+ "async-trait",
+ "common",
+ "hypervisor",
+ "kata-types",
+ "logging",
+ "oci-spec 0.10.0",
+ "resource",
+ "serde",
+ "serde_json",
+ "tokio",
+ "virt_container",
+]
+
+[[package]]
 name = "kata-ctl"
 version = "0.0.1"
 dependencies = [

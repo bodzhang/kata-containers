@@ -18,6 +18,7 @@ image:
 		--file $(CURDIR)/Dockerfile \
 		--build-arg KUBERNETES_VERSION=$(KUBERNETES_VERSION) \
 		--build-arg CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
+		--build-arg EROFS_CONTAINERD_VERSION=$(EROFS_CONTAINERD_VERSION) \
 		--build-arg RUNC_VERSION=$(RUNC_VERSION) \
 		--build-arg ETCD_VERSION=$(ETCD_VERSION) \
 		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \
@@ -30,6 +31,7 @@ reference-image:
 		--target legacy-reference \
 		--build-arg KUBERNETES_VERSION=$(KUBERNETES_VERSION) \
 		--build-arg CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
+		--build-arg EROFS_CONTAINERD_VERSION=$(EROFS_CONTAINERD_VERSION) \
 		--build-arg RUNC_VERSION=$(RUNC_VERSION) \
 		--build-arg ETCD_VERSION=$(ETCD_VERSION) \
 		--build-arg CNI_PLUGINS_VERSION=$(CNI_PLUGINS_VERSION) \

@@ -5,15 +5,11 @@ Predicts the Kata Agent `storages` and `devices` a workload would produce,
 records containerd's mount view, not the Agent `storages`/`devices` that the Kata
 shim synthesizes downstream.
 
-The predicted `storages` now **drive policy generation**: the policy compiler
-consumes `storages-devices-predicted.json` to pin the container rootfs (by EROFS
-dm-verity root hash, or by guest-pull image reference) and to inject each
-container's volume `storages` into the generated `policy.rego`, so storage-bearing
-workloads get a working, tightly-scoped policy instead of failing closed.
-Predicted **devices** remain audit-only: the policy's device *set*
-(`volumeDevices`, VFIO/NVIDIA GPU) is pinned by the compiler from the workload
-YAML — the authority for device intent — not from the no-VM predictor (see
-*Design* and *Known gaps*). See *Driving policy generation* below.
+The report is audit-only. Policy generation consumes the final captured
+`CreateContainerRequest`, whose OCI, storages, devices, request flags, and
+rootfs identity were assembled by the real runtime-rs container-create path.
+The predictor remains useful for diagnostics and focused no-VM testing of
+storage handlers; it is not a compiler fallback.
 
 **ConfigMap / Secret (Kata-CC), at a glance.** These are delivered two ways
 depending on the deployment's `shared_fs`. Under **`shared_fs = "none"`** — the
@@ -36,106 +32,12 @@ through a trusted channel (KBS / CDH / guest-pull), not plain K8s Secrets. See
 
 ## Design
 
-### What "storage" is in a Kata-CC UVM, and who decides it
-
-A confidential Kata guest (UVM) never sees the Kubernetes volume spec. It sees a
-kata-agent `CreateContainerRequest` carrying a list of **`storages`** (rootfs
-layers, emptyDir/configMap/secret volumes, …) and **`devices`**, each fully
-concrete: a driver, a guest source (`/dev/vdX`, a PCI/SCSI address, a shared-fs
-tag), a mount point, options, `fs_group`. That concrete shape is the product of a
-pipeline of authorities, each of which adds to or *mutates* the storage:
-
-| Authority | Trust (CoCo) | What it decides |
-|---|---|---|
-| **Workload YAML** (author) | trusted *intent* | the volume/device **set** (emptyDir, configMap, secret, projected, hostPath, PVC `volumeDevices`), the **image** (must be digest-pinned), `securityContext.fsGroup`, hugepage / `nvidia.com/pgpu` requests |
-| **Kubelet / K8s** | untrusted (host) | materializes volumes on the host — creates the emptyDir dir and sets its **GID** from `fsGroup`, projects secret/configMap files — and emits the CRI `ContainerConfig` |
-| **containerd** (CRI + snapshotter) | untrusted (host) | lowers CRI → OCI bundle `config.json` (a runtime-agnostic **bind/tmpfs** mount list), and the **snapshotter** produces the rootfs mounts (overlay for runc; erofs / guest-pull / block for kata) |
-| **Kata-CC shim** (`runtime-rs`) | trusted code, **host-controlled config** | the step where concrete Agent storage is *born*: rewrites bind/tmpfs → `ephemeral`/`local`, plugs block devices, applies `emptydir_mode` (shared-fs / local / **block-encrypted** / block-plain), computes guest paths, dm-verity options, `fs_group`, the guest-pull `KataVirtualVolume` |
-| **Kata-CC agent** (in-TEE) | trusted, **enforces** | receives the request and checks every storage/device against the attested policy |
-
-Two facts drive every design choice below:
-
-1. **Only the shim's output (row 4) is enforceable**, because that is exactly
-   what the agent (row 5) sees. The YAML (row 1) is authoritative for *intent*
-   but not for the guest storage *shape* — rows 2–4 mutate it (a YAML `emptyDir`
-   becomes a `tmpfs` `ephemeral` storage, or an `ext4` `blk` device, depending on
-   configuration the YAML never states).
-2. **Part of the shape is decided by host-controlled Kata configuration, not by
-   the YAML** — `shared_fs`, the block driver, and `emptydir_mode` live in the
-   deployment's `configuration.toml`, so the *same* YAML yields *different*
-   storages on different CC profiles.
-
-### Threat model the storage policy addresses
-
-Under Confidential Containers the **host is untrusted** (hypervisor, containerd,
-kubelet, node OS); the guest kernel, agent, and the attested policy are trusted.
-A malicious host controls the `CreateContainerRequest`, so the storage policy
-exists to bind that request to the workload author's intent and deny host
-tampering:
-
-- **rootfs substitution** — the host serves a different image → defended by
-  guest-pull **digest** pinning and erofs / single-layer **dm-verity root-hash**
-  pinning.
-- **volume injection / redirection** — the host adds a storage, or repoints an
-  existing one's source/mount_point to exfiltrate or inject data → defended by
-  pinning each storage's `driver`, `source`, `mount_point`, `options`, `fs_group`.
-- **trusted-device swap** — the host swaps a verity-protected device for an
-  untrusted one → defended by pinning the root hash (device *identity*).
-- **extra devices** — defended by pinning the device *set*.
-
-Explicitly **out of scope**: the *content* of host-supplied block `volumeDevices`
-(baseline-untrusted under CoCo — the guest treats them as untrusted input), host
-denial-of-service, and side channels. That scoping is why, e.g., raw block
-volumes are pinned only by `container_path` (bounding the set) rather than by
-content.
-
-### Design choices that follow
-
-- **Dry-run the real mutation pipeline; don't reimplement it.** Because only the
-  shim's output is enforceable and rows 2–4 mutate the YAML, the predictor
-  captures the OCI bundle **after** containerd's CRI→OCI lowering (from the runc
-  handler, which is CRI-equivalent — see *Known gaps*) and runs the shim's own
-  `VolumeResource::handler_volumes` / `handler_rootfs`. Legacy `genpolicy`
-  instead *reimplements* row 4 in a separate model, which drifts (it omits
-  hugepage, block, direct-volume, and all device synthesis); linking the real
-  `runtime-rs` `resource` crate removes that drift by construction.
-- **Skip the VM at the `Hypervisor` seam.** Storage synthesis is separable from
-  VM lifecycle, so the predictor supplies a no-op *dry-run* `Hypervisor` and a
-  stub `Agent`; guest device paths come from the device manager's deterministic
-  index allocation and a synthesized PCI/SCSI address (see *Dry-run block device
-  address synthesis*), not from live hotplug.
-- **Feed the shim the deployment's Kata-CC configuration.** Since the storage
-  shape depends on `shared_fs` / block driver / `emptydir_mode` (host-controlled
-  config, not YAML), the predictor sources the *same* `configuration.toml`
-  (`--kata-config`) so its prediction matches the CC shim the workload will
-  actually run under.
-- **Keep the YAML as the authority for intent.** What a no-VM run cannot (or
-  should not) derive is pinned from the YAML by the compiler instead: image
-  **digests** are enforced at YAML validation (`submit_workload.py`), and the
-  volume/device **set** (`volumeDevices`, `nvidia.com/pgpu`) is pinned from the
-  manifest.
-- **Reproduce only the unavoidable host-side rewriting.** The shim's
-  `kata_sys_util::k8s::update_ephemeral_storage_type` rewrites containerd
-  `bind`/`tmpfs` mounts into Kata `ephemeral`/`local` types and today inspects
-  live host mount state (`mountinfo`/`stat`) to classify a disk- vs memory-backed
-  emptyDir — a **current implementation coupling**, not an inherent need, since
-  that intent is also in the YAML (`emptyDir.medium`); see *Known gaps: fidelity
-  assumptions*. The one path that cannot be reused as-is (`VirtiofsShareMount`,
-  entangled with virtiofsd) is *mirrored*, with the drift surface documented (see
-  *Drift risk*).
-- **Predict without gating; gate in the compiler.** The predictor records
-  per-container failures and never blocks generation; gating (the dm-verity
-  coverage gate, the opt-in `--strict-storage-coverage` gate) happens downstream
-  where the policy is assembled (see *Driving policy generation*).
-- **Serialization mirror.** `agent::types::Storage`/`Device` are not `Serialize`,
-  so the tool maps them to local serializable structs for the JSON output.
-
-Guided by this framing, **Known gaps** are narrowed to two kinds: (a) one missing
-enforcement *capability* (dm-verity pinning of read-only data block volumes,
-blocked upstream); and (b) *fidelity assumptions* where the no-VM prediction
-could diverge from a real CC run. Tooling/config prerequisites live in
-*Requirements*; out-of-scope paths (nydus rootfs, raw block *content*, host DoS,
-side channels) live in *Coverage* / *Threat model*.
+The design rationale — what "storage" is in a Kata-CC UVM and who decides it, the
+Confidential Containers threat model the storage policy addresses, and the design
+choices that follow (dry-run the real shim mutation pipeline instead of
+reimplementing it, skip the VM at the `Hypervisor` seam, feed the deployment's
+Kata-CC configuration, keep the YAML authoritative for intent) — is in
+[DESIGN.md](DESIGN.md#design).
 
 ## Usage
 
@@ -162,7 +64,7 @@ dependencies** — deployment prerequisites, *not* policy gaps:
   artifact needs an **out-of-band prep-host stage**: containerd ≥ 2.2 with the
   erofs snapshotter/differ, `erofs-utils`, and the `erofs` (plus, for integrity,
   `dm-verity`) kernel modules, and a kata-runtime run to obtain the block mounts
-  the shim receives (see *Rootfs prediction*). The prediction itself then runs
+  the shim receives (see [Rootfs prediction](DESIGN.md#rootfs-prediction-design)). The prediction itself then runs
   no-VM, and `ErofsMultiLayerRootfs::new` stats each erofs source file, so those
   blob paths must exist when the predictor runs. **Guest-pull rootfs needs none
   of this.**
@@ -208,18 +110,17 @@ dependencies** — deployment prerequisites, *not* policy gaps:
   A CC deployment therefore never routes its rootfs through `NydusRootfs`, so it
   is deliberately not predicted.
 
-## Driving policy generation
+## Comparing policy inputs
 
-The policy compiler (`policy-compiler`) reads the report via `--predicted-storages`
-and turns it into enforceable `policy.rego`. It consumes the predictor's output as
-the **authoritative** storage shape rather than reimplementing the shim (as legacy
-`genpolicy` does), so the generated policy matches the real runtime-rs
-`CreateContainerRequest`.
+The report is an audit artifact for comparing predicted storage behavior with
+the final captured `CreateContainerRequest`. The policy compiler does not read
+it: the captured request is authoritative for OCI, storages, devices, request
+flags, and rootfs identity.
 
 ### Rootfs: dm-verity pinning (erofs multi-layer and single-layer block)
 
-The compiler collects the union of dm-verity **root hashes** into
-`policy_data.dmverity.allowed_roothashes`, covering two rootfs shapes:
+The compiler records dm-verity **root hashes** in each container's synthetic
+`dmverity-roothashes` marker storage, covering two rootfs shapes:
 
 - **multi-layer erofs**: each read-only **lower** layer is pinned by its root
   hash; the writable `ext4` upper is allowed by shape.
@@ -267,13 +168,12 @@ it through the real `handler_rootfs` with no `ShareFs` (`--guest-pull-rootfs`; i
 the appliance `GENPOLICY_GUEST_PULL=1`). The resulting `image_guest_pull`
 `Storage` carries `source` = the image reference from
 `io.kubernetes.cri.image-name` (digest-pinned, per above). The compiler collects
-the union of those references into `policy_data.guest_pull.allowed_images`, and
-the `rules.rego` `image_guest_pull` clause pins the pulled image to that
-allowlist. To stay backward compatible (legacy genpolicy, or the predictor not
-run), an empty allowlist falls back to the historical allow-by-shape. The huge,
-non-deterministic `driver_options` metadata blob is intentionally not pinned; the
-image reference is the security-relevant field (the guest pulls and verifies it
-by digest inside the TEE).
+each container's reference into its synthetic `guest-pull-images` marker, and
+the `rules.rego` `image_guest_pull` clause pins the pulled image to that marker.
+A missing marker fails closed. The huge, non-deterministic `driver_options`
+metadata blob is intentionally not pinned; the image reference is the
+security-relevant field (the guest pulls and verifies it by digest inside the
+TEE).
 
 ### Volume storages: templated injection
 
@@ -391,40 +291,29 @@ predicted report (no silent loosening). Pass `--strict-storage-coverage true`
 unsupported class a hard generation error instead — the fail-closed-at-generation
 choice for operators who want to guarantee full coverage.
 
-### Rootfs: per-container image identity (opt-in `--per-container-image`)
+### Rootfs: per-container image identity
 
-By default the rootfs allowlists are pod-scoped unions (dm-verity root hashes in
-`policy_data.dmverity.allowed_roothashes`, guest-pull digests in
-`policy_data.guest_pull.allowed_images`), so a container could present another
-same-pod container's image. `--per-container-image` (compiler flag) switches to
-the **tarfs-style** per-container binding for **all three** rootfs identity
-mechanisms — multi-layer erofs dm-verity, single-layer dm-verity block, and
-guest-pull — by injecting each container's OWN identity as a synthetic marker
-storage into that container's `ContainerPolicy.storages` (`dmverity-roothashes`
-carrying its root hashes, `guest-pull-images` carrying its image digests) and
-leaving the pod-wide unions empty. The `rules.rego` per-container clauses then
-pin the presented value against `some p_storage in p_storages` rather than the
-global union.
+Rootfs identity is always bound to one container policy for all three
+mechanisms: multi-layer erofs dm-verity, single-layer dm-verity block, and guest
+pull. The compiler injects each workload container's own identity as a synthetic
+marker storage in its `ContainerPolicy.storages`: `dmverity-roothashes` carries
+that container's root hashes and `guest-pull-images` carries its image digests.
+The pod-level `policy_data.dmverity.allowed_roothashes` and
+`policy_data.guest_pull.allowed_images` fields remain empty and cannot authorize
+a runtime storage.
 
-This is done **without** changing the shared `allow_storages` / `allow_storage`
-signature: the markers are excluded from the storage-count balance via
-`marker_count`, which is zero (so behaviour is unchanged) for legacy genpolicy
-and the default union mode. The guest-pull legacy allow-by-shape fallback still
-fires only when *no* pinning exists anywhere (empty union **and** no marker). The
-agent is unaffected — it still emits the same `X-kata.dmverity.*` /
-`image_guest_pull` storages; only the policy definition changes.
-Ordering/multiplicity of layers is still matched by set membership (as in the
-union), so this tightens *scope* (per container) but not layer order.
+The markers are excluded from the shared `allow_storages` count balance because
+the Agent never sends them. `rules.rego` requires the runtime rootfs identity to
+match a marker in that container policy; a missing marker, a different
+container's identity, or a populated legacy global field cannot authorize it.
+The Agent is unaffected and still emits the same `X-kata.dmverity.*` or
+`image_guest_pull` storage. Layer ordering and multiplicity are matched by set
+membership, so the binding scopes identity per container but does not enforce
+layer order.
 
-The only keyless capture is the **sandbox/pause container** (no
-`io.kubernetes.cri.container-name`), which gets no marker — but this is safe, not
-a gap: the agent detects the sandbox (`is_sandbox`) and unpacks the trusted
-built-in `/pause_bundle` from the attested guest image (`unpack_pause_image`),
-**ignoring** the host-supplied `image_guest_pull` `source`, and the pause never
-presents a dm-verity erofs/block storage. So the per-container mode's
-allow-by-shape of the sandbox source is harmless (the source is never acted on)
-and no per-sandbox binding is needed. The pod-wide union remains the **default**
-purely for backward compatibility, not to cover the sandbox.
+The sandbox/pause container has no workload container-name key and receives no
+marker. It uses the trusted built-in `/pause_bundle` from the attested guest
+image rather than a workload rootfs identity.
 
 ## Drift risk and mitigation
 
@@ -470,7 +359,7 @@ Mitigation options (not yet implemented):
 *fidelity assumptions* where the no-VM prediction could diverge from a real CC
 run. Tooling/config prerequisites are in *Requirements*; out-of-scope paths
 (nydus rootfs, raw block *content*, host DoS, side channels) are in *Coverage* /
-*Threat model*. Items *enforced at parity* — raw `volumeDevices[]`, VFIO/NVIDIA
+the [threat model](DESIGN.md#threat-model-the-storage-policy-addresses). Items *enforced at parity* — raw `volumeDevices[]`, VFIO/NVIDIA
 GPU (see *Devices*), and block emptyDir (see *Volume storages*) — are not gaps
 and are not repeated here.
 
@@ -524,197 +413,11 @@ and are not repeated here.
 
 ## Rootfs prediction (design)
 
-The rootfs is the one storage the appliance cannot capture from the runc bundle:
-runc uses overlayfs, while kata produces the container rootfs through
-`RootFsResource::handler_rootfs` (`resource/src/rootfs/mod.rs`), which dispatches
-by the shape of `rootfs_mounts`:
-
-- empty → `ShareFsRootfs`
-- erofs multi-layer (`is_erofs_multi_layer`) → `ErofsMultiLayerRootfs`
-- single layer: guest-pull (`is_guest_pull_volume`) → `VirtualVolume`; block
-  (`is_block_rootfs`) → `BlockRootfs`; nydus → `NydusRootfs`; else `ShareFsRootfs`
-
-`handler_rootfs` takes exactly the three dependencies the predictor already stubs
-(`Option<Arc<dyn ShareFs>>`, `RwLock<DeviceManager>`, `&dyn Hypervisor`) plus
-`sid`/`cid`/`root`/`bundle_path`/`rootfs_mounts`/`annotations`. Two target models
-matter for confidential guests:
-
-### Guest-pull rootfs (mainstream CoCo) — tractable, no snapshotter
-
-`VirtualVolume::new` → `handle_virtual_volume_storage`
-(`resource/src/rootfs/virtual_volume.rs`) is a **pure** transform: no device
-manager, no hypervisor, no snapshotter. For a
-`KATA_VIRTUAL_VOLUME_IMAGE_GUEST_PULL` volume it derives the Agent `Storage`
-entirely from data the appliance already captures:
-
-- `source` = image reference read from the OCI annotation
-  `io.kubernetes.cri.image-name` (or the cri-o key) via `get_image_reference`
-- `driver` = `image_guest_pull`, `fs_type` = `overlay`
-- `mount_point` = `/run/kata-containers/<cid>/rootfs`
-- `driver_options` = the serialized `ImagePull` metadata (the pod annotations)
-
-Because the guest pulls and verifies the image by digest inside the TEE, this
-storage is **deterministic from the captured spec** — the predictor synthesizes
-the guest-pull `KataVirtualVolume` option (via the shim's own
-`adjust_rootfs_mounts`), calls `handler_rootfs`, and emits the real Agent
-`Storage` with no snapshotter, VM, or device. **Implemented** via
-`--guest-pull-rootfs`; the compiler pins `source` into
-`policy_data.guest_pull.allowed_images` (see *Driving policy generation*). Proven
-by the `predicts_guest_pull_rootfs` integration test.
-
-### Multi-layer erofs rootfs — implemented (`--rootfs-mounts`)
-
-The predictor consumes a snapshotter-captured `rootfs_mounts` artifact via
-`--rootfs-mounts <file>` (a JSON array of `kata_types::mount::Mount`). A
-multi-layer erofs artifact (an `ext4` `rw` upper layer, an `erofs` lower layer,
-and an `overlay` mount)
-is routed by `handler_rootfs` to `ErofsMultiLayerRootfs`, which — like the block
-path — runs `do_handle_device` for each layer. Under the dry-run device manager
-each layer gets a deterministic `/dev/vdX` guest path with **no VM**, and
-`get_storage()` returns the two Agent `Storage` objects the guest agent would use
-to assemble the overlay (upper `ext4` + lower `erofs`, both `X-kata.multi-layer`).
-The predicted rootfs is emitted under the `rootfs` key of the output. Proven by
-the `dry_run_erofs_multi_layer_produces_layer_storages` unit test and the
-`predicts_erofs_multi_layer_rootfs` integration test.
-
-All three CC block drivers work under the dry-run: `virtio-blk-mmio`'s Agent
-source is the deterministic `virt_path` (`/dev/vdX`), while `virtio-blk-pci`
-(`blk`), `virtio-scsi` (`scsi`), and `virtio-blk-ccw` (`blk-ccw`) get a
-deterministic `pci_path` / `scsi_addr` / `ccw_addr` synthesized by the dry-run
-`add_device`. Proven by the `predicts_erofs_multi_layer_rootfs_pci` integration
-test and the `erofs_pci_driver_synthesizes_pci_path` unit test. Confidential
-guests use `virtio-scsi` (QEMU) or `virtio-blk-pci` (CLH/dragonball); the
-enforced policy wildcards the address via the base64url device id, so the
-synthetic value only needs a valid shape.
-
-The **capture stage** that produces the artifact is `capture_rootfs_mounts.py`:
-
-1. **Prepare (out-of-band, prep host)** — pull the workload image by the digest
-   pinned in the YAML with the erofs snapshotter, which converts each layer into
-   an on-disk EROFS blob at `<root>/io.containerd.snapshotter.v1.erofs/snapshots/<N>/layer.erofs`:
-
-   ```
-   ctr images pull --snapshotter erofs <image>@<digest>
-   ```
-
-   Verified against containerd 2.3.3: `ctr snapshots --snapshotter erofs mounts`
-   returns the **host** view — a single `overlay` mount (upperdir = the writable
-   `fs`, lowerdir = the mount-manager-mounted erofs blob) — **not** the block
-   mounts the guest sees. The block-device rootfs (`ext4` rw upper + `erofs` ro
-   lower(s) with `device=`) that `ErofsMultiLayerRootfs` consumes is produced by
-   the containerd erofs **mount-handler** when containerd hands the rootfs to the
-   Kata shim. So the authoritative mounts are captured from a **Kata-runtime run**
-   on the prep host (the mounts the shim receives), written per image as
-   `<digest>.mounts` (mount-command text) or `<digest>.json` (containerd mount
-   dicts). This preparation needs containerd ≥ 2.2, the erofs snapshotter/differ,
-   `erofs-utils`, and the `erofs` kernel module.
-2. **Convert (in-appliance)** — point `GENPOLICY_ROOTFS_MOUNTS_DIR` at that
-   directory. `capture_rootfs_mounts.py` maps each captured container (via its
-   `io.kubernetes.cri.image-name` digest) to its mounts file, converts the block
-   mounts to `kata_types::mount::Mount` (preserving `device=` and
-   `X-containerd.mkdir.path` options, deriving `read_only` from `ro`), and writes
-   `raw/<name>.rootfs-mounts.json`. The conversion is unit-tested in
-   `tests/test_capture_rootfs_mounts.py`.
-3. **Predict** — `predict_storages.py` auto-detects `raw/<name>.rootfs-mounts.json`
-   next to the OCI bundle and passes it to `--rootfs-mounts`; the predicted rootfs
-   lands under the `rootfs` key. A `rootfs-mounts-captured.json` report and the
-   per-container artifacts are recorded in provenance. The predictor was validated
-   against a **real** `layer.erofs` blob produced by the containerd erofs
-   snapshotter: the `erofs` lower resolves to `/dev/vdb` and the `ext4` upper to
-   `/dev/vda`, no VM.
-4. **Integrity (dm-verity)** — this branch tracks upstream `erofs_rootfs.rs` +
-   `kata-types::gpt_disk`, so the predictor emits the erofs **dm-verity root hash**
-   through the real handler. When the captured `rootfs_mounts` has **more than one**
-   erofs layer (GPT+VMDK mode) and each erofs layer carries an
-   `X-containerd.dmverity=<metadata.json>` option, `ErofsMultiLayerRootfs` parses
-   that metadata (`roothash`, `hashoffset`) and, via
-   `gpt_disk::generate_dmverity_options`, appends to each erofs lower-layer
-   `Storage.options`:
-
-   ```
-   X-kata.dmverity-enabled=true
-   X-kata.dmverity.roothash=<hash>
-   X-kata.dmverity.hashoffset=<off>
-   X-kata.dmverity.salt=<salt>
-   X-kata.gpt-partitioned=true, X-kata.partition-number=N
-   ```
-
-   Proven with no VM by `dry_run_erofs_gpt_dmverity_emits_roothash` (unit) and
-   `predicts_erofs_dmverity_rootfs` (binary end-to-end). This is the containerd
-   erofs dm-verity mode (`dmverity_mode = 'on'` + differ `enable_dmverity = true`,
-   enabled by kata-deploy `erofs_dmverity`); the guest agent's `multi_layer_erofs.rs`
-   activates a dm-verity device per layer from these options. A separate,
-   Go-runtime dm-verity model exists via `KataVirtualVolume` `image_raw_block` /
-   `layer_raw_block` / `*_nydus_block` carrying `DmVerityInfo`.
-
-A `virtio-blk-pci` deployment works with no VM: the dry-run `add_device`
-synthesizes a deterministic `pci_path` for each layer (see **Dry-run block
-device address synthesis** below), so the erofs transform completes and each
-layer's Agent `source` is a `PciPath` slot (`"xx"`) instead of `/dev/vdX`. Proven
-by `predicts_erofs_multi_layer_rootfs_pci` (binary) and
-`erofs_pci_driver_synthesizes_pci_path` (unit).
-
-### Single-layer block / dm-verity rootfs — implemented
-
-For a single-layer host-prepared block rootfs, `BlockRootfs::new`
-(`resource/src/rootfs/block_rootfs.rs`) runs the same device flow. `BlockRootfs`
-now honors the `X-containerd.dmverity` mount annotation and translates it into
-the `X-kata.dmverity.*` storage options via the shared
-`kata_types::gpt_disk` helpers (the same ones the multi-layer erofs path uses),
-so a single verity-protected block image is pinned by its root hash exactly like
-an erofs lower layer. `is_block_rootfs` needs a **real** source that stats as a
-block device (`S_IFBLK`) or a loop-backed regular file (`S_IFREG` + the `loop`
-option); the predictor test uses the loop-file form so the whole path runs with
-no VM (`dry_run_single_layer_dmverity_emits_roothash`). Any CC block driver
-works (`virtio-blk-mmio` `mmioblk` uses the deterministic `/dev/vdX` source;
-`virtio-blk-pci`/`virtio-scsi`/`virtio-blk-ccw` get a synthesized address — see
-**Dry-run block device address synthesis** below).
-
-### Dry-run block device address synthesis
-
-Block-backed handlers (`BlockRootfs`, `ErofsMultiLayerRootfs`,
-`BlockEmptyDirVolume`, `block_volume`) set the Agent `storage.source` from the
-guest device address the hypervisor backend assigns during attach, which varies
-by driver: `virtio-blk-mmio` (`mmioblk`) uses `config.virt_path` (`/dev/vdX`),
-but `virtio-blk-pci` (`blk`) reads `config.pci_path`, `virtio-scsi` (`scsi`)
-reads `config.scsi_addr`, and `virtio-blk-ccw` (`blk-ccw`) reads
-`config.ccw_addr`. Only `virt_path` is assigned by the device manager before
-attach; the other three are populated by the real hypervisor's device-attach
-round-trip, which the dry-run has no VM to perform.
-
-The dry-run `DryRunHypervisor::add_device` therefore synthesizes them
-deterministically from the device index, for `DeviceType::BlockModern` devices:
-
-| driver (`driver_option`) | field set | value |
-| --- | --- | --- |
-| `blk` (`virtio-blk-pci`) | `pci_path` | `PciPath::try_from(index + 1)` — slot 0 is reserved, renders as `"01"`, `"02"`… |
-| `scsi` (`virtio-scsi`) | `scsi_addr` | `"<index>>8>:<index&0xff>"` (SCSI-id:LUN) |
-| `blk-ccw` (`virtio-blk-ccw`) | `ccw_addr` | `"0.0.<index:04x>"` |
-| `mmioblk` (`virtio-blk-mmio`) | — | untouched; `virt_path` already assigned |
-
-Because `add_device` receives the `Arc<Mutex<BlockDeviceModern>>` the handler
-holds, the mutation flows back into the handler's `storage.source`. The value
-need only be *shape-valid*, not runtime-exact: the generated policy wildcards the
-source via the base64url device id (`$(spath)/$(b64_device_id)`), and a `PciPath`
-renders as `"xx"` which matches the `rules.rego` `blk`/`scsi` device-id clauses.
-This is a predictor-only change — no core Kata behavior is altered — and it lets
-the block/erofs paths run under the drivers CC confidential guests actually use
-(QEMU `virtio-scsi`, CLH/dragonball `virtio-blk-pci`, s390 `virtio-blk-ccw`),
-which forbid `virtio-blk-mmio`.
-
-**Remaining dry-run gaps for the block/erofs device paths:**
-
-- `ErofsMultiLayerRootfs::new` stats each erofs source file (`get_erofs_layer_size`
-  in GPT mode, `generate_merged_erofs_vmdk` in fsmerge mode) and creates a host
-  rootfs directory (side effect), so the captured artifact's `source` paths must
-  exist when the predictor runs.
-- The snapshotter needs kernel support (erofs / dm-verity) and the plugin present
-  in the appliance image.
-
-Trust rationale: preparing the rootfs in the clean room is legitimate for
-confidential guests because content is verified by **digest** (the guest's trust
-anchor) — trust shifts from "host is honest" to "digest matches + conversion is
-deterministic", and the recorded verity root hash lets the policy pin it.
+The rootfs is the one storage the appliance cannot capture from the runc bundle.
+How the predictor reproduces it with no VM — guest-pull digest pinning,
+multi-layer and single-layer erofs/block dm-verity root-hash pinning, and the
+dry-run block-device address synthesis — is in
+[DESIGN.md](DESIGN.md#rootfs-prediction-design).
 
 ## Validation
 

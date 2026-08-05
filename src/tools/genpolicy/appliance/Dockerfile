@@ -2,7 +2,26 @@ FROM registry.k8s.io/pause:3.10 AS pause
 FROM busybox:1.36.1 AS busybox
 FROM docker.io/library/registry:2.8.3 AS registry
 
-FROM docker.io/library/rust:1.88-bookworm AS policy-builder
+# Build erofs-utils >= 1.8.2, required by the containerd erofs differ for the
+# in-appliance dm-verity root-hash generation (Debian bookworm ships 1.6).
+FROM debian:bookworm-slim AS erofs-utils-builder
+ARG EROFS_UTILS_VERSION=1.8.4
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        autoconf automake build-essential ca-certificates curl libtool \
+        liblz4-dev pkg-config uuid-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    curl -fsSL -o /tmp/erofs-utils.tar.gz \
+        "https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/snapshot/erofs-utils-${EROFS_UTILS_VERSION}.tar.gz"; \
+    tar -xzf /tmp/erofs-utils.tar.gz -C /tmp; \
+    cd "/tmp/erofs-utils-${EROFS_UTILS_VERSION}"; \
+    ./autogen.sh; \
+    ./configure --enable-lz4; \
+    make -j"$(nproc)"; \
+    make install
+
+FROM docker.io/library/rust:1.95-bookworm AS policy-builder
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -19,13 +38,15 @@ WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tools/packaging/kata-deploy/binary ./tools/packaging/kata-deploy/binary
+COPY tools/packaging/kata-deploy/job-dispatcher ./tools/packaging/kata-deploy/job-dispatcher
 
 RUN sed 's/@COMMIT_INFO@/genpolicy-appliance/' \
         src/tools/genpolicy/src/version.rs.in \
         >src/tools/genpolicy/src/version.rs \
     && cargo build --locked --release \
         --package genpolicy-oci-compiler \
-        --package kata-storage-predictor
+        --package kata-storage-predictor \
+        --package kata-createreq-capture
 
 FROM policy-builder AS legacy-builder
 
@@ -39,20 +60,29 @@ ARG CONTAINERD_VERSION=v1.7.29
 ARG RUNC_VERSION=v1.2.8
 ARG ETCD_VERSION=v3.5.21
 ARG CNI_PLUGINS_VERSION=v1.7.1
+# containerd >= 2.2 provides the native erofs snapshotter+differ used by the
+# opt-in in-appliance dm-verity root-hash generation (kept separate from the
+# v1.7.x above that backs runc-capture).
+ARG EROFS_CONTAINERD_VERSION=v2.3.3
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \
         conntrack \
+        cryptsetup-bin \
         curl \
         iproute2 \
         iptables \
+        kmod \
+        liblz4-1 \
+        libuuid1 \
         openssl \
         python3 \
         python3-yaml \
         socat \
         tar \
         util-linux \
+        zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
@@ -83,6 +113,16 @@ RUN set -eux; \
         "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${TARGETARCH}-${CNI_PLUGINS_VERSION}.tgz" \
         | tar -xz -C /opt/cni/bin
 
+# containerd >= 2.2 (erofs snapshotter) + mkfs.erofs >= 1.8.2 for the opt-in
+# in-appliance dm-verity root-hash generation (prepare_erofs_dmverity.py).
+RUN set -eux; \
+    mkdir -p /opt/genpolicy/erofs/bin; \
+    curl -fsSL \
+        "https://github.com/containerd/containerd/releases/download/${EROFS_CONTAINERD_VERSION}/containerd-${EROFS_CONTAINERD_VERSION#v}-linux-${TARGETARCH}.tar.gz" \
+        | tar -xz --strip-components=1 -C /opt/genpolicy/erofs/bin \
+            "bin/containerd" "bin/ctr" "bin/containerd-shim-runc-v2"
+COPY --from=erofs-utils-builder /usr/local/bin/mkfs.erofs /usr/local/bin/mkfs.erofs
+
 COPY --from=pause /pause /opt/genpolicy/rootfs/pause/pause
 COPY --from=busybox / /opt/genpolicy/rootfs/busybox
 RUN mkdir -p /opt/genpolicy/rootfs/busybox/work
@@ -90,6 +130,8 @@ COPY --from=policy-builder /workspace/target/release/genpolicy-oci-compiler \
     /usr/local/bin/genpolicy-oci-compiler
 COPY --from=policy-builder /workspace/target/release/storage-predictor \
     /usr/local/bin/storage-predictor
+COPY --from=policy-builder /workspace/target/release/createreq-capture \
+    /usr/local/bin/createreq-capture
 COPY src/tools/genpolicy/appliance /opt/genpolicy/appliance
 COPY src/tools/genpolicy/rules.rego /opt/genpolicy/policy/rules.rego
 COPY src/tools/genpolicy/genpolicy-settings.json /opt/genpolicy/policy/settings/genpolicy-settings.json

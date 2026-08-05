@@ -26,7 +26,7 @@ class TagOciTests(unittest.TestCase):
         )
         transformed = MODULE.replace_string(
             value,
-            ["process", "env", "0"],
+            ["oci", "process", "env", "0"],
             "tagged/test.json",
             [
                 {
@@ -44,7 +44,7 @@ class TagOciTests(unittest.TestCase):
 
         service = MODULE.replace_string(
             "KUBERNETES_SERVICE_HOST=10.96.0.1",
-            ["process", "env", "1"],
+            ["oci", "process", "env", "1"],
             "tagged/test.json",
             [],
             occurrences,
@@ -79,7 +79,7 @@ class TagOciTests(unittest.TestCase):
 
         MODULE.replace_string(
             "KUBERNETES_PORT=tcp://10.96.0.1:443",
-            ["process", "env", "2"],
+            ["oci", "process", "env", "2"],
             "tagged/test.json",
             [],
             occurrences,
@@ -90,29 +90,30 @@ class TagOciTests(unittest.TestCase):
             definitions["service-env.KUBERNETES_PORT"]["suggested_regex"],
         )
 
-    def test_main_writes_tagged_spec_and_manifest(self):
+    def test_main_writes_tagged_request_and_request_rooted_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             raw = root / "raw"
             tagged = root / "tagged"
             raw.mkdir()
-            (raw / "0001-id.config.json").write_text(
+            (raw / "0001-id.json").write_text(
                 json.dumps(
                     {
-                        "annotations": {
-                            "io.kubernetes.cri.sandbox-uid": (
-                                "11111111-1111-4111-8111-111111111111"
-                            )
-                        },
-                        "process": {
-                            "env": ["KUBERNETES_SERVICE_PORT=443"]
+                        "container_id": "a" * 64,
+                        "storages": [{"source": "a" * 64}],
+                        "oci": {
+                            "annotations": {
+                                "io.kubernetes.cri.sandbox-uid": (
+                                    "11111111-1111-4111-8111-111111111111"
+                                )
+                            },
+                            "process": {
+                                "env": ["KUBERNETES_SERVICE_PORT=443"]
+                            },
                         },
                     }
                 ),
                 encoding="utf-8",
-            )
-            (raw / "0001-id.meta.json").write_text(
-                json.dumps({"container_id": "a" * 64}), encoding="utf-8"
             )
             dynamic = root / "dynamic.json"
             dynamic.write_text("[]", encoding="utf-8")
@@ -122,7 +123,7 @@ class TagOciTests(unittest.TestCase):
             try:
                 sys.argv = [
                     "tag_oci.py",
-                    "--raw-dir",
+                    "--raw-requests-dir",
                     str(raw),
                     "--dynamic-values",
                     str(dynamic),
@@ -135,7 +136,11 @@ class TagOciTests(unittest.TestCase):
             finally:
                 sys.argv = original_argv
 
-            output = (tagged / "0001-id.tagged.json").read_text(encoding="utf-8")
+            output_path = tagged / "0001-id.tagged.json"
+            output = output_path.read_text(encoding="utf-8")
+            tagged_request = json.loads(output)
+            self.assertIn("oci", tagged_request)
+            self.assertIn("storages", tagged_request)
             self.assertIn("{{GENPOLICY_DYNAMIC:pod.uid}}", output)
             self.assertIn(
                 "{{GENPOLICY_DYNAMIC:service-env.KUBERNETES_SERVICE_PORT}}",
@@ -143,6 +148,15 @@ class TagOciTests(unittest.TestCase):
             )
             tags = json.loads(manifest.read_text(encoding="utf-8"))["tags"]
             self.assertTrue(any(item["tag"] == "pod.uid" for item in tags))
+            service_tag = next(
+                item
+                for item in tags
+                if item["tag"] == "service-env.KUBERNETES_SERVICE_PORT"
+            )
+            self.assertEqual(
+                service_tag["occurrences"][0]["json_pointer"],
+                "/oci/process/env/0",
+            )
 
     def test_termination_log_id_is_tagged(self):
         from collections import defaultdict
@@ -151,7 +165,7 @@ class TagOciTests(unittest.TestCase):
         definitions = {}
         transformed = MODULE.replace_string(
             "/var/lib/kubelet/pods/uid/containers/workload/7f627291",
-            ["mounts", "7", "source"],
+            ["oci", "mounts", "7", "source"],
             "tagged/test.json",
             [],
             occurrences,
@@ -172,7 +186,7 @@ class TagOciTests(unittest.TestCase):
         definitions = {}
         transformed = MODULE.replace_string(
             "/var/run/netns/cni-11111111-2222-3333-4444-555555555555",
-            ["annotations", "nerdctl/network-namespace"],
+            ["oci", "annotations", "nerdctl/network-namespace"],
             "tagged/test.json",
             [],
             occurrences,
@@ -191,7 +205,7 @@ class TagOciTests(unittest.TestCase):
         definitions = {}
         service = MODULE.replace_string(
             "BACKEND_SERVICE_HOST=10.96.0.12",
-            ["process", "env", "0"],
+            ["oci", "process", "env", "0"],
             "tagged/test.json",
             [],
             occurrences,
@@ -200,7 +214,7 @@ class TagOciTests(unittest.TestCase):
         )
         network_namespace = MODULE.replace_string(
             "/var/run/netns/cni-11111111-2222-3333-4444-555555555555",
-            ["annotations", "nerdctl/network-namespace"],
+            ["oci", "annotations", "nerdctl/network-namespace"],
             "tagged/test.json",
             [],
             occurrences,

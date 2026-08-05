@@ -10,6 +10,7 @@ extern crate slog;
 logging::logger_with_subsystem!(sl, "virt-container");
 
 mod container_manager;
+pub use container_manager::VirtContainerManager;
 pub mod factory;
 pub mod health_check;
 pub mod sandbox;

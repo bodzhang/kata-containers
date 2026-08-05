@@ -13,7 +13,7 @@ readonly workload="${input_dir}/workload.yaml"
 # shellcheck source=/dev/null
 source "${appliance_root}/profile.env"
 
-mkdir -p "${output_dir}/raw" "${output_dir}/tagged" "${output_dir}/logs"
+mkdir -p "${output_dir}/raw" "${output_dir}/logs"
 
 pids=()
 cleanup() {
@@ -263,11 +263,36 @@ captures=$(find "${output_dir}/raw" -type f -name '*.config.json' | wc -l)
 [[ "${captures}" -eq "${expected_captures}" ]] ||
 	fail "expected ${expected_captures} OCI captures, found ${captures}"
 
-python3 "${appliance_root}/scripts/tag_oci.py" \
-	--raw-dir "${output_dir}/raw" \
-	--dynamic-values "${output_dir}/dynamic-values.json" \
-	--output-dir "${output_dir}/tagged" \
-	--manifest "${output_dir}/dynamic-tags.json"
+# In-appliance generation of the rootfs integrity pins from the digest-pinned
+# images: real erofs dm-verity root hashes (block mode) and the guest-pull
+# manifest digest. Uses a bundled containerd >= 2.2 erofs snapshotter, so it is
+# opt-in and requires the erofs kernel module, dm-verity, loop, and
+# erofs-utils >= 1.8.2 (see README Prerequisites). The two rootfs modes are
+# mutually exclusive: emit block rootfs-mounts only for erofs dm-verity;
+# guest-pull records digests only (emitting block mounts would replace the
+# guest-pull VirtualVolume). Populates GENPOLICY_ROOTFS_MOUNTS_DIR, which the
+# capture stage below consumes. Best-effort.
+if [[ "${GENPOLICY_BUILD_EROFS_DMVERITY:-0}" == "1" || "${GENPOLICY_GUEST_PULL:-0}" == "1" ]]; then
+	if [[ "${GENPOLICY_BUILD_EROFS_DMVERITY:-0}" == "1" ]]; then
+		erofs_mode="erofs-dmverity"
+		: "${GENPOLICY_ROOTFS_MOUNTS_DIR:=${output_dir}/erofs-mounts}"
+		mkdir -p "${GENPOLICY_ROOTFS_MOUNTS_DIR}"
+		export GENPOLICY_ROOTFS_MOUNTS_DIR
+	else
+		erofs_mode="guest-pull"
+	fi
+	python3 "${appliance_root}/scripts/prepare_erofs_dmverity.py" \
+		--raw-dir "${output_dir}/raw" \
+		--out-dir "${GENPOLICY_ROOTFS_MOUNTS_DIR:-${output_dir}/erofs-mounts}" \
+		--manifest-digests "${output_dir}/manifest-digests.json" \
+		--mode "${erofs_mode}" \
+		--containerd "${GENPOLICY_EROFS_CONTAINERD:-/opt/genpolicy/erofs/bin/containerd}" \
+		--ctr "${GENPOLICY_EROFS_CTR:-/opt/genpolicy/erofs/bin/ctr}" \
+		--work-root "${output_dir}/erofs-prep" \
+		--report "${output_dir}/erofs-prep-report.json" \
+		>"${output_dir}/logs/erofs-prep.log" 2>&1 ||
+		echo "erofs dm-verity prep failed; see logs/erofs-prep.log" >&2
+fi
 
 # Capture the Kata container rootfs_mounts (e.g. multi-layer erofs) that a
 # snapshotter would hand to the Kata shim. The appliance runs runc/overlayfs, so
@@ -283,12 +308,15 @@ if [[ -n "${GENPOLICY_ROOTFS_MOUNTS_DIR:-}" && -d "${GENPOLICY_ROOTFS_MOUNTS_DIR
 		echo "rootfs-mounts capture failed; see logs/rootfs-capture.log" >&2
 fi
 
+# Request capture needs the deployment's shim configuration and is mandatory,
+# so reject an incomplete invocation before running audit-only prediction.
+[[ -n "${GENPOLICY_KATA_CONFIG:-}" && -f "${GENPOLICY_KATA_CONFIG}" ]] ||
+	fail "GENPOLICY_KATA_CONFIG must name a readable Kata configuration"
+
 # Predict Kata agent storages/devices from the captured OCI specs using the real
-# runtime-rs volume handlers driven by a dry-run hypervisor (no VM). The EROFS
-# dm-verity root hashes and guest-pull image references drive policy generation
-# below; the rest is audit-only. Best-effort; the mount-type rewriting inspects
-# live host mount state, so this must run while the workload volumes are still
-# mounted.
+# runtime-rs volume handlers driven by a dry-run hypervisor (no VM). This report
+# is audit-only. Best-effort; mount-type rewriting inspects live host mount state,
+# so this must run while workload volumes are still mounted.
 guest_pull_arg=()
 [[ "${GENPOLICY_GUEST_PULL:-0}" == "1" ]] && guest_pull_arg=(--guest-pull)
 python3 "${appliance_root}/scripts/predict_storages.py" \
@@ -302,11 +330,42 @@ python3 "${appliance_root}/scripts/predict_storages.py" \
 	2>"${output_dir}/logs/storage-predictor.log" ||
 	echo "storage prediction failed; see logs/storage-predictor.log" >&2
 
-# Feed the predicted EROFS dm-verity root hashes into policy generation. The
-# predicted-storages file is best-effort, so pass it only when present.
-predicted_arg=()
-[[ -f "${output_dir}/storages-devices-predicted.json" ]] &&
-	predicted_arg=(--predicted-storages "${output_dir}/storages-devices-predicted.json")
+# Capture the authoritative agent CreateContainerRequest by driving the real
+# runtime-rs shim container-create path with a dry-run hypervisor and recording
+# agent (no VM). The runc OCI captures are only inputs to this stage; the policy
+# compiler consumes the resulting requests.
+mkdir -p "${output_dir}/createcontainer-requests"
+direct_vol_arg=()
+[[ -n "${GENPOLICY_DIRECT_VOLUME_MOUNTS:-}" && -f "${GENPOLICY_DIRECT_VOLUME_MOUNTS}" ]] &&
+	direct_vol_arg=(--direct-volume-mounts "${GENPOLICY_DIRECT_VOLUME_MOUNTS}")
+for spec in "${output_dir}"/raw/*.config.json; do
+	name="$(basename "${spec}" .config.json)"
+	meta="${spec%.config.json}.meta.json"
+	cid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["container_id"])' "${meta}")"
+	bundle="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("bundle",""))' "${meta}")"
+	rootfs_mounts_arg=()
+	[[ -f "${output_dir}/raw/${name}.rootfs-mounts.json" ]] &&
+		rootfs_mounts_arg=(--rootfs-mounts "${output_dir}/raw/${name}.rootfs-mounts.json")
+	/usr/local/bin/createreq-capture \
+		--container-id "${cid}" \
+		--bundle "${bundle:-/tmp/${cid}}" \
+		--spec "${spec}" \
+		--kata-config "${GENPOLICY_KATA_CONFIG}" \
+		"${rootfs_mounts_arg[@]}" \
+		"${direct_vol_arg[@]}" \
+		--output "${output_dir}/createcontainer-requests/${name}.json" \
+		2>>"${output_dir}/logs/createreq-capture.log" ||
+		fail "createreq-capture failed for ${name}; see logs/createreq-capture.log"
+done
+request_captures=$(find "${output_dir}/createcontainer-requests" -type f -name '*.json' | wc -l)
+[[ "${request_captures}" -eq "${expected_captures}" ]] ||
+	fail "expected ${expected_captures} CreateContainerRequest captures, found ${request_captures}"
+
+python3 "${appliance_root}/scripts/tag_oci.py" \
+	--raw-requests-dir "${output_dir}/createcontainer-requests" \
+	--dynamic-values "${output_dir}/dynamic-values.json" \
+	--output-dir "${output_dir}/tagged-requests" \
+	--manifest "${output_dir}/dynamic-tags.json"
 
 # Opt-in coverage gate: refuse to generate a policy that would fail closed on an
 # unsupported volume storage class (STRICT_STORAGE_COVERAGE=1).
@@ -315,8 +374,8 @@ coverage_arg=()
 	coverage_arg=(--strict-storage-coverage true)
 
 genpolicy-oci-compiler \
-	--raw-dir "${output_dir}/raw" \
-	--tagged-dir "${output_dir}/tagged" \
+	--raw-requests-dir "${output_dir}/createcontainer-requests" \
+	--tagged-requests-dir "${output_dir}/tagged-requests" \
 	--tag-manifest "${output_dir}/dynamic-tags.json" \
 	--rules /opt/genpolicy/policy/rules.rego \
 	--settings /opt/genpolicy/policy/settings \
@@ -325,20 +384,19 @@ genpolicy-oci-compiler \
 	--diff-output "${output_dir}/policy-oci-diff.json" \
 	--annotation-output "${output_dir}/policy-annotation.txt" \
 	--annotated-yaml-output "${output_dir}/workload-policy.yaml" \
-	"${predicted_arg[@]}" \
 	"${coverage_arg[@]}"
 
 if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
 	python3 "${appliance_root}/scripts/tag_oci.py" \
-		--raw-dir "${output_dir}/raw" \
+		--raw-requests-dir "${output_dir}/createcontainer-requests" \
 		--dynamic-values "${output_dir}/dynamic-values.json" \
-		--output-dir "${output_dir}/tagged-balanced" \
+		--output-dir "${output_dir}/tagged-requests-balanced" \
 		--manifest "${output_dir}/dynamic-tags-balanced.json" \
 		--regex-policy-mode balanced
 
 	genpolicy-oci-compiler \
-		--raw-dir "${output_dir}/raw" \
-		--tagged-dir "${output_dir}/tagged-balanced" \
+		--raw-requests-dir "${output_dir}/createcontainer-requests" \
+		--tagged-requests-dir "${output_dir}/tagged-requests-balanced" \
 		--tag-manifest "${output_dir}/dynamic-tags-balanced.json" \
 		--rules /opt/genpolicy/policy/rules.rego \
 		--settings /opt/genpolicy/policy/settings \
@@ -348,7 +406,6 @@ if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
 		--annotation-output "${output_dir}/policy-annotation-balanced.txt" \
 		--annotated-yaml-output "${output_dir}/workload-policy-balanced.yaml" \
 		--regex-policy-mode balanced \
-		"${predicted_arg[@]}" \
 		"${coverage_arg[@]}"
 fi
 
@@ -383,6 +440,7 @@ provenance_artifacts=(
 	--artifact "runc=/usr/local/bin/runc.real"
 	--artifact "genpolicy-oci-compiler=/usr/local/bin/genpolicy-oci-compiler"
 	--artifact "storage-predictor=/usr/local/bin/storage-predictor"
+	--artifact "createreq-capture=/usr/local/bin/createreq-capture"
 	--artifact "containerd-config=/etc/containerd/config.toml"
 	--artifact "kubelet-config=/etc/kubernetes/kubelet.yaml"
 	--artifact "cni-config=/etc/cni/net.d/10-genpolicy.conflist"
@@ -425,10 +483,10 @@ python3 "${appliance_root}/scripts/write_provenance.py" \
 	--profile "${appliance_root}/profile.env" \
 	--input "${workload}" \
 	--tag-manifest "${output_dir}/dynamic-tags.json" \
-	--raw-dir "${output_dir}/raw" \
-	--tagged-dir "${output_dir}/tagged" \
+	--raw-dir "${output_dir}/createcontainer-requests" \
+	--tagged-dir "${output_dir}/tagged-requests" \
 	--output "${output_dir}/provenance.json" \
 	"${provenance_generated[@]}" \
 	"${provenance_artifacts[@]}"
 
-echo "Generated ${captures} tagged OCI specifications and OCI-derived ${output_dir}/policy.rego"
+echo "Generated ${request_captures} tagged CreateContainerRequests and ${output_dir}/policy.rego"
