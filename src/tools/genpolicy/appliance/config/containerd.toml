@@ -1,34 +1,51 @@
-version = 2
+version = 4
 root = "/var/lib/containerd"
 state = "/run/containerd"
 
 [grpc]
   address = "/run/containerd/containerd.sock"
 
-[plugins."io.containerd.grpc.v1.cri"]
-  sandbox_image = "genpolicy.local:5000/pause:3.10"
+[plugins."io.containerd.transfer.v1.local"]
+  [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+    platform = "linux/amd64"
+    snapshotter = "native"
+    differ = "walking"
 
-  [plugins."io.containerd.grpc.v1.cri".registry]
-    config_path = "/etc/containerd/certs.d"
+[plugins."io.containerd.cri.v1.images"]
+  snapshotter = "native"
 
-  [plugins."io.containerd.grpc.v1.cri".cni]
-    bin_dir = "/opt/cni/bin"
-    conf_dir = "/etc/cni/net.d"
-
-  [plugins."io.containerd.grpc.v1.cri".containerd]
-    default_runtime_name = "runc"
+  [plugins."io.containerd.cri.v1.images".runtime_platforms.runc]
+    platform = "linux/amd64"
     snapshotter = "native"
 
-    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+  [plugins."io.containerd.cri.v1.images".runtime_platforms.kata]
+    platform = "linux/amd64"
+    snapshotter = "native"
+
+  [plugins."io.containerd.cri.v1.images".pinned_images]
+    sandbox = "genpolicy.local:5000/pause:3.10"
+
+  [plugins."io.containerd.cri.v1.images".registry]
+    config_path = "/etc/containerd/certs.d"
+
+[plugins."io.containerd.cri.v1.runtime"]
+  [plugins."io.containerd.cri.v1.runtime".cni]
+    bin_dirs = ["/opt/cni/bin"]
+    conf_dir = "/etc/cni/net.d"
+
+  [plugins."io.containerd.cri.v1.runtime".containerd]
+    default_runtime_name = "runc"
+
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]
       runtime_type = "io.containerd.runc.v2"
 
-      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+      [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
         BinaryName = "/usr/local/bin/runc-capture"
         SystemdCgroup = false
 
-    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata]
       runtime_type = "io.containerd.runc.v2"
 
-      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata.options]
+      [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata.options]
         BinaryName = "/usr/local/bin/runc-capture"
         SystemdCgroup = false

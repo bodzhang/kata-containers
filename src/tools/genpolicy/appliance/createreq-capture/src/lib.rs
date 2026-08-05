@@ -126,9 +126,9 @@ struct ExecProcessRequestDump {
     container_id: String,
     exec_id: String,
     process: Option<oci::Process>,
-    stdin_port: Option<u32>,
-    stdout_port: Option<u32>,
-    stderr_port: Option<u32>,
+    stdin_port: u32,
+    stdout_port: u32,
+    stderr_port: u32,
 }
 
 pub fn serialize_create_request(request: &CreateContainerRequest) -> serde_json::Result<String> {
@@ -151,14 +151,29 @@ pub fn serialize_create_request(request: &CreateContainerRequest) -> serde_json:
     serde_json::to_string_pretty(&dump)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_stream_ports_use_protobuf_defaults() {
+        let serialized = serialize_exec_request(&ExecProcessRequest::default()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(value["stdin_port"], 0);
+        assert_eq!(value["stdout_port"], 0);
+        assert_eq!(value["stderr_port"], 0);
+    }
+}
+
 pub fn serialize_exec_request(request: &ExecProcessRequest) -> serde_json::Result<String> {
     let dump = ExecProcessRequestDump {
         container_id: request.process_id.container_id.container_id.clone(),
         exec_id: request.process_id.exec_id.clone(),
         process: request.process.clone(),
-        stdin_port: request.stdin_port,
-        stdout_port: request.stdout_port,
-        stderr_port: request.stderr_port,
+        stdin_port: request.stdin_port.unwrap_or_default(),
+        stdout_port: request.stdout_port.unwrap_or_default(),
+        stderr_port: request.stderr_port.unwrap_or_default(),
     };
     serde_json::to_string_pretty(&dump)
 }

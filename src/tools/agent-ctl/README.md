@@ -367,6 +367,33 @@ $ cargo run -- -l trace connect --no-auto-values --bundle-dir "${bundle_dir}" --
 > must include an OCI configuration file specification in (quoted)
 > JSON format.
 
+#### Replay a captured GenPolicy appliance request
+
+`CreateContainerRaw` accepts the JSON files written under the appliance
+`createcontainer-requests` output directory. It converts the captured OCI spec,
+storages, devices, shared mounts, process IDs, and I/O ports to the Agent API
+request without pulling an image or synthesizing a new OCI spec.
+
+Load the generated policy before replaying its requests. Use
+`--no-auto-values` so `ExecProcess` also keeps the captured IDs and process:
+
+```bash
+$ sudo kata-agent-ctl -l debug connect --no-auto-values true \
+   --server-address "${server_addr}" \
+   -c "SetPolicy json://{\"policy_file\":\"${output}/policy.rego\"}" \
+      "CreateContainerRaw file://${output}/createcontainer-requests/<capture>.json" \
+      "ExecProcess file://${output}/execprocess-requests/<capture>.json"
+```
+
+Replay the create captures in filename order, with the sandbox request before
+its containers. Replace each `<capture>` with the appliance-generated filename;
+omit `ExecProcess` when the output has no captured exec request.
+
+The Agent evaluates each request against the installed policy before executing
+it. A policy incompatibility is reported as `PERMISSION_DENIED`; a later mount,
+storage, or container error means policy evaluation passed but the replay
+environment does not provide the captured guest resources.
+
 #### Delete a sandbox manually
 
 ```bash

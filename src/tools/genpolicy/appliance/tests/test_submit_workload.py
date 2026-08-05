@@ -32,8 +32,22 @@ class SubmitWorkloadTests(unittest.TestCase):
         self.assertTrue(generated)
         self.assertEqual(pod["metadata"]["namespace"], "test")
         self.assertEqual(pod["metadata"]["labels"], {"app": "web"})
-        self.assertTrue(pod["metadata"]["generateName"].startswith("gp-deployment-web-"))
+        self.assertEqual(pod["metadata"]["generateName"], "web-bcdfghjklm-")
         self.assertEqual(pod["spec"]["nodeName"], "genpolicy-node")
+
+    def test_controller_pod_names_follow_kubernetes_shapes(self):
+        self.assertEqual(
+            MODULE.controller_pod_metadata("CronJob", "nightly"),
+            ({"generateName": "nightly-0-"}, True),
+        )
+        self.assertEqual(
+            MODULE.controller_pod_metadata("DaemonSet", "node-agent"),
+            ({"generateName": "node-agent-"}, True),
+        )
+        self.assertEqual(
+            MODULE.controller_pod_metadata("StatefulSet", "database"),
+            ({"name": "database-0"}, False),
+        )
 
     def test_image_references_must_be_digest_pinned(self):
         import tempfile

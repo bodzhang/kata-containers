@@ -293,8 +293,8 @@ if [[ "${GENPOLICY_BUILD_EROFS_DMVERITY:-0}" == "1" || "${GENPOLICY_GUEST_PULL:-
 		--out-dir "${GENPOLICY_ROOTFS_MOUNTS_DIR:-${output_dir}/erofs-mounts}" \
 		--manifest-digests "${output_dir}/manifest-digests.json" \
 		--mode "${erofs_mode}" \
-		--containerd "${GENPOLICY_EROFS_CONTAINERD:-/opt/genpolicy/erofs/bin/containerd}" \
-		--ctr "${GENPOLICY_EROFS_CTR:-/opt/genpolicy/erofs/bin/ctr}" \
+		--containerd "${GENPOLICY_EROFS_CONTAINERD:-/usr/local/bin/containerd}" \
+		--ctr "${GENPOLICY_EROFS_CTR:-/usr/local/bin/ctr}" \
 		--work-root "${output_dir}/erofs-prep" \
 		--report "${output_dir}/erofs-prep-report.json" \
 		>"${output_dir}/logs/erofs-prep.log" 2>&1 ||

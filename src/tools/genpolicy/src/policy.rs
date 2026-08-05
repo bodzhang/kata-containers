@@ -198,6 +198,10 @@ pub struct KataLinux {
     /// Sysctls contains sysctls to be applied inside the container.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub Sysctl: BTreeMap<String, String>,
+
+    /// Seccomp contains the seccomp profile applied to the container.
+    #[serde(default)]
+    pub Seccomp: Option<protocols::oci::LinuxSeccomp>,
 }
 
 /// OCI container LinuxNamespace struct. This struct is similar to the LinuxNamespace

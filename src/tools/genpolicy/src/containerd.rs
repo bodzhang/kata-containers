@@ -156,6 +156,7 @@ pub fn get_linux(privileged_container: bool) -> policy::KataLinux {
             ],
             Devices: vec![],
             Sysctl: BTreeMap::new(),
+            Seccomp: None,
         }
     } else {
         policy::KataLinux {
@@ -164,6 +165,7 @@ pub fn get_linux(privileged_container: bool) -> policy::KataLinux {
             ReadonlyPaths: vec![],
             Devices: vec![],
             Sysctl: BTreeMap::new(),
+            Seccomp: None,
         }
     }
 }

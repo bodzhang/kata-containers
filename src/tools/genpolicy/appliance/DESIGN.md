@@ -5,14 +5,14 @@
 Initial compatibility profile:
 
 - Kubernetes API server and kubelet: `v1.33.13`
-- containerd: `v1.7.29`
+- containerd: `v2.3.3`
 - runc: `v1.2.8`
 - etcd: `v3.5.21`
 - CNI plugins: `v1.7.1`
 - pause image: `genpolicy.local:5000/pause:3.10`, populated from the pinned
   `registry.k8s.io/pause:3.10` build input
 
-The profile follows the Kubernetes 1.33 API line and containerd 1.7 runtime
+The profile follows the Kubernetes 1.33 API line and containerd 2.3 runtime
 assumptions currently present in this repository. It is intentionally immutable:
 changing any component version creates a new profile and image tag.
 
@@ -462,6 +462,8 @@ Podman is available. It verifies that:
 - at least the sandbox and workload OCI specs are captured;
 - dynamic values are replaced by markers;
 - provenance and tag manifests are emitted.
+- the generated policy authorizes every captured create and exec request through
+  the real Agent RPC and policy-state path in policy-only test mode.
 
 The end-to-end test must run inside a disposable VM.
 

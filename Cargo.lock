@@ -2505,6 +2505,7 @@ dependencies = [
  "anyhow",
  "genpolicy",
  "kata-types",
+ "oci-spec 0.10.0",
  "protobuf",
  "protocols",
  "regex",

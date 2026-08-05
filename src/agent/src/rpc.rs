@@ -922,6 +922,10 @@ impl agent_ttrpc::AgentService for AgentService {
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "create_container", req);
         is_allowed(&req).await?;
+        #[cfg(feature = "agent-policy")]
+        if AGENT_CONFIG.policy_only {
+            return Ok(Empty::new());
+        }
         self.do_create_container(req).await.map_ttrpc_err(same)?;
         Ok(Empty::new())
     }
@@ -955,6 +959,10 @@ impl agent_ttrpc::AgentService for AgentService {
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "exec_process", req);
         is_allowed(&req).await?;
+        #[cfg(feature = "agent-policy")]
+        if AGENT_CONFIG.policy_only {
+            return Ok(Empty::new());
+        }
         self.do_exec_process(req).await.map_ttrpc_err(same)?;
         Ok(Empty::new())
     }

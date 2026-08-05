@@ -80,6 +80,8 @@ const TRACING_ENV_VAR: &str = "KATA_AGENT_TRACING";
 // Policy file environment variable to pass a policy document
 // to initialize agent policy engine.
 const POLICY_FILE_VAR: &str = "KATA_AGENT_POLICY_FILE";
+#[cfg(feature = "agent-policy")]
+const POLICY_ONLY_VAR: &str = "KATA_AGENT_POLICY_ONLY";
 
 const ERR_INVALID_LOG_LEVEL: &str = "invalid log level";
 const ERR_INVALID_LOG_LEVEL_PARAM: &str = "invalid log level parameter";
@@ -150,6 +152,8 @@ pub struct AgentConfig {
     pub secure_storage_integrity: bool,
     #[cfg(feature = "agent-policy")]
     pub policy_file: String,
+    #[cfg(feature = "agent-policy")]
+    pub policy_only: bool,
     pub mem_agent: Option<MemAgentConfig>,
 }
 
@@ -281,6 +285,8 @@ impl Default for AgentConfig {
             secure_storage_integrity: true,
             #[cfg(feature = "agent-policy")]
             policy_file: String::from(""),
+            #[cfg(feature = "agent-policy")]
+            policy_only: false,
             mem_agent: None,
         }
     }
@@ -703,6 +709,12 @@ impl AgentConfig {
         if let Ok(policy_file) = env::var(POLICY_FILE_VAR) {
             self.policy_file = policy_file;
         }
+
+        #[cfg(feature = "agent-policy")]
+        if let Ok(value) = env::var(POLICY_ONLY_VAR) {
+            let name_value = format!("{POLICY_ONLY_VAR}={value}");
+            self.policy_only = get_bool_value(&name_value).unwrap_or(false);
+        }
     }
 }
 
@@ -917,6 +929,8 @@ mod tests {
             secure_storage_integrity: bool,
             #[cfg(feature = "agent-policy")]
             policy_file: &'a str,
+            #[cfg(feature = "agent-policy")]
+            policy_only: bool,
             mem_agent: Option<MemAgentConfig>,
         }
 
@@ -941,6 +955,8 @@ mod tests {
                     secure_storage_integrity: true,
                     #[cfg(feature = "agent-policy")]
                     policy_file: "",
+                    #[cfg(feature = "agent-policy")]
+                    policy_only: false,
                     mem_agent: None,
                 }
             }
@@ -1134,6 +1150,13 @@ mod tests {
                 contents: "",
                 env_vars: vec!["KATA_AGENT_SERVER_ADDR=foo"],
                 server_addr: "foo",
+                ..Default::default()
+            },
+            #[cfg(feature = "agent-policy")]
+            TestData {
+                contents: "",
+                env_vars: vec!["KATA_AGENT_POLICY_ONLY=true"],
+                policy_only: true,
                 ..Default::default()
             },
             TestData {
@@ -1508,6 +1531,8 @@ mod tests {
             assert_eq!(d.hotplug_timeout, config.hotplug_timeout, "{msg}");
             assert_eq!(d.container_pipe_size, config.container_pipe_size, "{msg}");
             assert_eq!(d.server_addr, config.server_addr, "{msg}");
+            #[cfg(feature = "agent-policy")]
+            assert_eq!(d.policy_only, config.policy_only, "{msg}");
             assert_eq!(d.tracing, config.tracing, "{msg}");
             assert_eq!(d.https_proxy, config.https_proxy, "{msg}");
             assert_eq!(d.no_proxy, config.no_proxy, "{msg}");

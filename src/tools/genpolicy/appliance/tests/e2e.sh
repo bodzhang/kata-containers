@@ -9,6 +9,8 @@ appliance_dir=$(cd "${script_dir}/.." && pwd)
 engine="${CONTAINER_ENGINE:?CONTAINER_ENGINE is required}"
 image="${IMAGE:?IMAGE is required}"
 reference_image="${REFERENCE_IMAGE:?REFERENCE_IMAGE is required}"
+agent_ctl="${AGENT_CTL:?AGENT_CTL is required}"
+kata_agent="${KATA_AGENT:?KATA_AGENT is required}"
 temporary=$(mktemp -d)
 trap 'rm -rf "${temporary}"' EXIT
 
@@ -93,18 +95,18 @@ assert (
     ]
 )
 assert "{{GENPOLICY_DYNAMIC:" not in json.dumps(final)
-expected_guest_pull_images = {
-    "sandbox": ["pause"],
-    "workload": ["genpolicy.local:5000/busybox:1.36.1"],
-    "sidecar": ["genpolicy.local:5000/busybox:1.36.1"],
-}
 for container in final_data["containers"]:
     annotations = container["OCI"]["Annotations"]
     identity = annotations.get("io.kubernetes.cri.container-name", "sandbox")
     assert len(container["storages"]) == 1
     marker = container["storages"][0]
     assert marker["driver"] == "guest-pull-images"
-    assert marker["options"] == expected_guest_pull_images[identity]
+    expected_image = (
+        "pause"
+        if identity == "sandbox"
+        else annotations["io.kubernetes.cri.image-name"]
+    )
+    assert marker["options"] == [expected_image]
 assert final_data["sandbox"]["storages"]
 pause = next(
     container
@@ -113,7 +115,7 @@ pause = next(
         "io.kubernetes.cri.container-type"
     ) == "sandbox"
 )
-assert "nerdctl/network-namespace" in pause["OCI"]["Annotations"]
+assert "nerdctl/network-namespace" not in pause["OCI"]["Annotations"]
 assert pause["OCI"]["Annotations"]["io.kubernetes.cri.sandbox-log-directory"].startswith(
     "^/var/log/pods/$(sandbox-namespace)_$(sandbox-name)_"
 )
@@ -146,7 +148,7 @@ assert balanced["service_endpoint_regex_count"] == 0
 assert balanced["identity_or_partition_regex_count"] == 0
 assert balanced["exact_service_env_count"] > 0
 assert balanced["termination_path_patterns"] == ["^/dev/termination\\-log$"]
-assert balanced["network_namespace_patterns"]
+assert balanced["network_namespace_patterns"] == []
 assert (
     balanced_workload["OCI"]["Annotations"]["io.kubernetes.cri.sandbox-name"]
     == legacy_reference_workload["OCI"]["Annotations"][
@@ -172,5 +174,8 @@ assert "/var/run/secrets/kubernetes.io/serviceaccount" in (
     workload_comparison["mount_destinations_only_in_reference"]
 )
 PY
+
+KATA_AGENT="${kata_agent}" AGENT_CTL="${agent_ctl}" \
+    "${script_dir}/policy-runtime-e2e.sh" "${temporary}/output"
 
 echo "appliance end-to-end validation passed"

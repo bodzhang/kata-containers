@@ -22,11 +22,10 @@ done
 
 grep -Fq "ARG KUBERNETES_VERSION=${KUBERNETES_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "ARG CONTAINERD_VERSION=${CONTAINERD_VERSION}" "${appliance_dir}/Dockerfile"
-grep -Fq "ARG EROFS_CONTAINERD_VERSION=${EROFS_CONTAINERD_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "ARG RUNC_VERSION=${RUNC_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "ARG ETCD_VERSION=${ETCD_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "ARG CNI_PLUGINS_VERSION=${CNI_PLUGINS_VERSION}" "${appliance_dir}/Dockerfile"
-grep -Fq "sandbox_image = \"${PAUSE_IMAGE}\"" "${appliance_dir}/config/containerd.toml"
+grep -Fq "sandbox = \"${PAUSE_IMAGE}\"" "${appliance_dir}/config/containerd.toml"
 
 # Rego policy-rule tests (EROFS dm-verity storage pinning, volume-storage
 # injection). Requires `opa`. Each test file declares its own package-level

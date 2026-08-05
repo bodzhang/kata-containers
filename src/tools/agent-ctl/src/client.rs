@@ -151,6 +151,11 @@ static AGENT_CMDS: &[AgentCmd] = &[
         fp: agent_cmd_container_create,
     },
     AgentCmd {
+        name: "CreateContainerRaw",
+        st: ServiceType::Agent,
+        fp: agent_cmd_container_create_raw,
+    },
+    AgentCmd {
         name: "CreateSandbox",
         st: ServiceType::Agent,
         fp: agent_cmd_sandbox_create,
@@ -1105,6 +1110,28 @@ fn agent_cmd_container_create(
     Ok(())
 }
 
+fn agent_cmd_container_create_raw(
+    ctx: &Context,
+    client: &AgentServiceClient,
+    _health: &HealthClient,
+    _options: &mut Options,
+    args: &str,
+) -> Result<()> {
+    let req = utils::make_captured_create_container_request(args)?;
+    let ctx = clone_context(ctx);
+
+    debug!(sl!(), "sending captured request"; "request" => format!("{:?}", req));
+
+    let reply = client
+        .create_container(ctx, &req)
+        .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
+
+    info!(sl!(), "response received";
+        "response" => format!("{:?}", reply));
+
+    Ok(())
+}
+
 fn agent_cmd_container_remove(
     ctx: &Context,
     client: &AgentServiceClient,
@@ -1144,7 +1171,7 @@ fn agent_cmd_container_exec(
     options: &mut Options,
     args: &str,
 ) -> Result<()> {
-    let mut req: ExecProcessRequest = utils::make_request(args)?;
+    let mut req: ExecProcessRequest = utils::make_exec_process_request(args)?;
 
     let ctx = clone_context(ctx);
 

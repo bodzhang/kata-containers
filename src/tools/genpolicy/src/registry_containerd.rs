@@ -197,6 +197,13 @@ pub async fn pull_image(
     mut client: ImageServiceClient<tonic::transport::Channel>,
 ) -> Result<()> {
     let auth = build_auth(image_ref);
+    let sandbox_config = k8s_cri::v1::PodSandboxConfig {
+        annotations: HashMap::from([(
+            "io.containerd.cri.runtime-handler".to_string(),
+            "runc".to_string(),
+        )]),
+        ..Default::default()
+    };
 
     debug!("cri auth: {:?}", auth);
 
@@ -206,7 +213,7 @@ pub async fn pull_image(
             annotations: HashMap::new(),
         }),
         auth,
-        sandbox_config: None,
+        sandbox_config: Some(sandbox_config),
     };
 
     client.pull_image(req).await?;

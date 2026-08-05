@@ -57,11 +57,23 @@ def nested(value: dict, path: tuple[str, ...]) -> dict:
     return current
 
 
-def safe_prefix(kind: str, name: str) -> str:
-    raw = f"gp-{kind.lower()}-{name.lower()}-"
+def safe_name(name: str) -> str:
+    raw = name.lower()
     value = re.sub(r"[^a-z0-9-]+", "-", raw)
-    value = re.sub(r"-+", "-", value).strip("-") + "-"
-    return value[-58:]
+    return re.sub(r"-+", "-", value).strip("-")
+
+
+def controller_pod_metadata(kind: str, name: str) -> tuple[dict, bool]:
+    name = safe_name(name)
+    if kind == "StatefulSet":
+        return {"name": f"{name[:61]}-0"}, False
+    if kind == "Deployment":
+        prefix = f"{name}-bcdfghjklm-"
+    elif kind == "CronJob":
+        prefix = f"{name}-0-"
+    else:
+        prefix = f"{name}-"
+    return {"generateName": prefix[-58:]}, True
 
 
 def pod_from_workload(resource: dict, node_name: str) -> tuple[dict, bool]:
@@ -75,19 +87,20 @@ def pod_from_workload(resource: dict, node_name: str) -> tuple[dict, bool]:
     resource_metadata = resource.get("metadata", {})
     template_metadata = template.get("metadata") or {}
     source_name = resource_metadata.get("name", kind.lower())
+    pod_name, generated_name = controller_pod_metadata(kind, source_name)
     pod = {
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
             "annotations": template_metadata.get("annotations", {}),
-            "generateName": safe_prefix(kind, source_name),
             "labels": template_metadata.get("labels", {}),
             "namespace": resource_metadata.get("namespace", "default"),
+            **pod_name,
         },
         "spec": template["spec"],
     }
     pod["spec"]["nodeName"] = node_name
-    return pod, True
+    return pod, generated_name
 
 
 def iter_documents(path: Path):

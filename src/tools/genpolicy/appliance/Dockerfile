@@ -72,14 +72,10 @@ FROM debian:bookworm-slim AS appliance-runtime
 ARG CAPTURE_BACKEND=runtime-rs
 ARG TARGETARCH=amd64
 ARG KUBERNETES_VERSION=v1.33.13
-ARG CONTAINERD_VERSION=v1.7.29
+ARG CONTAINERD_VERSION=v2.3.3
 ARG RUNC_VERSION=v1.2.8
 ARG ETCD_VERSION=v3.5.21
 ARG CNI_PLUGINS_VERSION=v1.7.1
-# containerd >= 2.2 provides the native erofs snapshotter+differ used by the
-# opt-in in-appliance dm-verity root-hash generation (kept separate from the
-# v1.7.x above that backs runc-capture).
-ARG EROFS_CONTAINERD_VERSION=v2.3.3
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -129,14 +125,9 @@ RUN set -eux; \
         "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${TARGETARCH}-${CNI_PLUGINS_VERSION}.tgz" \
         | tar -xz -C /opt/cni/bin
 
-# containerd >= 2.2 (erofs snapshotter) + mkfs.erofs >= 1.8.2 for the opt-in
-# in-appliance dm-verity root-hash generation (prepare_erofs_dmverity.py).
-RUN set -eux; \
-    mkdir -p /opt/genpolicy/erofs/bin; \
-    curl -fsSL \
-        "https://github.com/containerd/containerd/releases/download/${EROFS_CONTAINERD_VERSION}/containerd-${EROFS_CONTAINERD_VERSION#v}-linux-${TARGETARCH}.tar.gz" \
-        | tar -xz --strip-components=1 -C /opt/genpolicy/erofs/bin \
-            "bin/containerd" "bin/ctr" "bin/containerd-shim-runc-v2"
+# mkfs.erofs >= 1.8.2 supports the opt-in in-appliance dm-verity root-hash
+# generation. The primary containerd 2.3 installation provides the EROFS
+# snapshotter and differ.
 COPY --from=erofs-utils-builder /usr/local/bin/mkfs.erofs /usr/local/bin/mkfs.erofs
 
 COPY --from=pause /pause /opt/genpolicy/rootfs/pause/pause

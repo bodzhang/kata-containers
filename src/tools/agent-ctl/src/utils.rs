@@ -9,7 +9,10 @@ use crate::vm::vm_utils;
 use anyhow::{anyhow, Result};
 use oci::{Root as ociRoot, Spec as ociSpec};
 use oci_spec::runtime as oci;
-use protocols::agent::{CopyFileRequest, CreateContainerRequest, SetPolicyRequest};
+use protocols::agent::{
+    CopyFileRequest, CreateContainerRequest, ExecProcessRequest, SetPolicyRequest,
+};
+use protocols::types::FSGroupChangePolicy;
 use protocols::oci::{
     Mount as ttrpcMount, Process as ttrpcProcess, Root as ttrpcRoot, Spec as ttrpcSpec,
 };
@@ -502,6 +505,104 @@ pub fn make_set_policy_request(input: &SetPolicyInput) -> Result<SetPolicyReques
     Ok(req)
 }
 
+pub fn make_captured_create_container_request(args: &str) -> Result<CreateContainerRequest> {
+    let input: CapturedCreateContainerRequest = make_request(args)?;
+    if input.container_id.is_empty() {
+        return Err(anyhow!("captured CreateContainer request has no container ID"));
+    }
+
+    let storages = input
+        .storages
+        .into_iter()
+        .map(|storage| {
+            let fs_group = storage
+                .fs_group
+                .map(|group| {
+                    let policy = match group.group_change_policy.as_str() {
+                        "Always" => FSGroupChangePolicy::Always,
+                        "OnRootMismatch" => FSGroupChangePolicy::OnRootMismatch,
+                        policy => return Err(anyhow!("unknown FSGroup change policy {policy:?}")),
+                    };
+                    Ok(protocols::agent::FSGroup {
+                        group_id: group.group_id,
+                        group_change_policy: policy.into(),
+                        ..Default::default()
+                    })
+                })
+                .transpose()?;
+
+            Ok(protocols::agent::Storage {
+                driver: storage.driver,
+                driver_options: storage.driver_options,
+                source: storage.source,
+                fstype: storage.fs_type,
+                fs_group: protobuf::MessageField::from_option(fs_group),
+                options: storage.options,
+                mount_point: storage.mount_point,
+                shared: storage.shared,
+                ..Default::default()
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let devices = input
+        .devices
+        .into_iter()
+        .map(|device| protocols::agent::Device {
+            id: device.id,
+            type_: device.field_type,
+            vm_path: device.vm_path,
+            container_path: device.container_path,
+            options: device.options,
+            ..Default::default()
+        })
+        .collect();
+    let shared_mounts = input
+        .shared_mounts
+        .into_iter()
+        .map(|mount| protocols::agent::SharedMount {
+            name: mount.name,
+            src_ctr: mount.src_ctr,
+            src_path: mount.src_path,
+            dst_ctr: mount.dst_ctr,
+            dst_path: mount.dst_path,
+            ..Default::default()
+        })
+        .collect();
+
+    Ok(CreateContainerRequest {
+        container_id: input.container_id,
+        exec_id: input.exec_id,
+        OCI: protobuf::MessageField::from_option(input.oci.map(Into::into)),
+        sandbox_pidns: input.sandbox_pidns,
+        storages,
+        devices,
+        shared_mounts,
+        stdin_port: input.stdin_port.unwrap_or_default(),
+        stdout_port: input.stdout_port.unwrap_or_default(),
+        stderr_port: input.stderr_port.unwrap_or_default(),
+        ..Default::default()
+    })
+}
+
+pub fn make_exec_process_request(args: &str) -> Result<ExecProcessRequest> {
+    let value: serde_json::Value = make_request(args)?;
+    if value.pointer("/process/args").is_none() {
+        return Ok(serde_json::from_value(value)?);
+    }
+
+    let input: CapturedExecProcessRequest = serde_json::from_value(value)?;
+    Ok(ExecProcessRequest {
+        container_id: input.container_id,
+        exec_id: input.exec_id,
+        process: protobuf::MessageField::from_option(input.process.map(Into::into)),
+        stdin_port: input.stdin_port.unwrap_or_default(),
+        stdout_port: input.stdout_port.unwrap_or_default(),
+        stderr_port: input.stderr_port.unwrap_or_default(),
+        ..Default::default()
+    })
+}
+
 fn fix_oci_process_args(spec: &mut ttrpcSpec, bundle: &str) -> Result<()> {
     let config_path = scoped_join(bundle, CONFIG_FILE)?;
 
@@ -581,4 +682,79 @@ pub fn remove_container_image_mount(c_id: &str, share_fs: &str) -> Result<()> {
         vm_utils::unshare_rootfs(share_fs, c_id)?;
     }
     image::remove_image_mount(c_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captured_create_request_preserves_policy_input() {
+        let input = r#"json://{
+            "container_id":"container-id",
+            "exec_id":"",
+            "sandbox_pidns":false,
+            "oci":{
+                "ociVersion":"1.0.2",
+                "annotations":{"io.kubernetes.cri.container-name":"workload"}
+            },
+            "storages":[{
+                "driver":"guest-pull-images",
+                "driver_options":[],
+                "source":"",
+                "fs_type":"",
+                "fs_group":null,
+                "options":["registry/image@sha256:digest"],
+                "mount_point":"",
+                "shared":false
+            }],
+            "devices":[],
+            "shared_mounts":[],
+            "stdin_port":null,
+            "stdout_port":null,
+            "stderr_port":null
+        }"#;
+
+        let request = make_captured_create_container_request(input).unwrap();
+
+        assert_eq!(request.container_id, "container-id");
+        assert_eq!(request.storages.len(), 1);
+        assert_eq!(request.storages[0].driver, "guest-pull-images");
+        assert_eq!(
+            request.storages[0].options,
+            ["registry/image@sha256:digest"]
+        );
+        assert_eq!(
+            request.OCI.Annotations["io.kubernetes.cri.container-name"],
+            "workload"
+        );
+    }
+
+    #[test]
+    fn captured_exec_request_preserves_oci_process() {
+        let input = r#"json://{
+            "container_id":"container-id",
+            "exec_id":"exec-id",
+            "process":{
+                "user":{"uid":0,"gid":0,"additionalGids":[10]},
+                "args":["/bin/true"],
+                "env":["PATH=/bin"],
+                "cwd":"/work",
+                "noNewPrivileges":true
+            },
+            "stdin_port":0,
+            "stdout_port":0,
+            "stderr_port":0
+        }"#;
+
+        let request = make_exec_process_request(input).unwrap();
+
+        assert_eq!(request.container_id, "container-id");
+        assert_eq!(request.exec_id, "exec-id");
+        assert_eq!(request.process.Args, ["/bin/true"]);
+        assert_eq!(request.process.Env, ["PATH=/bin"]);
+        assert_eq!(request.process.Cwd, "/work");
+        assert_eq!(request.process.User.AdditionalGids, [10]);
+        assert!(request.process.NoNewPrivileges);
+    }
 }

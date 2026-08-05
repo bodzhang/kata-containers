@@ -36,6 +36,7 @@ struct Args {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 struct CapturedSpec {
+    #[serde(rename = "ociVersion")]
     version: String,
     process: CapturedProcess,
     root: CapturedRoot,
@@ -98,6 +99,7 @@ struct CapturedLinux {
     masked_paths: Vec<String>,
     readonly_paths: Vec<String>,
     devices: Vec<CapturedLinuxDevice>,
+    seccomp: Option<oci_spec::runtime::LinuxSeccomp>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -751,10 +753,12 @@ fn sandbox_process(settings: &Settings, capture: &CapturedSpec) -> KataProcess {
     let mut process = genpolicy::containerd::get_process(false, &settings.common);
     let template = &settings.pause_container.Process;
     process.Terminal = template.Terminal;
-    process.User = template.User.clone();
-    if process.User.AdditionalGids.is_empty() && process.User.GID != 0 {
-        process.User.AdditionalGids.insert(process.User.GID);
-    }
+    process.User = KataUser {
+        UID: capture.process.user.uid,
+        GID: capture.process.user.gid,
+        AdditionalGids: capture.process.user.additional_gids.clone(),
+        Username: capture.process.user.username.clone(),
+    };
     process.Args = if template.Args.is_empty() {
         capture.process.args.clone()
     } else {
@@ -909,18 +913,6 @@ fn compile_annotations(
             pattern,
         );
     }
-    if capture
-        .annotations
-        .get("io.kubernetes.cri.container-type")
-        .is_some_and(|value| value == "sandbox")
-    {
-        annotations
-            .entry("nerdctl/network-namespace".to_string())
-            .or_insert_with(|| {
-                "^/var/run/netns/cni-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-                    .to_string()
-            });
-    }
     Ok(annotations)
 }
 
@@ -1007,9 +999,10 @@ fn compile_container(
         ReadonlyPaths: capture.linux.readonly_paths.clone(),
         Devices: linux_devices,
         Sysctl: template.Linux.Sysctl.clone(),
+        Seccomp: capture.linux.seccomp.clone().map(Into::into),
     };
     let oci = KataSpec {
-        Version: settings.kata_config.oci_version.clone(),
+        Version: capture.version.clone(),
         Process: process,
         Root: KataRoot {
             Path: template.Root.Path.clone(),
@@ -2820,6 +2813,103 @@ mod tests {
             captured_process(&process, &BTreeMap::new(), "legacy").unwrap();
 
         assert_eq!(compiled.Cwd, "/captured");
+    }
+
+    #[test]
+    fn captured_oci_version_and_seccomp_are_authoritative() {
+        let settings_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../genpolicy-settings.json");
+        let settings = Settings::new(settings_path.to_str().unwrap());
+        let capture: CapturedSpec = serde_json::from_value(json!({
+            "ociVersion": "1.3.0",
+            "annotations": {
+                "io.kubernetes.cri.container-type": "container",
+                "io.kubernetes.cri.container-name": "workload"
+            },
+            "linux": {
+                "seccomp": {
+                    "defaultAction": "SCMP_ACT_ERRNO",
+                    "architectures": ["SCMP_ARCH_X86_64"],
+                    "syscalls": [{
+                        "names": ["read"],
+                        "action": "SCMP_ACT_ALLOW"
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+
+        let (compiled, _) = compile_container(
+            "capture.json",
+            &capture,
+            &settings,
+            &BTreeMap::new(),
+            &mut Vec::new(),
+            "legacy",
+            Vec::new(),
+            None,
+            &[],
+            0,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(compiled.OCI.Version, "1.3.0");
+        let seccomp = compiled.OCI.Linux.Seccomp.unwrap();
+        assert_eq!(seccomp.DefaultAction, "SCMP_ACT_ERRNO");
+        assert_eq!(seccomp.Architectures, ["SCMP_ARCH_X86_64"]);
+        assert_eq!(seccomp.Syscalls[0].Names, ["read"]);
+        assert_eq!(seccomp.Syscalls[0].Action, "SCMP_ACT_ALLOW");
+    }
+
+    #[test]
+    fn absent_sandbox_network_namespace_annotation_stays_absent() {
+        let settings_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../genpolicy-settings.json");
+        let settings = Settings::new(settings_path.to_str().unwrap());
+        let capture = CapturedSpec {
+            annotations: BTreeMap::from([(
+                "io.kubernetes.cri.container-type".to_string(),
+                "sandbox".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let annotations = compile_annotations(
+            &capture,
+            &settings.pause_container,
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+
+        assert!(!annotations.contains_key("nerdctl/network-namespace"));
+    }
+
+    #[test]
+    fn sandbox_user_is_capture_authoritative() {
+        let settings_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../genpolicy-settings.json");
+        let settings = Settings::new(settings_path.to_str().unwrap());
+        let capture = CapturedSpec {
+            process: CapturedProcess {
+                user: CapturedUser {
+                    uid: 0,
+                    gid: 0,
+                    additional_gids: BTreeSet::from([42]),
+                    username: "captured".to_string(),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let process = sandbox_process(&settings, &capture);
+
+        assert_eq!(process.User.UID, 0);
+        assert_eq!(process.User.GID, 0);
+        assert_eq!(process.User.AdditionalGids, BTreeSet::from([42]));
+        assert_eq!(process.User.Username, "captured");
     }
 
     #[test]

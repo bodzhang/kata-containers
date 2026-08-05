@@ -3,6 +3,74 @@
 This directory implements the versioned clean-room pipeline described in
 [`DESIGN.md`](DESIGN.md).
 
+## Dry-run capture pipeline
+
+The default backend runs the production Kubernetes and runtime-rs request
+transformation path, but replaces the VM, hypervisor side effects, and guest
+Agent with appliance-owned dry-run implementations:
+
+```mermaid
+flowchart TB
+  subgraph cluster["Real clean-room control plane"]
+    direction LR
+    input["Pinned workload YAML<br/>images and Kata configuration"]
+    api["etcd and kube-apiserver<br/>schema defaults and generated identities"]
+    kubelet["kubelet<br/>env, mounts, probes, and CRI requests"]
+    containerd["containerd<br/>snapshots and final OCI bundle"]
+    input --> api --> kubelet --> containerd
+  end
+
+  subgraph shim["Appliance capture shim"]
+    direction LR
+    task["TaskService and ServiceManager"]
+    handler["RuntimeHandlerManager<br/>injected RuntimeInstance"]
+    managers["VirtContainerManager and ResourceManager<br/>real runtime-rs transformations"]
+    task --> handler --> managers
+  end
+
+  subgraph dry["No-VM substitutions"]
+    direction LR
+    sandbox["CaptureSandbox<br/>sandbox lifecycle only"]
+    hypervisor["DryRunHypervisor<br/>deterministic device results"]
+    agent["RecordingAgent<br/>records final Agent RPCs"]
+    sandbox ~~~ hypervisor ~~~ agent
+  end
+
+  subgraph policy["Captured artifacts and policy generation"]
+    direction LR
+    artifacts["Raw OCI and metadata<br/>CreateContainerRequest<br/>ExecProcessRequest"]
+    tagger["Dynamic-value tagger<br/>bounded deployment identities"]
+    compiler["Request-derived policy compiler"]
+    output["policy.rego and initdata<br/>annotated workload and provenance"]
+    artifacts --> tagger --> compiler --> output
+  end
+
+  predictor["Storage and device prediction<br/>audit only"]
+  intent["Trusted probe and lifecycle intent"]
+
+  containerd --> task
+  managers -. sandbox operations .-> sandbox
+  managers -. hypervisor and device operations .-> hypervisor
+  managers --> agent --> artifacts
+  artifacts -. raw OCI .-> predictor
+  input -.-> intent -.-> compiler
+
+  classDef source fill:#e8f0fe,stroke:#355a9f,color:#17233d
+  classDef runtime fill:#e5f4ea,stroke:#31724a,color:#183523
+  classDef substitute fill:#fff2cc,stroke:#9a6a00,color:#463100
+  classDef result fill:#f3e8ff,stroke:#70409a,color:#301840
+  class input,api,kubelet,containerd,intent source
+  class task,handler,managers runtime
+  class sandbox,hypervisor,agent substitute
+  class artifacts,predictor,tagger,compiler,output result
+```
+
+The solid path produces policy inputs. The predictor's dashed path is retained
+for diagnostics and comparison only; it is never a fallback for a missing
+final `CreateContainerRequest`. `CaptureSandbox` and `DryRunHypervisor` satisfy
+runtime-rs interfaces without starting a VMM, while `RecordingAgent` is the
+authoritative interception point for final create and live exec requests.
+
 ## Prerequisites
 
 ### Host
@@ -96,7 +164,7 @@ docker run --rm --privileged --network=none \
   -e GENPOLICY_KATA_CONFIG=/input/configuration.toml \
   -v "$PWD/input:/input:ro" \
   -v "$PWD/output:/output" \
-  genpolicy-appliance:k8s-1.33.13-containerd-1.7.29-erofs-containerd-2.3.3
+  genpolicy-appliance:k8s-1.33.13-containerd-2.3.3
 ```
 
 Every `containers`, `initContainers`, and `ephemeralContainers` image in the
@@ -111,10 +179,57 @@ into the appliance. Omit it when repository downloads are required; the
 appliance seals its own outbound traffic after those downloads finish.
 The image includes local pause and BusyBox fixtures used by `make e2e`.
 
+After capture and compilation, `make e2e` starts a local policy-enabled Agent
+with `KATA_AGENT_POLICY_ONLY=true`. It installs the generated policy and uses
+`kata-agent-ctl` to replay every captured `CreateContainerRequest` and
+`ExecProcessRequest` in order. The Agent executes its normal deserialization,
+policy evaluation, and policy-state updates, then returns success before guest
+mount, device, or process setup. Any policy denial fails the test, and the
+evaluated inputs are retained as `policy-runtime-inputs.jsonl` for diagnostics.
+This mode is disabled by default and is intended only for policy compatibility
+testing outside a guest VM.
+
 Successful runs produce the request-derived `policy.rego`,
 `policy-annotation.txt`, `workload-policy.yaml`, and `policy-oci-diff.json`.
 The production appliance contains the standalone Rust policy compiler and does
 not contain or invoke the legacy GenPolicy executable.
+
+## Environment sources
+
+The appliance does not reconstruct Kubernetes environment variables from
+workload YAML. It submits ConfigMaps, Secrets, and workloads to the clean-room
+API server, lets the real kubelet resolve `envFrom` and `env[].valueFrom`, and
+captures the resulting OCI `process.env` at the runtime boundary. Kubernetes
+therefore decides optional-reference behavior, source ordering, explicit `env`
+overrides, prefixes, key validation, downward API fields, and resource-field
+quantities.
+
+Captured values are exact policy inputs unless the appliance can establish a
+bounded deployment-time identity. For example:
+
+| Environment source | Policy treatment |
+|---|---|
+| ConfigMap or Secret through `envFrom` | Each kubelet-expanded `KEY=value` is exact. `envFrom.prefix` is already reflected in the captured key. |
+| `configMapKeyRef` or `secretKeyRef` | The selected kubelet-expanded value is exact. |
+| `fieldRef` for generated Pod name, Pod UID, or node name | Replaced with `$(sandbox-name)`, `$(pod-uid)`, or `$(node-name)` after matching an API-server/profile value. Other resolved fields remain exact. |
+| `resourceFieldRef` | The quantity calculated by kubelet is captured exactly. |
+| Kubernetes service environment variable | Legacy-compatible mode uses the inherited bounded service-variable regexes. Balanced mode retains the captured endpoint exactly. |
+
+The original GenPolicy handles the same YAML forms by reconstructing values
+offline rather than observing kubelet. Its important fidelity limits are:
+
+| Legacy input | Legacy GenPolicy behavior |
+|---|---|
+| `envFrom.configMapRef` / `envFrom.secretRef` | Expands resources supplied in the input or with `--config-file`, but ignores `prefix`, `optional`, namespaces, and kubelet duplicate-key precedence. Missing references fail generation. |
+| `configMapKeyRef` / `secretKeyRef` | Resolves supplied resources by name, but ignores `optional` and namespaces. Secret data must be valid base64 and UTF-8. |
+| `fieldRef` | Maps a fixed set of fields to policy macros or exact YAML values. Unsupported fields fail generation; missing annotations may become the broad `$(todo-annotation)` placeholder. |
+| `resourceFieldRef` | Does not calculate the requested resource, divisor, or container value. Every selector becomes the broad `$(resource-field)` placeholder. |
+
+Secret values are base64-decoded by Kubernetes before runtime capture. They
+therefore appear in plaintext in `createcontainer-requests/`, tagged requests,
+policy data, and related reports. Treat the complete output directory as
+sensitive and regenerate policy whenever an exact ConfigMap or Secret value
+changes.
 
 ## Balanced policy mode
 
@@ -127,7 +242,7 @@ docker run --rm --privileged --network=none \
   --cgroupns=host \
   -v "$PWD/input:/input:ro" \
   -v "$PWD/output:/output" \
-  genpolicy-appliance:k8s-1.33.13-containerd-1.7.29-erofs-containerd-2.3.3
+  genpolicy-appliance:k8s-1.33.13-containerd-2.3.3
 ```
 
 The run additionally emits:
@@ -293,7 +408,7 @@ docker run --rm --privileged --network=none \
   -e GENPOLICY_KATA_CONFIG=/input/configuration.toml \
   -v "$PWD/input:/input:ro" \
   -v "$PWD/output:/output" \
-  genpolicy-appliance:k8s-1.33.13-containerd-1.7.29-erofs-containerd-2.3.3
+  genpolicy-appliance:k8s-1.33.13-containerd-2.3.3
 ```
 
 The file is required for every policy generation run because request capture
@@ -315,7 +430,7 @@ docker run --rm --privileged --network=none \
   --cgroupns=host \
   -v "$PWD/input:/input:ro" \
   -v "$PWD/output:/output" \
-  genpolicy-appliance:k8s-1.33.13-containerd-1.7.29-erofs-containerd-2.3.3
+  genpolicy-appliance:k8s-1.33.13-containerd-2.3.3
 ```
 
 Kubelet and containerd materialize the YAML volumes as bind mounts in

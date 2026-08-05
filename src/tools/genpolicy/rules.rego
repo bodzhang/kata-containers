@@ -152,7 +152,6 @@ allow_create_container_input if {
     is_null(i_linux.Resources.BlockIO)
     is_null(i_linux.Resources.Network)
     is_null(i_linux.Resources.Pids)
-    is_null(i_linux.Seccomp)
 
     i_process := i_oci.Process
     count(i_process.SelinuxLabel) == 0
@@ -439,6 +438,15 @@ allow_sandbox_net_namespace(p_oci, i_oci) if {
     print("allow_sandbox_net_namespace: true")
 }
 
+allow_sandbox_net_namespace(p_oci, i_oci) if {
+    key := "nerdctl/network-namespace"
+
+    not p_oci.Annotations[key]
+    not i_oci.Annotations[key]
+
+    print("allow_sandbox_net_namespace: absent from policy and input")
+}
+
 allow_net_namespace(p_oci, i_oci) if {
     print("allow_net_namespace: start")
 
@@ -654,6 +662,7 @@ allow_linux(state_ops, p_oci, i_oci) := {"ops": ops, "allowed": true} if {
     allow_readonly_paths(p_oci, i_oci)
     allow_linux_devices(p_oci.Linux.Devices, i_oci.Linux.Devices)
     allow_linux_sysctl(p_oci.Linux, i_oci.Linux)
+    p_oci.Linux.Seccomp == i_oci.Linux.Seccomp
     ret := allow_network_namespace_start(state_ops, p_oci, i_oci)
     ret.allowed
 
