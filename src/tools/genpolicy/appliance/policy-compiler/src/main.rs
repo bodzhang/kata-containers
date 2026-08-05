@@ -154,6 +154,40 @@ impl From<&CapturedAgentDevice> for agent::Device {
     }
 }
 
+fn compile_request_devices(
+    captured: &[CapturedAgentDevice],
+    generated: Vec<agent::Device>,
+    vfio_device_path: &str,
+) -> Result<Vec<agent::Device>> {
+    let captured_vfio = captured
+        .iter()
+        .filter(|device| device.container_path.starts_with(vfio_device_path))
+        .collect::<Vec<_>>();
+    let generated_vfio = generated
+        .into_iter()
+        .filter(|device| device.container_path == vfio_device_path)
+        .collect::<Vec<_>>();
+
+    if !captured_vfio.is_empty() && generated_vfio.is_empty() {
+        bail!("captured VFIO devices have no declared policy requirement");
+    }
+    if !captured_vfio.is_empty() && captured_vfio.len() != generated_vfio.len() {
+        bail!(
+            "captured VFIO device count {} does not match declared count {}",
+            captured_vfio.len(),
+            generated_vfio.len()
+        );
+    }
+
+    let mut devices = captured
+        .iter()
+        .filter(|device| !device.container_path.starts_with(vfio_device_path))
+        .map(agent::Device::from)
+        .collect::<Vec<_>>();
+    devices.extend(generated_vfio);
+    Ok(devices)
+}
+
 #[derive(Debug, Deserialize)]
 struct TagManifest {
     tags: Vec<TagDefinition>,
@@ -1259,9 +1293,15 @@ fn run(args: Args) -> Result<()> {
             )?;
         let mut container = container;
         // The captured request is authoritative for final Agent storages,
-        // devices, mounts, sandbox_pidns, and rootfs identity.
+        // non-VFIO devices, mounts, sandbox_pidns, and rootfs identity. VFIO
+        // policy entries retain their declared unsuffixed requirement because
+        // device numbers and PCI paths are assigned again in production.
         container.storages = request_data.volume_storages;
-        container.devices = raw_request.devices.iter().map(agent::Device::from).collect();
+        container.devices = compile_request_devices(
+            &raw_request.devices,
+            container.devices,
+            &settings.devices.vfio.device_path,
+        )?;
         container.sandbox_pidns = raw_request.sandbox_pidns;
         let roothashes = request_data.dmverity_roothashes;
         let images = request_data.guest_pull_images;
@@ -1952,6 +1992,87 @@ mod tests {
         assert_eq!(device.vm_path, "/dev/vdb");
         assert_eq!(device.container_path, "/dev/data");
         assert_eq!(device.options, vec!["ro"]);
+    }
+
+    #[test]
+    fn request_devices_preserve_normalized_vfio_requirement() {
+        let vfio_path = "/dev/vfio/devices/vfio";
+        let captured = vec![
+            CapturedAgentDevice {
+                id: "disk-id".to_string(),
+                field_type: "blk".to_string(),
+                container_path: "/dev/data".to_string(),
+                ..Default::default()
+            },
+            CapturedAgentDevice {
+                id: "vfio0".to_string(),
+                field_type: "vfio-pci-gk".to_string(),
+                container_path: format!("{vfio_path}0"),
+                options: vec!["0000:00:05.0=10/de".to_string()],
+                ..Default::default()
+            },
+        ];
+        let generated = vec![agent::Device {
+            container_path: vfio_path.to_string(),
+            type_: "vfio-pci-gk".to_string(),
+            ..Default::default()
+        }];
+
+        let devices = compile_request_devices(&captured, generated, vfio_path).unwrap();
+
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].id, "disk-id");
+        assert_eq!(devices[0].container_path, "/dev/data");
+        assert_eq!(devices[1].container_path, vfio_path);
+        assert_eq!(devices[1].type_, "vfio-pci-gk");
+        assert!(devices[1].id.is_empty());
+        assert!(devices[1].options.is_empty());
+    }
+
+    #[test]
+    fn request_devices_reject_undeclared_vfio_capture() {
+        let vfio_path = "/dev/vfio/devices/vfio";
+        let captured = vec![CapturedAgentDevice {
+            id: "vfio0".to_string(),
+            field_type: "vfio-pci-gk".to_string(),
+            container_path: format!("{vfio_path}0"),
+            ..Default::default()
+        }];
+
+        let error = compile_request_devices(&captured, Vec::new(), vfio_path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("no declared policy requirement"));
+    }
+
+    #[test]
+    fn request_devices_reject_vfio_count_mismatch() {
+        let vfio_path = "/dev/vfio/devices/vfio";
+        let captured = vec![CapturedAgentDevice {
+            id: "vfio0".to_string(),
+            field_type: "vfio-pci-gk".to_string(),
+            container_path: format!("{vfio_path}0"),
+            ..Default::default()
+        }];
+        let generated = vec![
+            agent::Device {
+                container_path: vfio_path.to_string(),
+                type_: "vfio-pci-gk".to_string(),
+                ..Default::default()
+            },
+            agent::Device {
+                container_path: vfio_path.to_string(),
+                type_: "vfio-pci-gk".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let error = compile_request_devices(&captured, generated, vfio_path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not match declared count"));
     }
 
     #[test]

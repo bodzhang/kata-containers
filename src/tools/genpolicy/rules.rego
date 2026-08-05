@@ -501,12 +501,42 @@ allow_devices(p_devices, i_devices, i_oci) if {
 allow_volume_devices(p_volume_devices, i_volume_devices) if {
     print("allow_volume_devices: start")
 
+    count(p_volume_devices) == count(i_volume_devices)
+
+    p_paths := {d.container_path | some d in p_volume_devices}
+    i_paths := {d.container_path | some d in i_volume_devices}
+    count(p_paths) == count(p_volume_devices)
+    count(i_paths) == count(i_volume_devices)
+    p_paths == i_paths
+
     every i_volume_device in i_volume_devices {
         some p_device in p_volume_devices
-        p_device.container_path == i_volume_device.container_path
+        allow_volume_device(p_device, i_volume_device)
     }
 
     print("allow_volume_devices: true")
+}
+
+allow_volume_device(p_device, i_device) if {
+    p_device.container_path == i_device.container_path
+    allow_optional_device_string(p_device, i_device, "id")
+    allow_optional_device_string(p_device, i_device, "type_")
+    allow_optional_device_string(p_device, i_device, "vm_path")
+    allow_optional_device_options(p_device, i_device)
+}
+
+allow_optional_device_string(p_device, i_device, field) if {
+    object.get(p_device, field, "") == ""
+}
+allow_optional_device_string(p_device, i_device, field) if {
+    object.get(p_device, field, "") == object.get(i_device, field, "")
+}
+
+allow_optional_device_options(p_device, i_device) if {
+    count(object.get(p_device, "options", [])) == 0
+}
+allow_optional_device_options(p_device, i_device) if {
+    object.get(p_device, "options", []) == object.get(i_device, "options", [])
 }
 
 allow_vfio_devices(p_vfio_devices, i_vfio_devices, i_oci) if {
@@ -1655,9 +1685,18 @@ allow_sandbox_storage(p_storages, i_storage) if {
 CopyFileRequest if {
     print("CopyFileRequest: input =", input)
 
+    allow_copy_file_range
     allow_copy_file
 
     print("CopyFileRequest: true")
+}
+
+allow_copy_file_range if {
+    file_size := object.get(input, "file_size", 0)
+    offset := object.get(input, "offset", 0)
+    file_size >= 0
+    offset >= 0
+    offset <= file_size
 }
 
 allow_copy_file if {
@@ -1793,6 +1832,10 @@ ExecProcessRequest if {
 
 allow_exec_process_input if {
     is_null(input.string_user)
+
+    object.get(input, "stdin_port", 0) == 0
+    object.get(input, "stdout_port", 0) == 0
+    object.get(input, "stderr_port", 0) == 0
 
     i_process := input.process
     count(i_process.SelinuxLabel) == 0

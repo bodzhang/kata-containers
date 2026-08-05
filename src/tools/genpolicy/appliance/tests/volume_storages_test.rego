@@ -476,5 +476,29 @@ test_copy_outside_shared_fs_denied if {
 		with data.agent_policy.policy_data as copy_policy_data
 }
 
+test_copy_negative_size_denied if {
+	not CopyFileRequest with input as {
+		"file_type": "Regular",
+		"file_size": -1,
+		"offset": 0,
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/token",
+		]),
+	}
+		with data.agent_policy.policy_data as copy_policy_data
+}
+
+test_copy_offset_past_size_denied if {
+	not CopyFileRequest with input as {
+		"file_type": "Regular",
+		"file_size": 4,
+		"offset": 5,
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/token",
+		]),
+	}
+		with data.agent_policy.policy_data as copy_policy_data
+}
+
 
 

@@ -154,7 +154,63 @@ runs both compilers against the same capture so the standalone result can be
 checked against legacy behavior without adding the legacy executable to the
 production appliance.
 
-## Volume handling
+## Legacy request defaults and stream I/O
+
+The appliance retains the legacy GenPolicy request baseline. Both generators
+load the same `genpolicy-settings.json`, and the appliance serializes the
+resulting `request_defaults` into `policy_data`. It also prepends the same
+shared `rules.rego` to the generated policy. The appliance settings drop-in
+changes only the pause image; it does not replace request defaults. Therefore,
+the appliance is not missing a separate set of legacy hardcoded endpoint
+rules.
+
+The shared Rego hardcodes a small lifecycle and observation baseline as
+allowed: `DestroySandboxRequest`, `GetOOMEventRequest`,
+`GuestDetailsRequest`, `OnlineCPUMemRequest`, `RemoveContainerRequest`,
+`RemoveStaleVirtiofsShareMountsRequest`, `SignalProcessRequest`,
+`StartContainerRequest`, `StatsContainerRequest`, `TtyWinResizeRequest`, and
+`WaitProcessRequest`. Other Agent endpoints default to denied unless a
+specific rule admits them. The settings-backed rules for container creation,
+copy-file paths, exec commands, routes, interfaces, ARP neighbors, diagnostic
+data, ephemeral mounts, and legacy streams are inherited unchanged.
+
+Legacy settings deny all three older stream RPC controls by default:
+
+| Operation | Legacy and appliance default |
+|---|---|
+| `WriteStreamRequest` to process stdin | Denied. |
+| `CloseStdinRequest` | Denied. |
+| `ReadStreamRequest` from stdout or stderr | Denied. |
+
+These are global RPC switches, not per-container or per-stream permissions.
+Enabling `ReadStreamRequest`, for example, does not distinguish stdout from
+stderr or one process from another. Legacy GenPolicy maps Kubernetes `tty` to
+the OCI process `Terminal` field, but its parsed Kubernetes `stdin` value does
+not generate stream authorization.
+
+Passfd I/O is a separate transport path. Legacy policy does not represent
+`stdin_port`, `stdout_port`, or `stderr_port`, so denying the old stream RPCs
+does not constrain a non-zero passfd handle. The appliance currently closes
+that gap by rejecting configured create-time passfd ports during generation
+and requiring all three exec-time ports to be zero in Rego. This is a
+fail-closed compatibility gate, not the intended long-term per-process stream
+model. stdout and stderr remain host-visible, suppressible output and must not
+be treated as trusted security evidence even after policy-bound passfd support
+is added.
+
+## Device, runtime-exec, and CopyFile policy status
+
+| Surface | Appliance status | Enforcement boundary |
+|---|---|---|
+| Non-VFIO `CreateContainerRequest.devices` | Supported for final-request shape admission. | The compiler retains captured records. Rego requires exact cardinality and unique paths; non-empty captured `id`, type, `vm_path`, and options are exact. Empty legacy placeholder fields remain path-only. This does not bind a resolved physical device identity. |
+| Kubernetes `volumeDevices` | Supported as a bounded container-visible device path, subject to authoritative final request capture. | Workload YAML supplies the declared path as an additional OCI policy check. It does not prove the backing block device's identity, integrity, confidentiality, or contents. |
+| NVIDIA pGPU through VFIO/CDI | Supported at the request-shape level, not as physical-device identity enforcement. | The compiler preserves one unsuffixed VFIO requirement per declared pGPU instead of pinning captured runtime numbers. Rego checks count, type, guest path shape, PCI option grammar, unique runtime device numbers, and CDI suffix correlation. A no-GPU clean room cannot identify the production device; trusted hotplug registry binding and post-CDI effective-plan authorization require future Agent changes. |
+| Probe and lifecycle exec actions | Supported with exact argv arrays read from trusted workload YAML. | These future requests are absent from `CreateContainerRequest`. Rego also checks the target container's recorded state and process user, environment, cwd, no-new-privileges, empty exec capabilities, and terminal semantics. Authorization is command-based, not caller/probe provenance-based: the same exact request can be issued through another exec client. |
+| Arbitrary `kubectl exec` | Denied by default. | The appliance defaults contain no global allowed commands or exec regexes. A command identical to an allowed probe or lifecycle action is nevertheless admitted. Until one-shot stream binding is implemented in the Agent, exec-process passfd ports are required to be zero. |
+| Runtime-rs `CopyFileRequest` for ConfigMap, Secret, projected, and runtime files | Supported within the configured Kata shared-directory domain. | Capture executes but does not record individual copy requests. Shared Rego constrains path, regular/directory/symlink type, traversal, relative symlink targets, and non-negative in-range offsets using the static `$(sfprefix)` rule. It does not authorize exact file sets, metadata, sizes, chunk sequences, or content. Agent `pathrs` handling confines writes beneath the guest shared directory. Host-provided contents remain mutable and untrusted. |
+| `kubectl cp` | Not a `CopyFileRequest` feature and denied by default. | `kubectl cp` normally invokes `tar` through `ExecProcessRequest`; it works only if the resulting exact exec command is separately authorized. |
+
+## Volume and shared-mount handling
 
 The appliance requires a captured `CreateContainerRequest` as the authority for
 every container. Missing or incomplete request capture fails generation. The
@@ -170,6 +226,7 @@ policy data for operations absent from container creation, such as exec probes.
 | CDH-managed encrypted block `emptyDir` | Emits the configured encrypted block-storage template. | Runs the real runtime-rs `block-encrypted` handler and captures the final request containing `encryption_key=ephemeral`, `create_filesystem`, the block storage, and rewritten mount. The recording Agent stops at the request boundary; it does not run CDH or create a LUKS mapping. | High-fidelity request capture. Policy pins the CDH trigger and the complete storage/mount relationship. Production CDH/LUKS execution is covered by Kata's confidential Kubernetes integration test, not by this no-VM appliance. |
 | CSI direct filesystem-mounted block volume | Has no direct-volume or `mountInfo.json` model; the extra runtime storage and rewritten mount are denied. | `GENPOLICY_DIRECT_VOLUME_MOUNTS` replays operator-supplied `mountInfo.json` data so `createreq-capture` records the real shim storage and mount. The compiler does not yet admit this storage class. | Captured but fail-closed. A dedicated direct-volume path template and Rego clause are required. |
 | CDH/KBS-backed persistent encrypted volume | Not represented for persistent PVCs. | Raw CSI direct volumes do not add a CDH key identity or encryption operation to the Agent request. | Unsupported in the production runtime/Agent contract; adding real CSI components to the appliance would not close this gap. |
+| Cross-container `shared_mounts` annotation | Not represented in `ContainerPolicy`; the shared Rego requires `count(input.shared_mounts) == 0`, so a non-empty request is denied at runtime. | Captures the final destination-container mappings but rejects any non-empty list during policy generation. | Unsupported and fail-closed in both. Potential future support requires exact policy declarations plus Agent-side mount-identity registration, fd-relative path confinement, and checked one-time cloning; path-string allowlisting alone is insufficient. |
 
 ### Encrypted `emptyDir` fidelity boundary
 

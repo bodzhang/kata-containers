@@ -40,6 +40,39 @@ test_volume_device_wrong_path_denied if {
 	)
 }
 
+# Every declared path is required; a subset cannot satisfy the policy.
+test_volume_device_missing_denied if {
+	not allow_devices(
+		[{"container_path": "/dev/xvdb"}, {"container_path": "/dev/xvdc"}],
+		[{"container_path": "/dev/xvdb"}],
+		oci,
+	)
+}
+
+# Captured non-empty fields are exact, while legacy path-only entries remain
+# compatible through the empty-field behavior in allow_volume_device.
+test_captured_volume_device_field_change_denied if {
+	not allow_devices(
+		[{
+			"container_path": "/dev/xvdb", "id": "disk-1", "type_": "blk",
+			"vm_path": "/dev/vdb", "options": ["ro"],
+		}],
+		[{
+			"container_path": "/dev/xvdb", "id": "disk-2", "type_": "blk",
+			"vm_path": "/dev/vdb", "options": ["ro"],
+		}],
+		oci,
+	)
+}
+
+test_captured_volume_device_exact_allowed if {
+	device := {
+		"container_path": "/dev/xvdb", "id": "disk-1", "type_": "blk",
+		"vm_path": "/dev/vdb", "options": ["ro"],
+	}
+	allow_devices([device], [device], oci)
+}
+
 # Multiple declared devices, all matched, are admitted.
 test_multiple_volume_devices_allowed if {
 	allow_devices(

@@ -318,7 +318,7 @@ denied.
 | --- | --- |
 | `oci` | Tagged request is compiled; raw OCI is retained for legacy environment coverage checks. |
 | `storages` | Raw request is authoritative. Supported volume classes are converted to bounded policy forms; rootfs identities become per-container marker storages. Unsupported classes are omitted to fail closed, or fail generation under strict coverage. |
-| `devices` | Raw request devices are copied into the container policy. Workload YAML is consulted only for additional policy checks already defined by the shared GenPolicy model, such as declared `volumeDevices` paths and NVIDIA pGPU count. |
+| `devices` | Raw non-VFIO request devices are copied into policy and matched with exact cardinality, unique paths, and any non-empty captured stable fields. Empty legacy placeholder fields remain path-only. Workload YAML supplies additional OCI checks for declared `volumeDevices` paths. For each declared NVIDIA pGPU, the compiler preserves an unsuffixed VFIO requirement instead of pinning runtime-assigned device numbers or PCI paths. This is request-shape enforcement, not physical-device identity. |
 | `sandbox_pidns` | Copied exactly from the raw request. |
 | `container_id` | Used to pair captures and report errors; runtime bundle/container identity is correlated through OCI annotations and root paths rather than pinned to the dry-run ID. |
 | `exec_id` | Captured and required to be empty; non-empty values fail generation because the field is not represented in policy. |
@@ -339,6 +339,229 @@ corresponds to the exact occurrence and original-value digest recorded in
 `dynamic-tags.json`. Until that validation exists, the tagger and its output
 directory remain part of the trusted compiler input path.
 
+#### Legacy request-rule inheritance audit
+
+The compiler does not maintain a forked endpoint-default table. It loads the
+legacy `Settings` implementation, serializes the complete
+`settings.request_defaults` value into `policy_data.request_defaults`, and
+concatenates the configured shared `rules.rego` before that data. The
+production appliance image copies the repository's base
+`genpolicy-settings.json` and applies a drop-in that changes only
+`cluster_config.pause_container_image`. Consequently, the following legacy
+policy classes are inherited rather than reconstructed:
+
+| Legacy policy class | Source | Appliance result |
+|---|---|---|
+| Hardcoded allow defaults | Shared Rego defaults for sandbox teardown, OOM and guest details, CPU/memory online, container removal, stale virtiofs cleanup, signaling, starting, stats, terminal resize, and process waiting. | Inherited from the same `rules.rego`. |
+| Hardcoded deny defaults | Every other named Agent endpoint defaults to false, including create, exec, copy, networking updates, tracing, policy replacement, resource updates, stream RPCs, and unsupported memory-agent operations. | Inherited from the same `rules.rego`; endpoint-specific clauses can admit only their constrained cases. |
+| Structured request defaults | `CreateContainerRequest`, `CopyFileRequest`, `ExecProcessRequest`, `UpdateRoutesRequest`, `UpdateInterfaceRequest`, and `AddARPNeighborsRequest`. | The complete deserialized settings objects are copied into policy data; compiler mode changes are limited to documented environment regex handling. Workload-derived exec commands are stored per container. |
+| Boolean request defaults | `CloseStdinRequest`, `ReadStreamRequest`, `WriteStreamRequest`, `UpdateEphemeralMountsRequest`, and `GetDiagnosticDataRequest`. | Copied unchanged. All five are false in the base settings. |
+| Failure behavior | `AllowRequestsFailingPolicy` defaults to false in shared Rego. | Inherited; policy evaluation failure remains fail-closed. |
+
+This audit found no omitted legacy default rule. The compatibility exception is
+not missing policy text but a field-model gap: legacy stream booleans govern
+the old read/write/close RPCs, while legacy create and exec rules did not model
+passfd port fields. An output policy can therefore contain all legacy defaults
+and still fail to constrain passfd attachments unless those request fields are
+checked separately.
+
+#### Cross-cutting future improvement: versioned Agent endpoint profiles
+
+The inherited defaults do not completely match the current Agent and runtime.
+They cover normal sandbox/container creation and teardown, basic container
+stats, OOM notification, guest capability discovery, CPU/memory online, stale
+virtiofs cleanup, and constrained network setup. Several newer or
+feature-specific automatic runtime calls still default to denied, however.
+That can preserve confidentiality while silently disabling legitimate
+Kubernetes behavior.
+
+This is primarily an Agent and shared GenPolicy compatibility problem, not an
+appliance feature. The endpoint definitions and policy-check call sites belong
+to the Agent, while the defaults and common admission rules belong to shared
+`rules.rego` and `genpolicy-settings.json`. Legacy GenPolicy and the appliance
+both consume that contract. The appliance may derive tighter request data from
+capture, but it must not own the endpoint inventory or establish a divergent
+baseline. This section is retained here to record how the shared contract
+affects appliance output and where capture can improve it.
+
+The policy should classify an endpoint by trusted runtime purpose instead of
+assuming that every read is harmless or every default-denied operation is
+interactive. The intended profiles are:
+
+| Profile | Intended caller and behavior | Default posture |
+|---|---|---|
+| Core lifecycle | Automatic shim operations required to create, start, stop, wait for, and remove a declared workload. | Enabled with container/sandbox state and request-shape checks. |
+| Observability | Automatic status, resource statistics, OOM events, pod stdout/stderr collection, termination messages, and explicitly selected metrics. Workload output is assumed to follow the deployment's data-handling policy. | Enabled for declared containers and bounded outputs; the data remains host-visible and is not trusted evidence. |
+| Feature automation | Automatic calls required only when a selected runtime or workload feature is active, such as dynamic resource updates, memory hotplug, swap, direct-volume statistics, or guest clock synchronization. | Enabled only when compiler inputs prove that the feature is selected, with endpoint-specific fields constrained. |
+| Interactive/debug | `ExecProcessRequest` outside declared probes/lifecycle hooks, stdin, terminal resize, pause/resume used as operator controls, network inspection, and ad hoc diagnostics. | Denied unless an explicit deployment profile opts in. |
+| Administrative | Policy replacement, iptables mutation, memory-agent tuning, tracing, and unrestricted guest mutation. | Denied by the workload policy; use a separately authenticated administrative channel if required. |
+
+##### Current compatibility findings
+
+| Endpoint or family | Current inherited behavior | Compatibility assessment and future rule |
+|---|---|---|
+| `CreateSandboxRequest`, `CreateContainerRequest`, and `CopyFileRequest` | Default deny with structured allow rules. | Retain. These are automatic operations, but admission must continue to depend on the compiled sandbox, container, storage, device, and copy-path contracts. |
+| `StartContainerRequest`, `WaitProcessRequest`, `RemoveContainerRequest`, `DestroySandboxRequest`, and `RemoveStaleVirtiofsShareMountsRequest` | Default allow. | Required automatically. Replace unconditional allows where practical with known sandbox/container state and idempotent lifecycle transitions. |
+| `SignalProcessRequest` | Default allow. | Needed for automatic stop/kill, but too broad for the desired non-interactive profile. Constrain the target to a policy-known process and allow only lifecycle-required signals and state transitions. |
+| `GuestDetailsRequest` and `OnlineCPUMemRequest` | Default allow. | Retain for runtime capability discovery and automatic CPU/memory online. Bound resource values to the selected runtime resource envelope. |
+| `StatsContainerRequest` and `GetOOMEventRequest` | Default allow. | Retain in the observability profile. Bind stats to a policy-known container; keep OOM output metadata-only and bounded. |
+| `UpdateInterfaceRequest`, `UpdateRoutesRequest`, and `AddARPNeighborsRequest` | Default deny with settings-backed structured rules. | Retain as core automatic network reconciliation. Add complete-set/duplicate checks and bind the request to the sandbox network plan rather than relying only on forbidden-value filters. |
+| `UpdateContainerRequest` | Unconditionally denied. | Compatibility gap for CRI/containerd resource updates, including Kubernetes in-place resource changes. Add a policy container id check and a compiler-produced resource envelope; reject devices and controllers not declared by that envelope. |
+| `GetDiagnosticDataRequest` | Denied by the default settings boolean. | Compatibility gap for automatic Kubernetes termination messages when `shared_fs = "none"`. Admit only `log_type == "termination_log"`, a policy-known container, the declared termination-message contract, and a bounded response size. Do not enable a generic diagnostic-data read. |
+| `ReadStreamRequest` | Denied by the default settings boolean; both stdout and stderr share the same Rego entrypoint. | Compatibility gap for the legacy stream transport used to collect pod logs. Future Agent policy input must distinguish `ReadStdout` from `ReadStderr`, bind the stream to a known process, and cap each read. Enable output in the observability profile while keeping `WriteStreamRequest` and `CloseStdinRequest` denied. Passfd output requires the separate one-shot binding design below. |
+| `GetMetricsRequest` | Unconditionally denied. | Compatibility gap for the shim metrics endpoint, which currently drops unavailable Agent metrics and returns the remaining metrics. Add an observability option for bounded, reviewed Agent metric families; do not treat this payload as workload-only telemetry. |
+| `VolumeStatsRequest` | Unconditionally denied. | Compatibility gap for CSI/direct-volume `NodeGetVolumeStats` handling. Admit only normalized guest paths bound to a policy-known mounted volume; do not authorize arbitrary guest path probing. |
+| `ResizeVolumeRequest` | Denied, and the current Agent returns `UNIMPLEMENTED` after policy admission. | Keep denied until the Agent implements it. Future support must bind the path and requested size to a declared resizable volume and an operator-defined maximum. |
+| `UpdateEphemeralMountsRequest` | Denied by the default settings boolean. | Compatibility gap after automatic sandbox memory growth, when the runtime recalculates tmpfs limits. Replace the boolean with exact Agent-managed tmpfs identities and limits derived from the admitted memory envelope. |
+| `MemHotplugByProbeRequest` | Unconditionally denied. | Feature compatibility gap when the selected hypervisor uses guest memory probing. Admit only addresses and sizes returned by a trusted hotplug registry and correlated with the resource update. |
+| `ReseedRandomDevRequest` | Unconditionally denied. | Feature compatibility gap for VM factory reuse, which automatically reseeds the guest RNG. Prefer an in-guest trusted entropy source; otherwise authorize exactly one bounded reseed during trusted VM assignment, not arbitrary runtime writes. |
+| `AddSwapRequest` and `AddSwapPathRequest` | Unconditionally denied. | Feature compatibility gap when runtime swap is configured. Admit only a device/path registered by the trusted device manager and selected by the runtime profile; remain denied when swap is disabled. |
+| `SetGuestDateTimeRequest` | Unconditionally denied. | Optional VM clock-sync compatibility gap. If enabled, constrain the requested time to a small skew window around a trusted time source. Host-supplied wall time alone is not a confidential-computing trust anchor. |
+| `PauseContainerRequest` and `ResumeContainerRequest` | Unconditionally denied. | Acceptable for the non-interactive Kubernetes profile; ordinary pod lifecycle does not require them. Add only as a paired feature with known container state if a platform workflow proves a requirement. |
+| `TtyWinResizeRequest` | Default allow. | Inconsistent with disabling interactive operation. Change the hardened profile to deny it unless a declared terminal process and interactive profile are both active. |
+| `ExecProcessRequest` | Default deny with exact global/probe/lifecycle command paths. | Continue to deny arbitrary human exec. Preserve exact probe and lifecycle process contracts, while recognizing that command equality alone does not prove control-plane purpose. |
+| `ListInterfacesRequest`, `ListRoutesRequest`, `GetIPTablesRequest`, and `SetIPTablesRequest` | Unconditionally denied. | Keep out of the baseline. Current runtime paths expose these as management operations, not required periodic Kubernetes status calls. A network integration that needs them requires a separate structured profile; iptables writes must never be enabled as a bare boolean. |
+| `MemAgentMemcgConfig`, `MemAgentCompactConfig`, and `SetPolicyRequest` | Unconditionally denied. | Retain as administrative-only. Workload policy must not authorize its own replacement or unrestricted memory-agent tuning. |
+| `StartTracingRequest` and `StopTracingRequest` | Still present as shared Rego defaults, but absent from the current `AgentService` protocol. | Treat as stale compatibility entries. Endpoint-manifest validation should report policy rules with no current RPC as well as RPCs with no rule. |
+
+##### Delivery plan
+
+1. **Inventory endpoints at the Agent/shared-policy boundary.** Derive the
+  service method, request type, policy entrypoint, and pre-side-effect
+  policy-check status from the current Agent protocol and implementation.
+  Shared CI must require every method to be explicitly classified as
+  constrained, allowed, denied, or intentionally outside policy scope. It must
+  also report stale Rego entrypoints. Unknown endpoints remain fail-closed.
+2. **Add shared policy conformance tests.** Exercise the automatic shim paths
+  for pod creation, network setup, start, stats, OOM watcher setup, stop, and
+  removal against shared `rules.rego`. Add feature cases for resource updates,
+  `shared_fs = "none"` termination messages, memory growth/tmpfs refresh,
+  swap, and direct volumes. These tests protect legacy GenPolicy and every
+  other consumer of the shared policy, not only the appliance.
+3. **Correct the shared GenPolicy contract.** Add bounded common rules and
+  extend `RequestDefaults` only where configuration is necessary. Cover exact
+  container binding for stats and termination logs, normalized policy-volume
+  paths for volume stats, and an explicit reviewed Agent metrics profile.
+  Avoid blanket boolean enables.
+4. **Add legacy generator support.** Populate new structured policy data from
+  trusted workload and runtime settings where legacy GenPolicy can do so
+  safely. Features without sufficient trusted input remain denied rather than
+  receiving guessed policy entries.
+5. **Implement required Agent enforcement.** Centralize pre-side-effect policy
+  checks for every non-health RPC, distinguish stdout from stderr, cap outputs,
+  and add trusted bindings for resource envelopes, tmpfs identities, hotplug,
+  swap, lifecycle signals, and passfd streams. CI must explicitly list any
+  endpoint outside policy scope.
+6. **Integrate the shared contract into the appliance.** Reuse the shared
+  endpoint classifications, settings schema, and Rego rules. Use authoritative
+  captured requests only to produce tighter endpoint-specific data that legacy
+  generation cannot know. Appliance tests should supplement, not duplicate or
+  replace, the shared compatibility suite.
+
+The first implementation target belongs in Agent/shared-policy CI: prove that
+the current endpoint set is completely classified and that core automatic shim
+operations remain usable. Bounded observability and other automatic operations
+reachable from CRI and shim-management APIs follow in the shared contract. The
+solution must not be an appliance settings drop-in that flips all denied
+requests to true; that would restore compatibility only for one consumer while
+discarding the request-shape and workload-purpose boundaries that policy is
+intended to enforce.
+
+#### Process identity and passfd I/O
+
+The currently unsupported request fields do not have one common security
+model. They require separate treatment.
+
+**Create-time `exec_id` remains empty by invariant.** Runtime-rs constructs a
+container's `CreateContainerRequest` with an empty exec ID, and the Agent does
+not consume that field while creating the init process. A non-empty value does
+not enable a legitimate create-container feature and must remain denied. Future
+process creation uses `ExecProcessRequest`, where `exec_id` is an opaque
+runtime process handle rather than a policy identity. The Agent must continue
+to validate its syntax, require uniqueness within the container, and reject
+collision with the init process. Policy authorization for an exec is based on
+the target container's policy state and exact process contract, not on trusting
+the handle's spelling.
+
+**Legacy stream RPC denial does not deny passfd streams.** The base settings
+set `CloseStdinRequest`, `ReadStreamRequest`, and `WriteStreamRequest` to false,
+which disables the Agent's older stream RPC path. These booleans are global
+controls and do not express stdin, stdout, or stderr presence for an individual
+process. Legacy generation records OCI terminal mode, but does not translate
+the parsed Kubernetes `stdin` field into stream policy. Passfd handles bypass
+the older RPC path after attachment, so their authorization requires the
+separate presence and ownership design below.
+
+#### Potential future improvement: policy-bound shared mounts
+
+This subsection is a potential future improvement, not a commitment or a
+description of current support. Legacy GenPolicy does not represent
+`shared_mounts`, and its Rego requires the request list to be empty. The
+appliance captures the field but currently rejects any non-empty value during
+generation. That fail-closed behavior must remain until both policy and Agent
+enforcement described below are implemented.
+
+`shared_mounts` can be supported only as an explicit cross-container trust
+grant. A policy entry must identify the exact tuple `(name, source container,
+source path, destination container, destination path)` and the destination
+container's `CreateContainerRequest` must match the complete declared set with
+no extras or duplicates. Container names must resolve uniquely to policy
+container identities; a request cannot choose a different source or
+destination by name alone.
+
+Exact tuple matching is necessary but not sufficient. The Agent currently
+waits for `src_path` to appear in the source container's mount table and clones
+that subtree with `open_tree()`. Secure support also requires the Agent to:
+
+1. Treat the policy declaration as an intentional grant for the source
+  container to provide content to the destination container. Do not infer
+  sharing from an untrusted request alone.
+2. Resolve the source and destination beneath the corresponding container
+  roots or mount namespaces with fd-relative, no-escape operations. Reject
+  symlinks, `..`, namespace aliases, and destinations that cover protected
+  runtime paths.
+3. Verify that the source is a mount point with a stable mount identity, open
+  that object once, and move the opened tree rather than resolving the path a
+  second time. Register the identity as sharable before cloning when the
+  source originates from an Agent-managed storage; for an application-created
+  mount, the policy grant explicitly delegates the approved source path to
+  that source container.
+4. Fail container creation if the source container, source mount, clone, or
+  destination move is unavailable. A timeout, unresolved source, or failed
+  `move_mount()` must not be silently skipped.
+5. Consume each declaration once and record the resulting destination mount
+  identity, preventing replay or a later request from substituting another
+  subtree at the same path.
+
+Until those Agent checks and policy fields exist, rejecting every non-empty
+`shared_mounts` request is the correct fail-closed behavior. Merely copying the
+captured tuples into policy would authorize path strings, not the mounted
+objects they name.
+
+#### Potential future improvement: policy-bound passfd I/O
+
+**Passfd stdio ports are transport handles, not workload identities.** Their
+numeric values are allocated at runtime and must not be pinned to clean-room
+values. Policy should instead carry, per container process, whether stdin,
+stdout, and stderr streams are expected. Rego can require zero for a disabled
+stream and a non-zero, pairwise-distinct handle for each enabled stream; it
+must also correlate terminal mode with stderr absence. The expected presence
+bits come from the captured final request and a trusted profile that enables
+passfd I/O, not from arbitrary production values.
+
+The Agent must atomically claim each non-zero handle from its passfd stream
+registry before any other request can use it, verify that every required stream
+exists and has the expected direction, and fail creation rather than replacing
+a missing stream with `None`. Registry entries must be one-shot and bound to
+the target sandbox, container/process, and stream role. If the transport cannot
+provide that binding, accepting a non-zero port proves only that some stream
+used that number and is not sufficient for cross-container isolation.
+
+With those registry checks, supporting variable non-zero ports is preferable
+to generation-time rejection. Until then, the compiler's rejection of any
+configured passfd port is a temporary fail-closed gate. The same presence and
+one-shot binding contract applies to passfd ports on `ExecProcessRequest`.
+
 ### Non-OCI policy fields
 
 The captured request supplies fields outside OCI as well as its final nested
@@ -358,6 +581,123 @@ Probe and lifecycle exec commands are the narrow exception: they describe
 future `ExecProcessRequest` operations and therefore do not exist in the
 initial `CreateContainerRequest`. The workload declaration is authoritative
 for those operations, and the policy admits their argument arrays exactly.
+
+#### Device and GPU requirements
+
+The final request remains authoritative for the device shape presented to the
+Agent, but a policy device must not be a verbatim copy of runtime-assigned
+identity. In particular, VFIO device numbers, guest PCI paths, and CDI
+annotation suffixes vary between the clean room and production.
+
+The compiler/Rego-only first phase is implemented:
+
+- raw non-VFIO devices retain exact cardinality, unique container paths, and
+  non-empty captured `id`, type, `vm_path`, and options;
+- empty fields in legacy volume-device placeholders remain path-only for
+  compatibility;
+- declared pGPUs produce unsuffixed VFIO requirements, while captured suffixed
+  runtime devices are used only to reject undeclared or count-mismatched
+  capture;
+- Rego correlates runtime VFIO number suffixes with unique CDI annotation
+  suffixes and checks the configured type, guest path shape, and PCI option
+  grammar.
+
+The remaining Agent-dependent phase should represent each device as a typed
+requirement with two groups of fields:
+
+- invariant intent: device class, expected count, container-visible path or
+  path family, access mode, vendor/class kind when declared, and whether the
+  device is represented through CDI;
+- runtime correlation: device number, transport identifier, guest PCI path,
+  CDI annotation suffix, and the Agent device-registry object that resolved
+  them.
+
+For GPUs and other VFIO devices, workload resource limits may establish count
+and requested CDI kind, but they cannot establish the physical device selected
+on the production node. A clean room without that hardware must not synthesize
+or claim a production identity. Secure support requires an Agent registry,
+rooted in trusted hotplug and guest-device resolution, to bind the policy
+requirement to the resolved host device, transport operation, guest device, and
+final CDI edits. Claims supplied by the untrusted host runtime and CDI
+annotations are correlation data, not trust anchors.
+
+Physical-identity support stays fail-closed until an Agent integration test
+proves registry and post-CDI effective-plan binding.
+
+#### Implementation complexity and boundary
+
+| Improvement | Complexity | Status / ownership |
+| --- | --- | --- |
+| Preserve normalized VFIO requirements and reject undeclared captured VFIO devices | Medium | Implemented in the compiler; no Agent change. |
+| Exact non-VFIO cardinality and captured stable fields | Low | Implemented in shared Rego with legacy path-only compatibility; no Agent change. |
+| Reject exec passfd handles in the current unsupported profile | Low | Implemented in shared Rego; no Agent change. |
+| Reject negative CopyFile sizes and offsets outside the declared size | Low | Implemented in shared Rego; no Agent change. |
+| Record a data-free CopyFile manifest and compare it with mount shape | Medium | Future appliance capture/compiler work; useful before, but not sufficient without, session enforcement. |
+| Bind a device requirement to hotplug transport, resolved guest device, and post-CDI effective plan | High | Design only; requires Agent/device-registry and creation-flow changes. |
+| Distinguish probe/lifecycle purpose from an identical interactive exec | Very high | Design only; requires protocol changes and a trusted intent issuer outside the host path. |
+| Enforce one-shot passfd stream ownership and role | High | Design only; requires Agent passfd registry and protocol changes. |
+| Enforce bundle-bound, one-shot CopyFile sessions and sealing | High | Design only; requires Agent state and protocol changes. |
+
+#### Potential future improvement: purpose-bound runtime exec
+
+An exact process contract is necessary but does not prove why an exec was
+requested. Today, a user-issued exec that reproduces an allowed probe or
+lifecycle process is indistinguishable from that action at the Agent boundary.
+The policy must not claim caller or purpose authorization unless the runtime
+adds authenticated request metadata that the host cannot freely substitute.
+
+If purpose separation is required, the request needs an exec authorization
+context bound to the sandbox, container, operation class (`probe`, `lifecycle`,
+or `interactive`), and one process request. That context must be issued by a
+trusted authority outside the untrusted host path, such as a signed
+control-plane workload intent verified in the guest or an in-guest trusted
+scheduler. A token issued merely because the host runtime requested one does
+not establish purpose. The Agent must validate the context before matching the
+corresponding policy entry. Probe contexts may be reusable within bounded
+command and concurrency rules; lifecycle contexts need phase-specific
+issuance; interactive contexts remain denied unless explicitly declared.
+Without a trusted issuer, policy can authorize only the process shape, not its
+origin.
+
+Each exec policy entry should match the complete process contract: exact argv,
+user and groups, environment semantics, cwd, no-new-privileges, capabilities,
+terminal mode, and expected stdio presence. `exec_id` remains an opaque,
+unique, runtime handle and is never an authorization identity. Regex command
+authorization remains disabled. Compiler-to-Rego tests must cover near-match
+argv, changed process fields, use before container creation, wrong-container
+reuse, duplicate/replayed handles, terminal changes, and passfd stream-role
+mismatches.
+
+#### Potential future improvement: bounded CopyFile sessions
+
+The current static `$(sfprefix)` rule is a permanent domain-wide write grant.
+It confines destination paths but does not prove that a copy belongs to a
+captured workload operation, and the recording Agent does not retain individual
+`CopyFileRequest` calls. Secure support should model a copy session rather than
+an unrestricted path prefix.
+
+Runtime-rs should register a copy plan before issuing file RPCs. The plan must
+be bound to the sandbox and destination bundle, identify the target mount role,
+and constrain the permitted relative paths and file types. Where metadata is
+deployment-invariant, it should also constrain mode, ownership, and final size;
+where ConfigMap or Secret content is intentionally deployment-variable, policy
+must classify it as mutable external input instead of pretending that capture
+attests it. Content digests are appropriate only for explicitly immutable
+inputs whose digest is available from a trusted declaration.
+
+The Agent should issue a one-shot session handle, require every chunk to claim
+that session and a declared file, enforce monotonic non-overlapping offsets and
+size limits, and atomically seal the destination when the plan completes.
+Unknown files, duplicate completion, writes after sealing, cross-bundle reuse,
+and incomplete sessions must fail. Existing `pathrs` confinement remains a
+required defense but is not a substitute for operation authorization.
+
+The appliance capture Agent should record a data-free copy manifest containing
+path, type, metadata, total size, and sequence boundaries while omitting Secret
+payload bytes. The compiler can then compare that manifest with the final mount
+shape and emit bounded copy-session policy. `kubectl cp` remains outside this
+contract because it is an exec-based `tar` workflow, not an Agent
+`CopyFileRequest` operation.
 
 ### External storage and device trust boundary
 
@@ -601,6 +941,16 @@ compatibility during rollout, but confidential production mode must enforce.
   outside its class contract;
 - cross-container shared mounts cannot clone `/`, `/proc`, secret volumes, or
   any mount that was not registered as sharable;
+- generated GPU/VFIO policy preserves normalized count and class requirements,
+  accepts correlated runtime-assigned device numbers, and rejects missing,
+  extra, duplicate, wrong-kind, or registry-unbound devices;
+- no exec request is described as probe- or lifecycle-authorized without a
+  context from a trusted issuer; process-only mode rejects every near-match and
+  wrong-container request while acknowledging that an identical caller cannot
+  be distinguished;
+- CopyFile writes require an active bundle-bound plan, cannot add undeclared
+  files or metadata, cannot overlap or exceed declared ranges, and cannot be
+  replayed after the destination is sealed;
 - watchable ConfigMap/Secret synchronization cannot scan, copy, delete, or
   change ownership outside its registered source and target roots;
 - CDI, CDH, storage, or device edits performed after receipt of the original
