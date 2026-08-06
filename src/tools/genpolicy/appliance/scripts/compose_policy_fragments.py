@@ -143,14 +143,53 @@ def compose(static_policy: dict, fragments: list[dict]) -> dict:
     return result
 
 
-def materialize(static_ir: dict, fragments: list[dict]) -> dict:
+def escaped_pointer_token(token: str) -> str:
+    return token.replace("~", "~0").replace("/", "~1")
+
+
+def first_mismatch(actual, expected, path="") -> str | None:
+    if type(actual) is not type(expected):
+        return path or "/"
+    if isinstance(expected, dict):
+        for key in sorted(expected.keys() | actual.keys()):
+            child_path = f"{path}/{escaped_pointer_token(key)}"
+            if key not in actual or key not in expected:
+                return child_path
+            mismatch = first_mismatch(actual[key], expected[key], child_path)
+            if mismatch is not None:
+                return mismatch
+        return None
+    if isinstance(expected, list):
+        for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
+            mismatch = first_mismatch(actual_item, expected_item, f"{path}/{index}")
+            if mismatch is not None:
+                return mismatch
+        if len(actual) != len(expected):
+            return f"{path}/{min(len(actual), len(expected))}"
+        return None
+    return None if actual == expected else path or "/"
+
+
+def verify_expected_policy(actual: dict, expected: dict) -> None:
+    mismatch = first_mismatch(actual, expected)
+    if mismatch is not None:
+        raise CompositionError(f"composed policy does not match expected policy at {mismatch}")
+
+
+def materialize(
+    static_ir: dict, fragments: list[dict], expected_policy: dict | None = None
+) -> dict:
     composed = compose(static_ir, fragments)
     if "subjects" not in composed or "policy_data" not in composed:
-        return composed
-    result = composed["policy_data"]
-    result["containers"] = [
-        subject["policy"] for subject in sorted(composed["subjects"], key=lambda item: item["ordinal"])
-    ]
+        result = composed
+    else:
+        result = composed["policy_data"]
+        result["containers"] = [
+            subject["policy"]
+            for subject in sorted(composed["subjects"], key=lambda item: item["ordinal"])
+        ]
+    if expected_policy is not None:
+        verify_expected_policy(result, expected_policy)
     return result
 
 
@@ -158,11 +197,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--static-policy", required=True, type=Path)
     parser.add_argument("--fragment", action="append", default=[], type=Path)
+    parser.add_argument("--expected-policy", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     static_policy = json.loads(args.static_policy.read_text(encoding="utf-8"))
     fragments = [json.loads(path.read_text(encoding="utf-8")) for path in args.fragment]
-    result = materialize(static_policy, fragments)
+    expected_policy = (
+        json.loads(args.expected_policy.read_text(encoding="utf-8"))
+        if args.expected_policy is not None
+        else None
+    )
+    result = materialize(static_policy, fragments, expected_policy)
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 

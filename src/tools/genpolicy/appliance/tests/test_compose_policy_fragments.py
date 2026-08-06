@@ -41,9 +41,33 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         return baseline
 
     def test_fragments_reconstruct_policy_compiler_output(self):
-        composed = composition.materialize(self.static_baseline(), self.fragments)
+        composed = composition.materialize(
+            self.static_baseline(), self.fragments, self.compiler_policy
+        )
 
         self.assertEqual(composed, self.compiler_policy)
+
+    def test_missing_claim_fails_expected_policy_coverage(self):
+        fragments = copy.deepcopy(self.fragments)
+        omitted = fragments[0]["claims"].pop()
+
+        with self.assertRaisesRegex(
+            composition.CompositionError,
+            rf"does not match expected policy at /containers/2{omitted['target']['path']}",
+        ):
+            composition.materialize(
+                self.static_baseline(), fragments, self.compiler_policy
+            )
+
+    def test_unexpected_static_leaf_fails_expected_policy_coverage(self):
+        baseline = self.static_baseline()
+        baseline["policy_data"]["unexpected"] = True
+
+        with self.assertRaisesRegex(
+            composition.CompositionError,
+            "does not match expected policy at /unexpected",
+        ):
+            composition.materialize(baseline, self.fragments, self.compiler_policy)
 
     def test_selectors_survive_container_reordering(self):
         baseline = self.static_baseline()
