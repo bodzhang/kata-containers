@@ -223,8 +223,36 @@ def first_mismatch(actual, expected, path="") -> str | None:
     return None if actual == expected else path or "/"
 
 
+def canonical_policy(policy: dict) -> dict:
+    result = copy.deepcopy(policy)
+    for container in result.get("containers", []):
+        process = container.get("OCI", {}).get("Process", {})
+        environment = process.get("Env")
+        if isinstance(environment, list):
+            by_name = {}
+            for entry in environment:
+                if not isinstance(entry, str):
+                    raise CompositionError("process environment entry is not a string")
+                name, separator, value = entry.partition("=")
+                if not separator or not name or name in by_name:
+                    raise CompositionError(
+                        f"invalid or duplicate process environment: {entry}"
+                    )
+                by_name[name] = value
+            process["Env"] = [f"{name}={by_name[name]}" for name in sorted(by_name)]
+        capabilities = process.get("Capabilities", {})
+        for name, values in capabilities.items():
+            if isinstance(values, list):
+                capabilities[name] = sorted(values)
+    request_defaults = result.get("request_defaults", {}).get("CreateContainerRequest", {})
+    allow_env_regex = request_defaults.get("allow_env_regex")
+    if isinstance(allow_env_regex, list):
+        request_defaults["allow_env_regex"] = sorted(allow_env_regex)
+    return result
+
+
 def verify_expected_policy(actual: dict, expected: dict) -> None:
-    mismatch = first_mismatch(actual, expected)
+    mismatch = first_mismatch(canonical_policy(actual), canonical_policy(expected))
     if mismatch is not None:
         raise CompositionError(f"composed policy does not match expected policy at {mismatch}")
 

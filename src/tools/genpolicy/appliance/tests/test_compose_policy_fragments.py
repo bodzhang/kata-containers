@@ -232,7 +232,7 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
                 {
                     "OCI": {
                         "Process": {
-                            "Env": ["POD_UID=$(pod-uid)", "STATIC=image"]
+                            "Env": ["STATIC=image", "POD_UID=$(pod-uid)"]
                         }
                     }
                 }
@@ -241,7 +241,54 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
 
         composed = composition.materialize(baseline, fragments, expected)
 
-        self.assertEqual(composed, expected)
+        self.assertEqual(
+            composed["containers"][0]["OCI"]["Process"]["Env"],
+            ["POD_UID=$(pod-uid)", "STATIC=image"],
+        )
+
+    def test_expected_policy_rejects_duplicate_environment_name(self):
+        policy = {
+            "containers": [
+                {"OCI": {"Process": {"Env": ["NAME=first", "NAME=second"]}}}
+            ]
+        }
+
+        with self.assertRaisesRegex(
+            composition.CompositionError, "invalid or duplicate process environment"
+        ):
+            composition.verify_expected_policy(policy, policy)
+
+    def test_expected_policy_normalizes_typed_sets(self):
+        actual = {
+            "containers": [
+                {
+                    "OCI": {
+                        "Process": {
+                            "Capabilities": {"Bounding": ["CAP_CHOWN", "CAP_AUDIT_WRITE"]}
+                        }
+                    }
+                }
+            ],
+            "request_defaults": {
+                "CreateContainerRequest": {"allow_env_regex": ["second", "first"]}
+            },
+        }
+        expected = {
+            "containers": [
+                {
+                    "OCI": {
+                        "Process": {
+                            "Capabilities": {"Bounding": ["CAP_AUDIT_WRITE", "CAP_CHOWN"]}
+                        }
+                    }
+                }
+            ],
+            "request_defaults": {
+                "CreateContainerRequest": {"allow_env_regex": ["first", "second"]}
+            },
+        }
+
+        composition.verify_expected_policy(actual, expected)
 
     def test_environment_map_rejects_invalid_name(self):
         baseline = {
