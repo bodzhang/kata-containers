@@ -13,7 +13,16 @@ SPEC.loader.exec_module(comparison)
 
 
 class ProfileRequestComparisonTests(unittest.TestCase):
-    def make_capture(self, root: Path, identity: str, rootfs_mode: str, container_id: str, pod_name: str):
+    def make_capture(
+        self,
+        root: Path,
+        identity: str,
+        rootfs_mode: str,
+        container_id: str,
+        pod_name: str,
+        profile_name: str = "test-profile",
+        kubernetes_version: str = "v1.33.13",
+    ):
         (root / "createcontainer-requests").mkdir(parents=True)
         (root / "execprocess-requests").mkdir()
         workload = """apiVersion: apps/v1
@@ -34,7 +43,11 @@ spec:
             "configuration_hashes": {},
             "identity": identity,
             "rootfs_mode": rootfs_mode,
-            "values": {"CONTAINERD_VERSION": "v2.3.3"},
+            "values": {
+                "CONTAINERD_VERSION": "v2.3.3",
+                "KUBERNETES_VERSION": kubernetes_version,
+                "PROFILE_NAME": profile_name,
+            },
         }
         (root / "profile.json").write_text(json.dumps(profile), encoding="utf-8")
         artifacts = {
@@ -83,6 +96,38 @@ spec:
             normalized = {change["path"]: change for change in entry["normalized_changes"]}
             self.assertEqual(normalized["/oci/process/env"]["change"], "reordered")
             self.assertEqual(normalized["/storages"]["section"], "agent-storages")
+
+    def test_profile_name_does_not_confound_one_factor_attribution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / "baseline"
+            candidate = root / "candidate"
+            self.make_capture(
+                baseline,
+                "base",
+                "guest-pull",
+                "base-id",
+                "service-old",
+                "k8s-1.33-containerd-2.3",
+                "v1.33.13",
+            )
+            self.make_capture(
+                candidate,
+                "next",
+                "guest-pull",
+                "next-id",
+                "service-new",
+                "k8s-1.36-containerd-2.3",
+                "v1.36.3",
+            )
+
+            delta = comparison.profile_delta(baseline, candidate)
+
+            self.assertEqual(len(delta["dimensions"]), 2)
+            self.assertEqual(
+                delta["attributed_cause"]["path"],
+                "/values/KUBERNETES_VERSION",
+            )
 
 
 if __name__ == "__main__":

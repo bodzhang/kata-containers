@@ -42,6 +42,7 @@ cleanup() {
 		cp "${policy_log}" "${output_dir}/policy-runtime-inputs.jsonl"
 		rm -f "${policy_log}"
 	fi
+	cp "${agent_log}" "${output_dir}/policy-agent.log"
 	rm -f "${agent_log}"
 	POLICY_TEST_STATUS="${status}" \
 	POLICY_TEST_FILE="${policy_file}" \

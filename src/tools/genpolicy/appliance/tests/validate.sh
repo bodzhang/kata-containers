@@ -34,6 +34,19 @@ assert changed == {"KUBERNETES_VERSION", "PROFILE_NAME"}, changed
 assert candidate["KUBERNETES_VERSION"] == "v1.36.3"
 PY
 
+python3 - \
+	"${appliance_dir}/profiles/k8s-1.33-containerd-2.3-guest-pull.settings.json" \
+	"${appliance_dir}/profiles/k8s-1.36-containerd-2.3-guest-pull.settings.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+assert json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")) == json.loads(
+    Path(sys.argv[2]).read_text(encoding="utf-8")
+)
+PY
+
 python3 -m compileall -q "${appliance_dir}/scripts" "${appliance_dir}/tests"
 python3 -m unittest discover -s "${appliance_dir}/tests" -p 'test_*.py'
 

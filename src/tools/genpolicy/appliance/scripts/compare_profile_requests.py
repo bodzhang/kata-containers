@@ -186,10 +186,15 @@ def profile_delta(baseline: Path, candidate: Path) -> dict:
         for path in static_paths
     )
     result = {"dimensions": dimensions, "static_inputs_equal": inputs_equal}
-    if inputs_equal and len(dimensions) == 1:
-        result["attributed_cause"] = dimensions[0]
-    elif dimensions:
-        result["candidate_causes"] = dimensions
+    causal_dimensions = [
+        dimension
+        for dimension in dimensions
+        if dimension["path"] != "/values/PROFILE_NAME"
+    ]
+    if inputs_equal and len(causal_dimensions) == 1:
+        result["attributed_cause"] = causal_dimensions[0]
+    elif causal_dimensions:
+        result["candidate_causes"] = causal_dimensions
     return result
 
 
