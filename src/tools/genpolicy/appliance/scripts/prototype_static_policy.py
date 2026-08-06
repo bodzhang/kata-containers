@@ -4,9 +4,21 @@ import argparse
 import base64
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import yaml
+
+
+UVM_STATIC_PATHS = {
+    "/OCI/Process/Args",
+    "/OCI/Process/Cwd",
+    "/OCI/Process/Env",
+    "/OCI/Process/NoNewPrivileges",
+    "/OCI/Process/User",
+    "/OCI/Root/Path",
+    "/OCI/Root/Readonly",
+}
 
 
 def load_module(name: str, path: Path):
@@ -162,10 +174,37 @@ def exec_commands(container: dict) -> list[list[str]]:
     return commands
 
 
-def generate_static_ir(capture: Path) -> dict:
+def uvm_static_baseline(path: Path) -> dict:
+    baseline = json.loads(path.read_text(encoding="utf-8"))
+    if baseline.get("schema_version") != 1:
+        raise ValueError("unsupported UVM static baseline schema")
+    artifact_digest = baseline.get("artifact_digest")
+    if not isinstance(artifact_digest, str) or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", artifact_digest
+    ) is None:
+        raise ValueError("UVM static baseline requires a sha256 artifact digest")
+    constraints = baseline.get("pause_constraints")
+    if not isinstance(constraints, dict):
+        raise ValueError("UVM static baseline requires pause_constraints")
+    unknown = set(constraints) - UVM_STATIC_PATHS
+    if unknown:
+        raise ValueError(f"profile-owned or unknown UVM static paths: {sorted(unknown)}")
+    missing = UVM_STATIC_PATHS - set(constraints)
+    if missing:
+        raise ValueError(f"missing UVM static paths: {sorted(missing)}")
+    return {
+        "artifact_digest": artifact_digest,
+        "constraints": constraints,
+    }
+
+
+def generate_static_ir(capture: Path, uvm_baseline_path: Path | None = None) -> dict:
     documents = workload_documents(capture / "workload.yaml")
     config_maps, secrets = trusted_objects(documents)
     images = image_configs(capture)
+    uvm_baseline = (
+        uvm_static_baseline(uvm_baseline_path) if uvm_baseline_path is not None else None
+    )
     subjects = []
     for document in documents:
         resolved = pod_spec(document)
@@ -212,6 +251,17 @@ def generate_static_ir(capture: Path) -> dict:
                     "workload": {"kind": document["kind"], "name": workload_name},
                 }
             )
+        if uvm_baseline is not None:
+            subjects.append(
+                {
+                    "constraints": uvm_baseline["constraints"],
+                    "namespace": namespace,
+                    "static_artifact": uvm_baseline["artifact_digest"],
+                    "subject": f"sandbox/{namespace}/{workload_name}",
+                    "unresolved": [],
+                    "workload": {"kind": document["kind"], "name": workload_name},
+                }
+            )
     return {"schema_version": 1, "subjects": subjects}
 
 
@@ -223,15 +273,28 @@ def policy_data(path: Path) -> dict:
     return json.loads(text.rsplit(marker, 1)[1])
 
 
-def policy_subjects(data: dict) -> dict[str, dict]:
+def policy_subjects(data: dict, static_ir: dict | None = None) -> dict[str, dict]:
     result = {}
+    sandboxes_by_namespace = {}
     for container in data.get("containers", []):
         annotations = container.get("OCI", {}).get("Annotations", {})
-        if annotations.get("io.kubernetes.cri.container-type") != "container":
-            continue
-        name = annotations.get("io.kubernetes.cri.container-name")
-        if name:
-            result[f"container/{name}"] = container
+        container_type = annotations.get("io.kubernetes.cri.container-type")
+        if container_type == "container":
+            name = annotations.get("io.kubernetes.cri.container-name")
+            if name:
+                result[f"container/{name}"] = container
+        elif container_type == "sandbox":
+            namespace = annotations.get("io.kubernetes.cri.sandbox-namespace")
+            sandboxes_by_namespace.setdefault(namespace, []).append(container)
+    if static_ir is not None:
+        static_sandboxes = {}
+        for subject in static_ir["subjects"]:
+            if subject["subject"].startswith("sandbox/"):
+                static_sandboxes.setdefault(subject["namespace"], []).append(subject)
+        for namespace, subjects in static_sandboxes.items():
+            candidates = sandboxes_by_namespace.get(namespace, [])
+            if len(subjects) == 1 and len(candidates) == 1:
+                result[subjects[0]["subject"]] = candidates[0]
     return result
 
 
@@ -293,7 +356,7 @@ def merged_settings(base: Path, patches: list[Path]) -> dict:
 
 
 def compare_static(ir: dict, policy: dict) -> dict:
-    subjects = policy_subjects(policy)
+    subjects = policy_subjects(policy, ir)
     checks = []
     for static_subject in ir["subjects"]:
         subject = static_subject["subject"]
@@ -305,14 +368,14 @@ def compare_static(ir: dict, policy: dict) -> dict:
             else:
                 try:
                     actual = pointer_value(candidate, path)
-                    if path == "/OCI/Process/Env":
+                    if path == "/OCI/Process/Env" and isinstance(expected, dict):
                         actual = key_values(actual)
                         matched = all(
                             actual.get(name) == value for name, value in expected.items()
                         )
                     else:
                         matched = actual == expected
-                except (KeyError, TypeError):
+                except (IndexError, KeyError, TypeError, ValueError):
                     actual = None
                     matched = False
             checks.append(
@@ -454,8 +517,9 @@ def analyze(
     settings_patches: list[Path] | None = None,
     baseline_capture: Path | None = None,
     kata_config: Path | None = None,
+    uvm_baseline: Path | None = None,
 ) -> dict:
-    static_ir = generate_static_ir(capture)
+    static_ir = generate_static_ir(capture, uvm_baseline)
     legacy = policy_data(legacy_policy_path)
     compiler = policy_data(compiler_policy_path)
     transformations, provenance = request_provenance.analyze(capture)
@@ -510,6 +574,7 @@ def main() -> None:
     parser.add_argument("--settings-patch", action="append", default=[], type=Path)
     parser.add_argument("--baseline-capture", type=Path)
     parser.add_argument("--kata-config", type=Path)
+    parser.add_argument("--uvm-baseline", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     report = analyze(
@@ -520,6 +585,7 @@ def main() -> None:
         args.settings_patch,
         args.baseline_capture,
         args.kata_config,
+        args.uvm_baseline,
     )
     args.output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"

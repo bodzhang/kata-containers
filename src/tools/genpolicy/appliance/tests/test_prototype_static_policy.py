@@ -130,6 +130,139 @@ spec:
             with self.assertRaisesRegex(ValueError, "not digest-bound"):
                 prototype.generate_static_ir(capture)
 
+    def test_generates_uvm_static_pause_subject(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            baseline = capture / "uvm-static.json"
+            constraints = {
+                "/OCI/Process/Args": ["/pause"],
+                "/OCI/Process/Cwd": "/",
+                "/OCI/Process/Env": ["PATH=/usr/bin"],
+                "/OCI/Process/NoNewPrivileges": True,
+                "/OCI/Process/User": {
+                    "AdditionalGids": [65535],
+                    "GID": 65535,
+                    "UID": 65535,
+                    "Username": "",
+                },
+                "/OCI/Root/Path": "$(root_path)",
+                "/OCI/Root/Readonly": True,
+            }
+            baseline.write_text(
+                json.dumps(
+                    {
+                        "artifact_digest": f"sha256:{'a' * 64}",
+                        "pause_constraints": constraints,
+                        "schema_version": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = prototype.generate_static_ir(capture, baseline)
+
+            sandbox = result["subjects"][1]
+            self.assertEqual(sandbox["subject"], "sandbox/default/test")
+            self.assertEqual(sandbox["constraints"], constraints)
+            self.assertEqual(sandbox["static_artifact"], f"sha256:{'a' * 64}")
+
+    def test_rejects_profile_owned_uvm_static_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            baseline = Path(temporary) / "uvm-static.json"
+            baseline.write_text(
+                json.dumps(
+                    {
+                        "artifact_digest": f"sha256:{'a' * 64}",
+                        "pause_constraints": {
+                            path: [] for path in prototype.UVM_STATIC_PATHS
+                        }
+                        | {"/OCI/Linux/Namespaces": []},
+                        "schema_version": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "profile-owned or unknown"):
+                prototype.uvm_static_baseline(baseline)
+
+    def test_compares_uvm_static_pause_subject(self):
+        constraints = {
+            "/OCI/Process/Args": ["/pause"],
+            "/OCI/Process/Env": ["PATH=/usr/bin"],
+            "/OCI/Root/Readonly": True,
+        }
+        static_ir = {
+            "subjects": [
+                {
+                    "constraints": constraints,
+                    "namespace": "default",
+                    "subject": "sandbox/default/test",
+                }
+            ]
+        }
+        policy = {
+            "containers": [
+                {
+                    "OCI": {
+                        "Annotations": {
+                            "io.kubernetes.cri.container-type": "sandbox",
+                            "io.kubernetes.cri.sandbox-namespace": "default",
+                        },
+                        "Process": {"Args": ["/pause"], "Env": ["PATH=/usr/bin"]},
+                        "Root": {"Readonly": True},
+                    }
+                }
+            ]
+        }
+
+        comparison = prototype.compare_static(static_ir, policy)
+
+        self.assertEqual(comparison["result"], "pass")
+        self.assertEqual(comparison["matched"], 3)
+
+    def test_does_not_guess_ambiguous_sandbox_subject(self):
+        static_ir = {
+            "subjects": [
+                {
+                    "constraints": {"/OCI/Process/Args": ["/pause"]},
+                    "namespace": "default",
+                    "subject": "sandbox/default/first",
+                },
+                {
+                    "constraints": {"/OCI/Process/Args": ["/pause"]},
+                    "namespace": "default",
+                    "subject": "sandbox/default/second",
+                },
+            ]
+        }
+        policy = {
+            "containers": [
+                {
+                    "OCI": {
+                        "Annotations": {
+                            "io.kubernetes.cri.container-type": "sandbox",
+                            "io.kubernetes.cri.sandbox-namespace": "default",
+                        }
+                    }
+                },
+                {
+                    "OCI": {
+                        "Annotations": {
+                            "io.kubernetes.cri.container-type": "sandbox",
+                            "io.kubernetes.cri.sandbox-namespace": "default",
+                        }
+                    }
+                },
+            ]
+        }
+
+        comparison = prototype.compare_static(static_ir, policy)
+
+        self.assertEqual(comparison["result"], "fail")
+        self.assertEqual(comparison["matched"], 0)
+
     def test_merges_legacy_settings_patches_in_order(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
