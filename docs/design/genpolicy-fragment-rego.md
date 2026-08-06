@@ -2,9 +2,9 @@
 
 ## Status
 
-This document proposes a design for separating workload-static policy from
-versioned platform mutations. It does not describe functionality currently
-implemented by Kata Agent or GenPolicy.
+This document proposes a design for separating workload-static and UVM-static
+policy from versioned platform mutations. It does not describe functionality
+currently implemented by Kata Agent or GenPolicy.
 
 ## Motivation
 
@@ -26,9 +26,9 @@ The prediction embeds behavior from specific Kubernetes, containerd, and Kata
 versions in GenPolicy. Component upgrades can therefore cause policy drift even
 when workload intent has not changed.
 
-The proposed design makes GenPolicy responsible only for static workload and
-image constraints. Versioned **Rego fragments** validate mutations introduced
-by the platform profile. The name and composition model follow the hcsshim
+The proposed design makes GenPolicy responsible for static workload, image,
+and measured UVM constraints. Versioned **Rego fragments** validate mutations
+introduced by the platform profile. The name and composition model follow the hcsshim
 security-policy fragment design, including fragment identity by issuer, feed,
 namespace, and security version number (SVN). The main adaptation is that Kata
 fragments validate platform mutations rather than contribute additional
@@ -77,7 +77,13 @@ and
 
 Static policy
 :   Constraints derived from trusted workload YAML, referenced ConfigMaps and
-    Secrets, and image configuration bound to a manifest digest.
+  Secrets, image configuration bound to a manifest digest, or a measured UVM
+  artifact such as the built-in pause container.
+
+UVM-static policy
+:   Constraints derived from the measured UVM image and independent of the
+  Kubernetes, containerd, and runtime-rs profile. The built-in pause
+  executable and its image-derived process identity are UVM-static.
 
 Static policy IR
 :   A compiler intermediate representation containing only static policy plus
@@ -111,6 +117,7 @@ one of those subjects. It cannot replace or delete static data.
 ```mermaid
 flowchart LR
     YAML[Workload YAML and image data] --> IR[Static policy IR]
+  UVM[Measured UVM image] --> IR
     PROFILE[Selected profile fragments] --> COMPOSE[Additive compositor]
     IR --> COMPOSE
     COMPOSE --> POLICY[Final policy data]
@@ -199,7 +206,7 @@ correlations, evidence, and whether absence is also meaningful.
 
 ## Mutation Categories
 
-### Static workload and image
+### Static workload, image, and UVM pause
 
 This category is not a fragment. GenPolicy owns it.
 
@@ -214,11 +221,32 @@ This category is not a fragment. GenPolicy owns it.
 | Root read-only state | Exact |
 | Volume role and destination | Exact |
 | Probe and lifecycle commands | Exact |
+| Built-in pause command and process identity | Exact from the measured UVM image |
 
 Static data must not contain containerd-generated root paths, CRI annotations,
 host mount paths, or runtime-rs storage objects. It does contain stable subject
 IDs and static anchors needed by fragment additions, such as container name,
 volume role, destination, image digest, command, and environment-variable name.
+
+The pause container is a special static subject. Kata uses the pause executable
+from the UVM image rather than treating the Kubernetes CRI sandbox image as a
+workload image pulled into the guest. Its command, executable identity, and
+UVM-root relationship are pinned by the measured UVM artifact and do not vary
+with Kubernetes, containerd, or runtime-rs versions. The CRI pause image
+reference can still appear as sandbox envelope metadata, but it is not
+authority for guest code or rootfs content.
+
+Profile fragments may add the sandbox OCI version, generated identity,
+annotations, namespaces, mounts, sysctls, cgroup data, and Agent transport
+fields. They cannot redefine the pause executable, command, or UVM-root
+identity. A UVM image update creates a new UVM-static baseline; it is not a new
+containerd or runtime-rs mutation fragment.
+
+The existing containerd 1.7.29 and 2.3.3 captures corroborate this boundary.
+Both sandbox requests have command `/pause`, UID and GID `65535`, supplementary
+GID `65535`, working directory `/`, no-new-privileges enabled, and a read-only
+root. Capture equality is supporting evidence; the measured UVM artifact
+remains the authority.
 
 The first static IR prototype derives the following constraints without reading
 either generated policy:
@@ -233,7 +261,7 @@ either generated policy:
 
 It rejects image references that are not manifest-digest bound. It does not yet
 classify user and group resolution, capability deltas other than explicit final
-sets, volume intent, or sandbox policy as static.
+sets, volume intent, or emit the UVM-static pause subject.
 
 ### Kubernetes API and controller fragment
 
@@ -294,7 +322,7 @@ differences across five workloads and eleven paired create requests:
 | Claim | containerd 1.7.29 | containerd 2.3.3 | Request scope |
 | --- | --- | --- | --- |
 | OCI version | `1.1.0` | `1.3.0` | Sandbox and containers |
-| `io.kubernetes.cri.podsandbox.image-name` | Absent | Exact profile pause reference | Sandbox |
+| `io.kubernetes.cri.podsandbox.image-name` | Absent | Exact configured CRI sandbox reference; metadata only | Sandbox |
 | Sandbox sysctls | Absent | `ip_unprivileged_port_start=0` and `ping_group_range=0 2147483647` | Sandbox |
 
 Capability, environment, and mount ordering differed but their semantic sets
@@ -323,7 +351,8 @@ The fragment rejects internally consistent but statically unanchored identities.
 Storage behavior merits a separate fragment because it depends on trusted Kata
 configuration and snapshotter artifacts, not only runtime-rs version:
 
-- guest pull: exact manifest digest or the special pause identity;
+- guest pull: exact workload manifest digest; the built-in pause root remains
+  UVM-static and is not authorized by a CRI image reference;
 - EROFS/dm-verity: exact root hash, layer identity, driver, and options;
 - shared filesystem: source constrained to the configured shared domain;
 - `shared_fs = "none"`: Agent-local disk `emptyDir` fallback;
@@ -421,12 +450,28 @@ changing fragment validator semantics.
 
 ## Profile Identity
 
-A fragment feed is readable metadata, not sufficient compatibility proof. The
-canonical profile identity hashes at least:
+A fragment feed is readable metadata, not sufficient compatibility proof.
+Composition binds two different identities:
+
+Static base identity
+:   Hashes the trusted workload inputs, digest-bound workload images, measured
+    UVM image, and built-in pause artifact.
+
+Mutation profile identity
+:   Hashes only the components, configurations, and operating modes that can
+    affect the selected fragment claims.
+
+Separating them permits one reviewed containerd fragment to be reused across
+UVM images when its claims do not depend on UVM content. A fragment declares
+any static-base capability it consumes; a rootfs/storage fragment may depend on
+UVM facilities even though a containerd OCI fragment does not. The composition
+manifest binds both identities and rejects an undeclared dependency.
+
+Across the selected fragments, mutation profile identities cover at least:
 
 - Kubernetes, kubelet, containerd, runtime-rs, runc, CNI, and Agent versions;
 - kubelet, containerd, Kata, CNI, and policy-framework configurations;
-- architecture, cgroup mode, rootfs mode, snapshotter, and pause image;
+- architecture, cgroup mode, rootfs mode, and snapshotter;
 - capture backend and request-authority implementation;
 - enabled admission, controller, CSI, and device-plugin fragments;
 - hashes of binaries and configuration artifacts used to derive the fragment.
@@ -558,12 +603,12 @@ must be normalized by typed identity correlation before individual differences
 become fragment claims. Component-family attribution alone is insufficient.
 
 !!! warning "Current proof boundary"
-  The independently generated static slice proves selected static fields and
-  the capture proves several mutation boundaries. It does not yet prove full
-  final-policy reconstruction. Full proof requires extending the static IR,
-  deriving every mutation claim from settings or capture evidence, and
-  requiring complete additive reconstruction of policy-compiler output with
-  no unclaimed leaf paths.
+    The independently generated static slice proves selected static fields and
+    the capture proves several mutation boundaries. It does not yet prove full
+    final-policy reconstruction. Full proof requires extending the static IR,
+    deriving every mutation claim from settings or capture evidence, and
+    requiring complete additive reconstruction of policy-compiler output with
+    no unclaimed leaf paths.
 
 ## Capture And Fragment Derivation
 
@@ -595,6 +640,228 @@ flowchart LR
 The appliance already captures all boundaries except kubelet CRI requests.
 Until a recording CRI proxy is added, kubelet and containerd ownership is
 partially ambiguous and must be reviewed conservatively.
+
+## Evidence And Testing Strategy
+
+No finite workload corpus can prove that a fragment captures every possible
+mutation. Completeness is established by combining field coverage, controlled
+experiments, source review, negative tests, and fail-closed handling of unknown
+fields. Captures alone demonstrate observed behavior; source review alone does
+not demonstrate the behavior of the deployed binary and configuration.
+
+### Mutation completeness ledger
+
+For each adjacent pipeline boundary, the analysis produces a typed field
+ledger. A ledger entry records:
+
+- request kind and stable workload subject;
+- canonical field path or typed collection role;
+- presence at the input and output boundary;
+- operation: `default`, `generate`, `resolve`, `derive`, `normalize`,
+  `rewrite`, `remove`, or `envelope`;
+- owning category and fragment claim;
+- static anchors and cross-field correlations;
+- capture artifacts and profile identity;
+- source-code evidence, when reviewed; and
+- positive, negative, absence, and interaction tests covering the claim.
+
+Presence and absence are both covered. A component that stops emitting a
+sysctl or annotation has changed behavior even though no final value exists to
+compare. Collections are inventoried by semantic role, such as mount
+destination or environment-variable name, rather than array index.
+
+For one request $Q$, let $L(Q)$ be all canonical final leaves and required
+absences, $S(Q)$ the leaves owned by static policy, and $C_i(Q)$ the leaves
+claimed by fragment $i$. The coverage gate is:
+
+$$
+L(Q) = S(Q) \dot{\cup} C_1(Q) \dot{\cup} \cdots \dot{\cup} C_n(Q)
+$$
+
+where $\dot{\cup}$ requires disjoint ownership. Composition fails if a leaf is
+unclaimed, multiply claimed, or absent from the protocol schema inventory.
+Schema inventory is generated from protocol descriptors and captured JSON, so
+a newly introduced request field fails CI until it is classified.
+
+Coverage is measured at three levels:
+
+| Gate | Requirement |
+| --- | --- |
+| Request coverage | Every final leaf, collection role, and required absence has one owner |
+| Transformation coverage | Every adjacent-boundary difference has one operation and category |
+| Evidence coverage | Every claim has capture replay, negative tests, and reviewed evidence |
+
+The current PoC measures only part of request and transformation coverage. It
+must not report fragment completeness yet.
+
+### Evidence hierarchy
+
+Each claim requires more than one type of evidence:
+
+| Evidence | What it establishes | Limitation |
+| --- | --- | --- |
+| Static derivation | Value follows from YAML, digest-bound image data, or a trusted object | Covers only implemented input forms |
+| Same-profile repetition | Separates stable behavior from generated or nondeterministic values | Does not identify the producing component |
+| Adjacent-boundary capture | Shows the stage at which a mutation occurred | Requires every relevant boundary |
+| One-factor profile comparison | Attributes a behavior change to one component or configuration family | Misses unexercised branches |
+| Pinned source review | Finds defaults, removals, feature gates, and branches absent from captures | Build flags, downstream patches, and runtime configuration can differ |
+| Negative and metamorphic tests | Demonstrates that the proposed rule rejects widening and preserves correlations | Tests only stated properties |
+
+No fragment is publishable from a single capture or a source-code reading
+alone.
+
+### Component source review
+
+Source review is required before a fragment moves from experimental to
+publishable. It is not required to start a capture-derived candidate. Review
+uses the exact source commit, build configuration, patches, and configuration
+hashes from the profile, and covers the code that owns each claim:
+
+| Category | Source review focus |
+| --- | --- |
+| Kubernetes API/controller | Defaulting, generated names and UIDs, controller templates, feature gates |
+| Kubelet resolution | Environment resolution, security-context projection, resources, DNS, and volume preparation |
+| containerd OCI | CRI-to-OCI defaults, annotations, mounts, capabilities, namespaces, sysctls, and cgroups |
+| runtime-rs | OCI-to-Agent rewrites, storage/device construction, annotation injection, and Seccomp handling |
+| Rootfs/storage mode | Snapshotter metadata, guest-pull identity, shared-fs mode, dm-verity, and encryption options |
+| UVM pause baseline | Built-in pause binary, process identity, packaging, and measured UVM-root relationship |
+
+The claim ledger records repository, commit, file and symbol, controlling
+configuration or feature gate, and reviewed branch conditions. Source review
+must identify absence behavior and error paths, not only the branch observed in
+the capture. A source branch without a workload test becomes an explicit
+coverage gap.
+
+### Workload corpus
+
+Large YAML tests reduce missed-mutation risk only when their coverage is
+structured. Repeating similar large manifests provides less evidence than
+small single-feature workloads plus selected interaction workloads.
+
+The corpus has three layers:
+
+1. Minimal fixtures isolate one YAML or image feature and produce a small,
+  attributable delta.
+2. Pairwise fixtures combine features likely to interact at one component
+  boundary.
+3. Realistic workloads exercise ordering, repetition, multiple containers,
+  controllers, and generated identities.
+
+The existing matrix covers basic Pods, process overrides, environment sources,
+service environment, probes, ConfigMap and Secret data, and several storage
+classes. It needs additional fixtures for:
+
+| Area | Required cases |
+| --- | --- |
+| Container lifecycle | Init, sidecar, ephemeral, lifecycle hooks, all probe types, TTY and stdin |
+| Image semantics | Entrypoint/Cmd precedence, empty fields, numeric and named users, groups, supplementary groups |
+| Security context | Privileged, capability add/drop, no-new-privileges, read-only root, Seccomp, AppArmor, SELinux |
+| Pod sharing | Host network/PID/IPC, shared process namespace, hostname, DNS policy and options |
+| Resources | CPU and memory requests/limits, huge pages, unified cgroup values, QoS classes |
+| Volumes | Projected, downward API, service account, PVC, image, subPath, block device, read-only and mount propagation |
+| Devices | VFIO, CDI, GPU count, volume devices, and conflicting device paths |
+| Controllers | Deployment, StatefulSet, DaemonSet, Job, CronJob, generated names, and restart behavior |
+| Networking | Multiple Services, named ports, IPv4/IPv6, host ports, CNI namespace, and no service links |
+| Metadata | User annotations, runtime annotation allowlists, labels, namespaces, and admission mutation |
+
+Pause testing is intentionally smaller than workload-image testing. One
+canonical sandbox case per measured UVM image verifies the exact pause command,
+process identity, and UVM-root relationship. The same pause static subject is
+then reused across component profiles. Cross-profile tests require those static
+leaves to remain identical while permitting only the claimed sandbox envelope
+to differ.
+
+Feature coverage is recorded against ledger claims and reviewed source
+branches. Pairwise generation is preferred for broad interaction coverage;
+full Cartesian products are reserved for interactions known to cross ownership
+boundaries. Property-based tests vary ordering, omission, duplicate entries,
+names, IDs, and valid boundary values without creating permanent YAML files for
+every combination.
+
+### Profile matrix
+
+Additional profiles are required, but profile proliferation must remain
+controlled. Static classification is provenance-first: a value is static
+because it is derived only from trusted static inputs, not merely because it
+remained unchanged in sampled profiles. Cross-profile invariance is a
+falsification test for that classification.
+
+Use one-factor-at-a-time comparisons from a fully pinned baseline, followed by
+selected pairwise interactions:
+
+| Axis | Minimum comparison |
+| --- | --- |
+| Kubernetes API and kubelet | Two supported minor versions with otherwise identical binaries and configuration |
+| containerd | Current 1.7 and 2.x profiles, plus another supported 2.x release when behavior changes |
+| runtime-rs and Agent | Two commits or releases with containerd and workload held constant |
+| Runtime configuration | Seccomp on/off, annotation allowlist, sandbox sharing, and relevant feature gates |
+| Rootfs/storage | Guest pull, EROFS/dm-verity, shared fs, Agent-local `emptyDir`, encrypted and plain block |
+| UVM image | Two measured UVM builds when the built-in pause artifact changes; component-only changes reuse one UVM baseline |
+| Host environment | cgroup v1/v2 where supported, at least amd64 and arm64, IPv4 and dual stack |
+| Runtime baseline | runtime-rs capture and runc-native raw-OCI baseline |
+| Extensions | Each admission webhook, CSI driver, CNI, and device plugin independently enabled |
+
+Each profile is captured at least three times with generated identities and
+resource creation order varied. Stable semantic output must be identical after
+typed normalization. A difference between repetitions is classified as
+nondeterminism and requires a grammar or correlation rule; it is never copied
+as an exact fragment value.
+
+Profile comparisons are accepted for automatic attribution only when static
+artifact hashes match and all changed profile dimensions belong to one declared
+component family. Version labels and profile names are metadata, not separate
+causes. Changes spanning component families remain unassigned until a narrower
+experiment is run.
+
+### Falsifying the additive assumption
+
+The additive model is a hypothesis to test, not a constraint imposed on
+evidence. For every controlled run:
+
+1. Generate static IR without loading profile settings or captures.
+2. Verify that profile selection cannot change or delete a static IR leaf.
+  This includes the UVM-static pause command and root relationship.
+3. Derive mutation claims only from settings leaves, adjacent-boundary capture,
+  and reviewed transformations.
+4. Apply claims in multiple orders and require canonical output equality.
+5. Require the composed policy data to equal request-derived policy-compiler
+  output after documented order-insensitive normalization.
+6. Replay all captured requests against the composed policy.
+7. Compare with Legacy policy and explain every semantic difference; Legacy is
+  a compatibility reference, not the security authority.
+
+The hypothesis is falsified if a profile must overwrite or delete a trusted
+static constraint, if composition order changes the result, or if final policy
+requires an unclaimed value. A host-to-guest rewrite does not falsify the model
+when static IR records host-independent intent and the fragment adds only the
+final guest constraint. If static IR already contains the host representation,
+the IR boundary is wrong and must be redesigned rather than granting fragments
+replacement authority.
+
+### Test phases and exit criteria
+
+1. **Inventory:** enumerate request schemas, settings leaves, static-input
+  forms, and reviewed source branches.
+2. **Repeatability:** capture the baseline profile repeatedly and establish
+  typed normalization for every nondeterministic value.
+3. **Boundary attribution:** add the kubelet CRI capture boundary and require
+  complete adjacent-stage ledgers.
+4. **Workload coverage:** run minimal, pairwise, realistic, property-based, and
+  negative workload tests until every known branch and claim is covered.
+5. **Profile coverage:** run one-factor comparisons, then selected pairwise
+  profile interactions.
+6. **Reconstruction:** require static IR plus fragments to reproduce canonical
+  policy-compiler output for every matrix cell.
+7. **Enforcement:** replay positive requests and mutate every claim, anchor,
+  absence, and correlation to demonstrate rejection.
+8. **Review:** reconcile capture evidence with pinned source and configuration,
+  then sign and publish the fragment and its evidence manifest.
+
+A fragment can be labeled **experimental** after successful reconstruction for
+one controlled profile. It becomes **reviewed** after source reconciliation,
+complete claim/absence coverage, negative tests, and same-profile repetition.
+It becomes **releasable** only after the required workload and profile matrix
+passes with zero unknown or multiply owned leaves.
 
 ## Agent Integration
 
