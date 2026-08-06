@@ -340,11 +340,15 @@ This fragment owns the raw-OCI to Agent-request transformation:
 - Kata bundle and container-type annotations;
 - Agent `Storage` and `Device` construction;
 - `shared_mounts` and `sandbox_pidns` request fields;
-- Seccomp removal when enabled by trusted Kata configuration.
+- Seccomp removal when enabled by trusted Kata configuration, paired with an
+  explicit final-request absence rule.
 
 Root paths, storage mount points, and bundle annotations must bind the same
 bundle ID. Sandbox-scoped mount and storage paths must bind the same sandbox ID.
 The fragment rejects internally consistent but statically unanchored identities.
+The current upstream Rego does not enforce sandbox Seccomp absence in the
+captured profile, so that observed removal remains an uncovered candidate, not
+an implemented fragment claim.
 
 ### Rootfs and storage-mode fragment
 
@@ -516,28 +520,29 @@ runtime validator.
 
 ## Executable Design Check
 
-An initial compositor prototype lives in
+The compositor prototype lives in
 `src/tools/genpolicy/appliance/scripts/compose_policy_fragments.py`, with tests
 in `src/tools/genpolicy/appliance/tests/test_compose_policy_fragments.py`. It
 uses the checked-in `run-complex` policy compiler output as a golden result.
 
-The test removes representative containerd and runtime-rs fields from the
-compiler result to form a static IR, assigns each container a stable workload
-subject ID, applies additive fragments, and compares the materialized
-`policy_data` structurally with the compiler output. It currently demonstrates:
+The original test removed representative containerd and runtime-rs fields from
+the compiler result. It remains a focused composition test, while
+`prototype_fragment_coverage.py` now exercises an independently generated
+static IR. The compositor demonstrates:
 
-- exact reconstruction of OCI version defaults and Kata root-path constraints;
+- complete expected-policy comparison with fail-closed missing-leaf detection;
 - selectors that remain correct after subject-array reordering;
-- rejection of duplicate claims;
+- semantic environment composition by variable name;
+- typed normalization of environment, capability, and regex collections;
+- non-materializing required-absence assertions;
+- rejection of duplicate or overlapping parent/child claims;
 - rejection when an addition would overwrite static data; and
 - rejection of an unknown subject.
 
-This proves that additive fragments can reproduce the selected compiler-owned
-fields without Agent changes. It is not yet proof that the complete policy has
-been partitioned correctly: the current static IR fixture is derived by
-subtracting selected fields from compiler output. The next implementation step
-is for GenPolicy to emit the static IR directly and for a coverage report to
-show that every non-static final-policy field came from exactly one fragment.
+This proves the additive composition mechanics without Agent changes. The
+coverage prototype additionally separates policy-data reconstruction from
+runtime-request absence coverage; success at the first cannot hide a gap in the
+second.
 
 ### Independently generated static slice
 
@@ -548,20 +553,71 @@ image configuration. It does not read Legacy or request-derived policy while
 generating constraints. It then compares those constraints with both policy
 outputs and uses the bundle only for mutation provenance.
 
-The checked local containerd 1.7.29 and 2.3.3 complex-workload bundles produced
-the following result:
+The generator also accepts a separately measured UVM baseline through a strict
+allowlist. It adds the pause command, environment, user, working directory,
+no-new-privileges, root path relationship, and read-only root without reading a
+containerd capture. The checked local containerd 1.7.29 and 2.3.3
+complex-workload bundles produced the following result:
 
 | Measurement | containerd 1.7.29 | containerd 2.3.3 |
 | --- | ---: | ---: |
-| Static constraints generated | 9 | 9 |
+| Workload/image static constraints generated | 9 | 9 |
+| UVM-static pause constraints generated | 7 | 7 |
 | Matching Legacy constraints | 9 | 9 |
-| Matching request-derived compiler constraints | 9 | 9 |
+| Matching request-derived compiler constraints | 16 | 16 |
 | Unresolved `valueFrom` anchors retained | 3 | 3 |
 
 The constraints cover two workload containers. They include arguments,
 environment subsets, working directories, no-new-privileges, and exec commands.
 The result is evidence that these fields can move out of profile-specific
 generation without changing either policy implementation.
+
+### Complete candidate reconstruction
+
+`prototype_fragment_coverage.py` builds sparse subjects only from the
+independent static IR, derives a candidate claim for every remaining final
+policy-data leaf, and invokes the compositor with the compiler policy as an
+oracle. The expected policy supplies no static value. Environment entries are
+keyed by name in the composition IR and materialized back to OCI arrays.
+
+Both checked profiles reconstruct canonically:
+
+| Measurement | containerd 1.7.29 | containerd 2.3.3 |
+| --- | ---: | ---: |
+| Static owned roles | 19 | 19 |
+| Candidate fragment claims | 139 | 139 |
+| Ambiguous kubelet-or-containerd claims | 73 | 73 |
+| Exact canonical reconstruction | Pass | Pass |
+
+The `19` static roles count environment variables individually, unlike the
+earlier `16` constraint-object comparison. Candidate categories in each run are
+`73` kubelet-or-containerd, `3` kubelet resolution, `37` policy-framework
+settings, `11` runtime-rs rewrites, and `15` runtime-rs envelope claims.
+
+After typed set normalization, only three claims differ between profiles: OCI
+version for the sandbox and two workload containers, from `1.1.0` to `1.3.0`.
+Capability and service-environment regex order differences are not mutations.
+
+The CLI writes its report and exits nonzero by default while ownership or
+absence coverage is incomplete. `--allow-incomplete` permits candidate
+generation but leaves the report result as `incomplete`.
+
+### Runtime absence coverage
+
+Policy-data reconstruction and final Agent-request coverage are separate
+gates. Adjacent raw-OCI-to-Agent analysis observes four removals in each checked
+profile:
+
+- `Linux.Resources.Devices` is absent for the sandbox and both workload
+  containers. The current Rego input gate enforces all three absences.
+- Sandbox `Linux.Seccomp` is removed by runtime-rs but has no corresponding
+  final-request absence rule in the current upstream Rego.
+
+The current inventory therefore covers three of four observed removals and
+fails closed on the uncovered Seccomp absence. This does not imply Seccomp must
+always be absent: profiles that preserve guest Seccomp require an exact or
+bounded positive claim instead. The profile configuration and Agent feature
+set determine which branch applies.
 
 ### Legacy settings contribution
 
@@ -603,12 +659,12 @@ must be normalized by typed identity correlation before individual differences
 become fragment claims. Component-family attribution alone is insufficient.
 
 !!! warning "Current proof boundary"
-    The independently generated static slice proves selected static fields and
-    the capture proves several mutation boundaries. It does not yet prove full
-    final-policy reconstruction. Full proof requires extending the static IR,
-    deriving every mutation claim from settings or capture evidence, and
-    requiring complete additive reconstruction of policy-compiler output with
-    no unclaimed leaf paths.
+  The PoC now proves canonical policy-data reconstruction for two controlled
+  profiles, but it does not prove publishable fragment completeness. Seventy-
+  three claims still cross the missing kubelet CRI capture boundary, the
+  current profile manifests do not bind a measured UVM digest, and one
+  observed sandbox Seccomp removal lacks runtime absence enforcement. The
+  workload and profile matrices also remain incomplete.
 
 ## Capture And Fragment Derivation
 
@@ -691,8 +747,9 @@ Coverage is measured at three levels:
 | Transformation coverage | Every adjacent-boundary difference has one operation and category |
 | Evidence coverage | Every claim has capture replay, negative tests, and reviewed evidence |
 
-The current PoC measures only part of request and transformation coverage. It
-must not report fragment completeness yet.
+The current PoC measures complete final policy-data reconstruction for two
+profiles and partial transformation and absence coverage. It reports
+`incomplete`, never fragment completeness.
 
 ### Evidence hierarchy
 
