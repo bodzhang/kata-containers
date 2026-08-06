@@ -113,10 +113,10 @@ def validate_fragments(fragments: list[dict]) -> None:
             operation = claim.get("operation")
             if operation not in SEMANTIC_OPERATIONS:
                 raise CompositionError(f"unsupported semantic operation: {operation}")
-            if operation == "remove":
-                raise CompositionError("remove is an absence assertion, not a materialized claim")
-            if "value" not in claim:
+            if operation != "remove" and "value" not in claim:
                 raise CompositionError("materialized claim requires a value")
+            if operation == "remove" and "value" in claim:
+                raise CompositionError("absence assertion cannot contain a value")
             identity = target_identity(claim.get("target", {}))
             if identity in owners:
                 raise CompositionError(
@@ -134,12 +134,29 @@ def apply_claim(document: dict, claim: dict) -> None:
     add_child(parent, token, copy.deepcopy(claim["value"]))
 
 
+def assert_absence(document: dict, claim: dict) -> None:
+    selected, pointer = resolve_target(document, claim["target"])
+    try:
+        parent, token = pointer_parent(selected, pointer)
+    except CompositionError:
+        return
+    if has_child(parent, token):
+        raise CompositionError(
+            f"required absence is present: {target_identity(claim['target'])}"
+        )
+
+
 def compose(static_policy: dict, fragments: list[dict]) -> dict:
     validate_fragments(fragments)
     result = copy.deepcopy(static_policy)
     for fragment in fragments:
         for claim in fragment.get("claims", []):
-            apply_claim(result, claim)
+            if claim["operation"] != "remove":
+                apply_claim(result, claim)
+    for fragment in fragments:
+        for claim in fragment.get("claims", []):
+            if claim["operation"] == "remove":
+                assert_absence(result, claim)
     return result
 
 

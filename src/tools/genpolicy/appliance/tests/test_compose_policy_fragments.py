@@ -134,6 +134,70 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         with self.assertRaisesRegex(composition.CompositionError, "subject matched 0 items"):
             composition.compose(self.static_baseline(), fragments)
 
+    def test_absence_assertion_does_not_materialize_a_value(self):
+        fragments = copy.deepcopy(self.fragments)
+        fragments.append(
+            {
+                "category": "runtime-rs",
+                "claims": [
+                    {
+                        "operation": "remove",
+                        "target": {
+                            "subject": "container/workload",
+                            "path": "/OCI/Process/ApparmorProfile",
+                        },
+                    }
+                ],
+            }
+        )
+
+        composed = composition.materialize(
+            self.static_baseline(), fragments, self.compiler_policy
+        )
+
+        self.assertEqual(composed, self.compiler_policy)
+
+    def test_absence_assertion_rejects_static_value(self):
+        fragments = copy.deepcopy(self.fragments)
+        fragments.append(
+            {
+                "category": "runtime-rs",
+                "claims": [
+                    {
+                        "operation": "remove",
+                        "target": {
+                            "subject": "container/workload",
+                            "path": "/OCI/Process/Cwd",
+                        },
+                    }
+                ],
+            }
+        )
+
+        with self.assertRaisesRegex(composition.CompositionError, "required absence is present"):
+            composition.compose(self.static_baseline(), fragments)
+
+    def test_absence_assertion_conflicts_with_additive_claim(self):
+        fragments = copy.deepcopy(self.fragments)
+        claim = copy.deepcopy(fragments[0]["claims"][0])
+        claim.pop("value")
+        claim["operation"] = "remove"
+        fragments.append({"category": "runtime-rs", "claims": [claim]})
+
+        with self.assertRaisesRegex(composition.CompositionError, "duplicate claim"):
+            composition.compose(self.static_baseline(), fragments)
+
+    def test_absence_assertion_rejects_value(self):
+        fragments = copy.deepcopy(self.fragments)
+        claim = copy.deepcopy(fragments[0]["claims"][0])
+        claim["operation"] = "remove"
+        fragments.append({"category": "runtime-rs", "claims": [claim]})
+
+        with self.assertRaisesRegex(
+            composition.CompositionError, "absence assertion cannot contain a value"
+        ):
+            composition.compose(self.static_baseline(), fragments)
+
 
 if __name__ == "__main__":
     unittest.main()
