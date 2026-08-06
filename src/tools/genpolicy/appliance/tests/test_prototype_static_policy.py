@@ -130,6 +130,20 @@ spec:
             with self.assertRaisesRegex(ValueError, "not digest-bound"):
                 prototype.generate_static_ir(capture)
 
+    def test_rejects_duplicate_static_subject_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            workload = (capture / "workload.yaml").read_text(encoding="utf-8")
+            pod = workload[workload.index("apiVersion: v1\nkind: Pod") :]
+            (capture / "workload.yaml").write_text(
+                workload + "---\n" + pod.replace("name: test", "name: second", 1),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "static subject identity is ambiguous"):
+                prototype.generate_static_ir(capture)
+
     def test_generates_uvm_static_pause_subject(self):
         with tempfile.TemporaryDirectory() as temporary:
             capture = Path(temporary)
@@ -262,6 +276,19 @@ spec:
 
         self.assertEqual(comparison["result"], "fail")
         self.assertEqual(comparison["matched"], 0)
+
+    def test_rejects_duplicate_final_policy_subject_identity(self):
+        container = {
+            "OCI": {
+                "Annotations": {
+                    "io.kubernetes.cri.container-name": "app",
+                    "io.kubernetes.cri.container-type": "container",
+                }
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "policy subject identity is ambiguous"):
+            prototype.policy_subjects({"containers": [container, container]})
 
     def test_merges_legacy_settings_patches_in_order(self):
         with tempfile.TemporaryDirectory() as temporary:

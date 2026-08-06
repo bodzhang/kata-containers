@@ -262,6 +262,12 @@ def generate_static_ir(capture: Path, uvm_baseline_path: Path | None = None) -> 
                     "workload": {"kind": document["kind"], "name": workload_name},
                 }
             )
+    subject_ids = [subject["subject"] for subject in subjects]
+    duplicates = sorted(
+        subject_id for subject_id in set(subject_ids) if subject_ids.count(subject_id) > 1
+    )
+    if duplicates:
+        raise ValueError(f"static subject identity is ambiguous: {duplicates}")
     return {"schema_version": 1, "subjects": subjects}
 
 
@@ -282,7 +288,10 @@ def policy_subjects(data: dict, static_ir: dict | None = None) -> dict[str, dict
         if container_type == "container":
             name = annotations.get("io.kubernetes.cri.container-name")
             if name:
-                result[f"container/{name}"] = container
+                subject = f"container/{name}"
+                if subject in result:
+                    raise ValueError(f"policy subject identity is ambiguous: {subject}")
+                result[subject] = container
         elif container_type == "sandbox":
             namespace = annotations.get("io.kubernetes.cri.sandbox-namespace")
             sandboxes_by_namespace.setdefault(namespace, []).append(container)
