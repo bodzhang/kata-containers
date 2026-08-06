@@ -235,6 +235,23 @@ def request_absence_coverage(observed: list[dict], inventory: dict | None) -> di
     }
 
 
+def finalize_report(report: dict, absence_coverage: dict) -> dict:
+    report["request_absence_coverage"] = absence_coverage
+    blockers = []
+    ambiguous = report["coverage"]["ambiguous_boundary_claims"]
+    if ambiguous:
+        blockers.append(f"{ambiguous} claims have ambiguous component ownership")
+    if absence_coverage["inventory"] != "loaded":
+        blockers.append("runtime absence inventory is missing")
+    if absence_coverage["uncovered"]:
+        blockers.append(
+            f"{absence_coverage['uncovered']} observed runtime absences are uncovered"
+        )
+    report["blockers"] = blockers
+    report["result"] = "pass" if not blockers else "incomplete"
+    return report
+
+
 def report_sources(source_report: dict, static_ir: dict) -> dict[str, dict[str, str]]:
     static_sandboxes = [
         subject["subject"]
@@ -391,6 +408,7 @@ def main() -> None:
     parser.add_argument("--compiler-policy", required=True, type=Path)
     parser.add_argument("--source-report", required=True, type=Path)
     parser.add_argument("--absence-inventory", type=Path)
+    parser.add_argument("--allow-incomplete", action="store_true")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     static_ir = static_policy.generate_static_ir(args.capture, args.uvm_baseline)
@@ -402,10 +420,15 @@ def main() -> None:
         if args.absence_inventory is not None
         else None
     )
-    report["request_absence_coverage"] = request_absence_coverage(
-        observed_request_absences(args.capture, static_ir), inventory
+    report = finalize_report(
+        report,
+        request_absence_coverage(
+            observed_request_absences(args.capture, static_ir), inventory
+        ),
     )
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if report["result"] != "pass" and not args.allow_incomplete:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

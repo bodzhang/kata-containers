@@ -192,6 +192,30 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
                 observed, {"rules": [rule, rule], "schema_version": 1}
             )
 
+    def test_final_report_fails_closed_on_coverage_gaps(self):
+        report = {"coverage": {"ambiguous_boundary_claims": 2}}
+        absences = {
+            "inventory": "loaded",
+            "uncovered": 1,
+        }
+
+        result = coverage.finalize_report(report, absences)
+
+        self.assertEqual(result["result"], "incomplete")
+        self.assertEqual(len(result["blockers"]), 2)
+
+    def test_final_report_passes_complete_evidence(self):
+        report = {"coverage": {"ambiguous_boundary_claims": 0}}
+        absences = {
+            "inventory": "loaded",
+            "uncovered": 0,
+        }
+
+        result = coverage.finalize_report(report, absences)
+
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(result["blockers"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
