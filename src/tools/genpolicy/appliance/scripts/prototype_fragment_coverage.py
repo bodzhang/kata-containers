@@ -262,9 +262,14 @@ def bind_profile(report: dict, static_ir: dict, profile: dict) -> dict:
         "uvm_bound": bool(uvm_artifacts) and profile_uvm_digest in uvm_artifacts,
     }
     report["binding"] = binding
+    report["static_policy"]["profile_identity"] = identity
+    report["static_policy"]["static_base_digest"] = static_base_digest
     for fragment in report["fragments"]:
         fragment["profile_identity"] = identity
         fragment["static_base_digest"] = static_base_digest
+    composition.validate_fragment_bindings(
+        report["static_policy"], report["fragments"]
+    )
     return report
 
 

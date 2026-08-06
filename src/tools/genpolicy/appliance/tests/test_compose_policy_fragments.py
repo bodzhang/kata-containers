@@ -432,6 +432,39 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         with self.assertRaisesRegex(composition.CompositionError, "invalid JSON pointer"):
             composition.validate_fragments(fragments)
 
+    def test_rejects_mismatched_profile_binding(self):
+        baseline = self.static_baseline()
+        baseline["profile_identity"] = "profile-a"
+        baseline["static_base_digest"] = "sha256:static"
+        fragments = copy.deepcopy(self.fragments)
+        for fragment in fragments:
+            fragment["profile_identity"] = "profile-b"
+            fragment["static_base_digest"] = "sha256:static"
+
+        with self.assertRaisesRegex(composition.CompositionError, "profile_identity"):
+            composition.compose(baseline, fragments)
+
+    def test_rejects_unbound_fragment_in_bound_composition(self):
+        baseline = self.static_baseline()
+        baseline["profile_identity"] = "profile-a"
+        baseline["static_base_digest"] = "sha256:static"
+
+        with self.assertRaisesRegex(composition.CompositionError, "profile_identity"):
+            composition.compose(baseline, self.fragments)
+
+    def test_accepts_matching_fragment_bindings(self):
+        baseline = self.static_baseline()
+        baseline["profile_identity"] = "profile-a"
+        baseline["static_base_digest"] = "sha256:static"
+        fragments = copy.deepcopy(self.fragments)
+        for fragment in fragments:
+            fragment["profile_identity"] = "profile-a"
+            fragment["static_base_digest"] = "sha256:static"
+
+        composed = composition.materialize(baseline, fragments, self.compiler_policy)
+
+        self.assertEqual(composed, self.compiler_policy)
+
 
 if __name__ == "__main__":
     unittest.main()

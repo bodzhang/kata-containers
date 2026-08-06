@@ -179,6 +179,24 @@ def validate_fragments(fragments: list[dict]) -> None:
             owners.append((target, category))
 
 
+def validate_fragment_bindings(static_policy: dict, fragments: list[dict]) -> None:
+    keys = ("profile_identity", "static_base_digest")
+    static_values = {key: static_policy.get(key) for key in keys}
+    static_bound = any(value is not None for value in static_values.values())
+    fragment_bound = any(
+        fragment.get(key) is not None for fragment in fragments for key in keys
+    )
+    if not static_bound and not fragment_bound:
+        return
+    if any(not isinstance(static_values[key], str) or not static_values[key] for key in keys):
+        raise CompositionError("static policy requires complete fragment bindings")
+    for fragment in fragments:
+        category = fragment["category"]
+        for key in keys:
+            if fragment.get(key) != static_values[key]:
+                raise CompositionError(f"fragment {category} has mismatched {key}")
+
+
 def apply_claim(document: dict, claim: dict) -> None:
     selected, pointer = resolve_target(document, claim["target"])
     parent, token = pointer_parent_for_add(selected, pointer)
@@ -202,6 +220,7 @@ def assert_absence(document: dict, claim: dict) -> None:
 
 def compose(static_policy: dict, fragments: list[dict]) -> dict:
     validate_fragments(fragments)
+    validate_fragment_bindings(static_policy, fragments)
     result = copy.deepcopy(static_policy)
     for fragment in fragments:
         for claim in fragment.get("claims", []):
