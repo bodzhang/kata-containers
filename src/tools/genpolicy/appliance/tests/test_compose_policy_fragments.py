@@ -452,6 +452,13 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         with self.assertRaisesRegex(composition.CompositionError, "profile_identity"):
             composition.compose(baseline, self.fragments)
 
+    def test_rejects_partial_static_binding(self):
+        baseline = self.static_baseline()
+        baseline["profile_identity"] = "profile-a"
+
+        with self.assertRaisesRegex(composition.CompositionError, "complete fragment bindings"):
+            composition.compose(baseline, self.fragments)
+
     def test_accepts_matching_fragment_bindings(self):
         baseline = self.static_baseline()
         baseline["profile_identity"] = "profile-a"

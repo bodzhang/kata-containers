@@ -307,15 +307,25 @@ def policy_subjects(data: dict, static_ir: dict | None = None) -> dict[str, dict
     return result
 
 
+def pointer_tokens(pointer: str) -> list[str]:
+    if pointer == "":
+        return []
+    if not pointer.startswith("/"):
+        raise ValueError(f"invalid JSON pointer: {pointer}")
+    return [token.replace("~1", "/").replace("~0", "~") for token in pointer[1:].split("/")]
+
+
 def pointer_value(document: dict, pointer: str):
     value = document
-    for token in pointer.removeprefix("/").split("/"):
+    for token in pointer_tokens(pointer):
         value = value[int(token)] if isinstance(value, list) else value[token]
     return value
 
 
 def pointer_parent(document: dict, pointer: str):
-    tokens = pointer.removeprefix("/").split("/")
+    tokens = pointer_tokens(pointer)
+    if not tokens:
+        raise ValueError("JSON patch cannot replace the settings root")
     parent = document
     for token in tokens[:-1]:
         parent = parent[int(token)] if isinstance(parent, list) else parent[token]

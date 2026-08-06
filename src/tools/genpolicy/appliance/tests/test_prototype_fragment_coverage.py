@@ -131,6 +131,10 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
                 self.static_ir(), expected, self.source_report()
             )
 
+    def test_environment_map_rejects_empty_name(self):
+        with self.assertRaisesRegex(coverage.CoverageError, "invalid or duplicate"):
+            coverage.environment_map(["=value"])
+
     def test_unmapped_final_subject_fails_coverage(self):
         expected = self.expected_policy()
         expected["containers"][0]["OCI"]["Annotations"][

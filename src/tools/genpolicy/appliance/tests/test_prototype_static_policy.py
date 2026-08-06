@@ -336,6 +336,29 @@ spec:
             self.assertEqual(settings["kata_config"]["oci_version"], "1.3.0")
             self.assertEqual(settings["values"], ["first"])
 
+    def test_settings_patch_decodes_json_pointer_tokens(self):
+        settings = {"escaped/key": {"tilde~key": "old"}}
+
+        prototype.apply_settings_patch(
+            settings,
+            [
+                {
+                    "op": "replace",
+                    "path": "/escaped~1key/tilde~0key",
+                    "value": "new",
+                }
+            ],
+        )
+
+        self.assertEqual(settings["escaped/key"]["tilde~key"], "new")
+        self.assertEqual(
+            prototype.pointer_value(settings, "/escaped~1key/tilde~0key"), "new"
+        )
+
+    def test_settings_patch_rejects_root_replacement(self):
+        with self.assertRaisesRegex(ValueError, "settings root"):
+            prototype.apply_settings_patch({}, [{"op": "replace", "path": "", "value": {}}])
+
     def test_reports_settings_leaf_coverage(self):
         settings = {
             "common": {"exact": "value", "compiler_only": "input"},
