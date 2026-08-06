@@ -428,18 +428,24 @@ impl Agent for RecordingAgent {
                 serialize_create_request(&req)? + "\n",
             )?;
             if let Some(spec) = &req.oci {
-                std::fs::write(
-                    output_dir.join("raw").join(format!("{basename}.config.json")),
-                    serde_json::to_string_pretty(spec)? + "\n",
-                )?;
                 let bundle = spec
                     .annotations()
                     .as_ref()
                     .and_then(|annotations| {
                         annotations.get(kata_types::annotations::BUNDLE_PATH_KEY)
                     })
-                    .cloned()
-                    .unwrap_or_default();
+                    .context("captured create request has no runtime bundle annotation")?;
+                let raw_config_path = PathBuf::from(bundle).join("config.json");
+                let raw_config = std::fs::read_to_string(&raw_config_path).with_context(|| {
+                    format!("read raw OCI config {}", raw_config_path.display())
+                })?;
+                serde_json::from_str::<serde_json::Value>(&raw_config).with_context(|| {
+                    format!("parse raw OCI config {}", raw_config_path.display())
+                })?;
+                std::fs::write(
+                    output_dir.join("raw").join(format!("{basename}.config.json")),
+                    raw_config,
+                )?;
                 std::fs::write(
                     output_dir.join("raw").join(format!("{basename}.meta.json")),
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -613,11 +619,24 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&output);
         let agent = RecordingAgent::to_directory(output.clone()).unwrap();
-        let bundle = "/run/containerd/io.containerd.runtime.v2.task/k8s.io/test";
+        let bundle_dir = output.join("bundle");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(
+            bundle_dir.join("config.json"),
+            r#"{"ociVersion":"1.0.2","process":{"cwd":"/raw"}}"#,
+        )
+        .unwrap();
+        let bundle = bundle_dir.to_string_lossy().into_owned();
         let spec = serde_json::from_value(serde_json::json!({
             "ociVersion": "1.0.2",
+            "process": {
+                "args": [],
+                "cwd": "/final",
+                "env": [],
+                "user": {"gid": 0, "uid": 0},
+            },
             "annotations": {
-                kata_types::annotations::BUNDLE_PATH_KEY: bundle,
+                kata_types::annotations::BUNDLE_PATH_KEY: &bundle,
             },
         }))
         .unwrap();
@@ -646,6 +665,13 @@ mod tests {
         assert!(create.exists());
         assert!(raw.exists());
         assert!(exec.exists());
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(raw).unwrap()).unwrap();
+        let final_request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(create).unwrap()).unwrap();
+        assert_eq!(raw["process"]["cwd"], "/raw");
+        assert_eq!(final_request["oci"]["process"]["cwd"], "/final");
 
         let metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(metadata).unwrap()).unwrap();

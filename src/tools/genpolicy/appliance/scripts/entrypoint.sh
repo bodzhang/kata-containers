@@ -10,8 +10,15 @@ readonly input_dir="${GENPOLICY_INPUT_DIR:-/input}"
 readonly output_dir="${GENPOLICY_OUTPUT_DIR:-/output}"
 readonly workload="${input_dir}/workload.yaml"
 
+profile_name="${GENPOLICY_PROFILE_NAME:-k8s-1.33-containerd-2.3-native}"
+profile_path="${appliance_root}/profiles/${profile_name}.env"
+[[ -f "${profile_path}" ]] || {
+	echo "ERROR: unknown capture profile: ${profile_name}" >&2
+	exit 1
+}
 # shellcheck source=/dev/null
-source "${appliance_root}/profile.env"
+source "${profile_path}"
+export GENPOLICY_ROOTFS_MODE="${ROOTFS_MODE}"
 
 mkdir -p "${output_dir}/raw" "${output_dir}/logs"
 
@@ -58,10 +65,22 @@ runc) ;;
 runtime-rs) containerd_config="${appliance_root}/config/containerd-runtime-rs.toml" ;;
 *) fail "unsupported capture backend: ${GENPOLICY_CAPTURE_BACKEND}" ;;
 esac
+if [[ "${ROOTFS_MODE}" == "erofs-dmverity" ]]; then
+	[[ "${GENPOLICY_CAPTURE_BACKEND:-runtime-rs}" == "runtime-rs" ]] ||
+		fail "EROFS dm-verity requires the runtime-rs capture backend"
+	containerd_config="${appliance_root}/config/containerd-runtime-rs-erofs.toml"
+fi
 install -D -m 0644 "${containerd_config}" /etc/containerd/config.toml
 install -D -m 0644 "${appliance_root}/config/kubelet.yaml" /etc/kubernetes/kubelet.yaml
 install -D -m 0644 "${appliance_root}/config/10-genpolicy.conflist" /etc/cni/net.d/10-genpolicy.conflist
 install -D -m 0755 "${appliance_root}/scripts/runc-capture" /usr/local/bin/runc-capture
+if [[ "${ROOTFS_MODE}" == "erofs-dmverity" ]]; then
+	/lib/systemd/systemd-udevd --daemon
+	wait_for udev udevadm control --ping
+	python3 "${appliance_root}/scripts/watch_device_mapper_nodes.py" \
+		>"${output_dir}/logs/device-mapper-nodes.log" 2>&1 &
+	pids+=("$!")
+fi
 mkdir -p "/etc/containerd/certs.d/${LOCAL_REGISTRY}"
 cat >"/etc/containerd/certs.d/${LOCAL_REGISTRY}/hosts.toml" <<EOF
 server = "http://${LOCAL_REGISTRY}"
@@ -183,6 +202,21 @@ while IFS= read -r image_ref; do
 	fi
 done <"${output_dir}/requested-images.txt"
 
+case "$(uname -m)" in
+x86_64) image_architecture=amd64 ;;
+aarch64) image_architecture=arm64 ;;
+ppc64le | s390x) image_architecture=$(uname -m) ;;
+*) fail "unsupported image architecture: $(uname -m)" ;;
+esac
+python3 "${appliance_root}/scripts/capture_image_metadata.py" \
+	--requested-images "${output_dir}/requested-images.txt" \
+	--output "${output_dir}/images" \
+	--ctr /usr/local/bin/ctr \
+	--address /run/containerd/containerd.sock \
+	--namespace k8s.io \
+	--os linux \
+	--architecture "${image_architecture}"
+
 iptables --flush OUTPUT
 iptables --append OUTPUT --out-interface lo --jump ACCEPT
 iptables --policy OUTPUT DROP
@@ -270,72 +304,10 @@ captures=$(find "${output_dir}/raw" -type f -name '*.config.json' | wc -l)
 [[ "${captures}" -eq "${expected_captures}" ]] ||
 	fail "expected ${expected_captures} OCI captures, found ${captures}"
 
-# In-appliance generation of the rootfs integrity pins from the digest-pinned
-# images: real erofs dm-verity root hashes (block mode) and the guest-pull
-# manifest digest. Uses a bundled containerd >= 2.2 erofs snapshotter, so it is
-# opt-in and requires the erofs kernel module, dm-verity, loop, and
-# erofs-utils >= 1.8.2 (see README Prerequisites). The two rootfs modes are
-# mutually exclusive: emit block rootfs-mounts only for erofs dm-verity;
-# guest-pull records digests only (emitting block mounts would replace the
-# guest-pull VirtualVolume). Populates GENPOLICY_ROOTFS_MOUNTS_DIR, which the
-# capture stage below consumes. Best-effort.
-if [[ "${GENPOLICY_BUILD_EROFS_DMVERITY:-0}" == "1" || "${GENPOLICY_GUEST_PULL:-0}" == "1" ]]; then
-	if [[ "${GENPOLICY_BUILD_EROFS_DMVERITY:-0}" == "1" ]]; then
-		erofs_mode="erofs-dmverity"
-		: "${GENPOLICY_ROOTFS_MOUNTS_DIR:=${output_dir}/erofs-mounts}"
-		mkdir -p "${GENPOLICY_ROOTFS_MOUNTS_DIR}"
-		export GENPOLICY_ROOTFS_MOUNTS_DIR
-	else
-		erofs_mode="guest-pull"
-	fi
-	python3 "${appliance_root}/scripts/prepare_erofs_dmverity.py" \
-		--raw-dir "${output_dir}/raw" \
-		--out-dir "${GENPOLICY_ROOTFS_MOUNTS_DIR:-${output_dir}/erofs-mounts}" \
-		--manifest-digests "${output_dir}/manifest-digests.json" \
-		--mode "${erofs_mode}" \
-		--containerd "${GENPOLICY_EROFS_CONTAINERD:-/usr/local/bin/containerd}" \
-		--ctr "${GENPOLICY_EROFS_CTR:-/usr/local/bin/ctr}" \
-		--work-root "${output_dir}/erofs-prep" \
-		--report "${output_dir}/erofs-prep-report.json" \
-		>"${output_dir}/logs/erofs-prep.log" 2>&1 ||
-		echo "erofs dm-verity prep failed; see logs/erofs-prep.log" >&2
-fi
-
-# Capture the Kata container rootfs_mounts (e.g. multi-layer erofs) that a
-# snapshotter would hand to the Kata shim. The appliance runs runc/overlayfs, so
-# the erofs mounts are prepared out-of-band on an equipped prep host and the
-# per-image snapshotter mounts are provided via GENPOLICY_ROOTFS_MOUNTS_DIR.
-# Best-effort; writes raw/<name>.rootfs-mounts.json consumed by the predictor.
-if [[ -n "${GENPOLICY_ROOTFS_MOUNTS_DIR:-}" && -d "${GENPOLICY_ROOTFS_MOUNTS_DIR}" ]]; then
-	python3 "${appliance_root}/scripts/capture_rootfs_mounts.py" \
-		--raw-dir "${output_dir}/raw" \
-		--mounts-dir "${GENPOLICY_ROOTFS_MOUNTS_DIR}" \
-		--report "${output_dir}/rootfs-mounts-captured.json" \
-		2>"${output_dir}/logs/rootfs-capture.log" ||
-		echo "rootfs-mounts capture failed; see logs/rootfs-capture.log" >&2
-fi
-
 # Request capture needs the deployment's shim configuration and is mandatory,
 # so reject an incomplete invocation before running audit-only prediction.
 [[ -n "${GENPOLICY_KATA_CONFIG:-}" && -f "${GENPOLICY_KATA_CONFIG}" ]] ||
 	fail "GENPOLICY_KATA_CONFIG must name a readable Kata configuration"
-
-# Predict Kata agent storages/devices from the captured OCI specs using the real
-# runtime-rs volume handlers driven by a dry-run hypervisor (no VM). This report
-# is audit-only. Best-effort; mount-type rewriting inspects live host mount state,
-# so this must run while workload volumes are still mounted.
-guest_pull_arg=()
-[[ "${GENPOLICY_GUEST_PULL:-0}" == "1" ]] && guest_pull_arg=(--guest-pull)
-python3 "${appliance_root}/scripts/predict_storages.py" \
-	--raw-dir "${output_dir}/raw" \
-	--predictor /usr/local/bin/storage-predictor \
-	--emptydir-mode "${GENPOLICY_EMPTYDIR_MODE:-shared-fs}" \
-	--block-driver "${GENPOLICY_BLOCK_DRIVER:-virtio-blk-pci}" \
-	--kata-config "${GENPOLICY_KATA_CONFIG:-}" \
-	"${guest_pull_arg[@]}" \
-	--output "${output_dir}/storages-devices-predicted.json" \
-	2>"${output_dir}/logs/storage-predictor.log" ||
-	echo "storage prediction failed; see logs/storage-predictor.log" >&2
 
 if [[ "${GENPOLICY_CAPTURE_BACKEND:-runtime-rs}" == "runc" ]]; then
 	mkdir -p "${output_dir}/createcontainer-requests"
@@ -366,6 +338,77 @@ fi
 request_captures=$(find "${output_dir}/createcontainer-requests" -type f -name '*.json' | wc -l)
 [[ "${request_captures}" -eq "${expected_captures}" ]] ||
 	fail "expected ${expected_captures} CreateContainerRequest captures, found ${request_captures}"
+
+if [[ "${ROOTFS_MODE}" == "erofs-dmverity" ]]; then
+	python3 - "${output_dir}/createcontainer-requests" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+required = {
+	"X-kata.dmverity-enabled=true",
+	"X-kata.multi-layer=true",
+}
+for path in Path(sys.argv[1]).glob("*.json"):
+	request = json.loads(path.read_text(encoding="utf-8"))
+	protected = [
+		storage
+		for storage in request.get("storages", [])
+		if required.issubset(storage.get("options", []))
+		and any(option.startswith("X-kata.dmverity.roothash=") for option in storage.get("options", []))
+		and any(option.startswith("X-kata.dmverity.hashoffset=") for option in storage.get("options", []))
+	]
+	if not protected:
+		raise SystemExit(f"{path.name}: no strict dm-verity EROFS storage in final Agent request")
+PY
+fi
+
+rootfs_mode="${ROOTFS_MODE}"
+
+capture_bundle_args=(
+	--source "${output_dir}"
+	--bundle "${output_dir}/capture"
+	--workload "${workload}"
+	--profile "${profile_path}"
+	--capture-backend "${GENPOLICY_CAPTURE_BACKEND:-runtime-rs}"
+	--rootfs-mode "${rootfs_mode}"
+	--outbound-sealed
+	--configuration "containerd.toml=/etc/containerd/config.toml"
+	--configuration "kubelet.yaml=/etc/kubernetes/kubelet.yaml"
+	--configuration "cni.conflist=/etc/cni/net.d/10-genpolicy.conflist"
+	--configuration "kata-configuration.toml=${GENPOLICY_KATA_CONFIG}"
+	--input-image "pause.tar=/opt/genpolicy/images/pause.tar"
+	--input-image "busybox.tar=/opt/genpolicy/images/busybox.tar"
+)
+if [[ "${GENPOLICY_CAPTURE_BACKEND:-runtime-rs}" == "runtime-rs" ]]; then
+	capture_bundle_args+=(
+		--capture-binary \
+		"containerd-shim-kata-capture-v2=/usr/local/bin/containerd-shim-kata-capture-v2"
+	)
+else
+	capture_bundle_args+=(
+		--capture-binary "createreq-capture=/usr/local/bin/createreq-capture"
+		--capture-binary "runc-capture=/usr/local/bin/runc-capture"
+	)
+fi
+if [[ -d "${input_dir}/images" ]]; then
+	input_image_number=0
+	while IFS= read -r -d '' image; do
+		input_image_number=$((input_image_number + 1))
+		capture_bundle_args+=(
+			--input-image \
+			"$(printf 'input-image-%04d' "${input_image_number}")=${image}"
+		)
+	done < <(find "${input_dir}/images" -type f -name '*.tar' -print0 | sort -z)
+fi
+
+python3 "${appliance_root}/scripts/capture_bundle.py" build \
+	"${capture_bundle_args[@]}"
+
+if [[ "${GENPOLICY_CAPTURE_ONLY:-1}" == "1" ]]; then
+	echo "Captured ${request_captures} CreateContainerRequests in ${output_dir}/capture"
+	exit 0
+fi
 
 python3 "${appliance_root}/scripts/tag_oci.py" \
 	--raw-requests-dir "${output_dir}/createcontainer-requests" \
@@ -467,8 +510,12 @@ provenance_generated=(
 	--generated "policy-oci-diff.json=${output_dir}/policy-oci-diff.json"
 	--generated "policy-annotation.txt=${output_dir}/policy-annotation.txt"
 	--generated "workload-policy.yaml=${output_dir}/workload-policy.yaml"
-	--generated "storages-devices-predicted.json=${output_dir}/storages-devices-predicted.json"
 )
+if [[ -f "${output_dir}/storages-devices-predicted.json" ]]; then
+	provenance_generated+=(
+		--generated "storages-devices-predicted.json=${output_dir}/storages-devices-predicted.json"
+	)
+fi
 if [[ -f "${output_dir}/rootfs-mounts-captured.json" ]]; then
 	provenance_generated+=(
 		--generated "rootfs-mounts-captured.json=${output_dir}/rootfs-mounts-captured.json"
@@ -486,7 +533,7 @@ if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
 fi
 
 python3 "${appliance_root}/scripts/write_provenance.py" \
-	--profile "${appliance_root}/profile.env" \
+	--profile "${profile_path}" \
 	--input "${workload}" \
 	--tag-manifest "${output_dir}/dynamic-tags.json" \
 	--raw-dir "${output_dir}/createcontainer-requests" \

@@ -23,7 +23,7 @@ RUN set -eux; \
     make -j"$(nproc)"; \
     make install
 
-FROM docker.io/library/rust:1.95-bookworm AS policy-builder
+FROM docker.io/library/rust:1.95-bookworm AS rust-builder
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -44,32 +44,58 @@ COPY tools/packaging/kata-deploy/job-dispatcher ./tools/packaging/kata-deploy/jo
 
 RUN sed 's/@COMMIT_INFO@/genpolicy-appliance/' \
         src/tools/genpolicy/src/version.rs.in \
-        >src/tools/genpolicy/src/version.rs \
-    && cargo build --locked --release \
-        --package genpolicy-oci-compiler \
-        --package kata-storage-predictor \
-        --package kata-createreq-capture
+    >src/tools/genpolicy/src/version.rs
 
-FROM policy-builder AS capture-backend-runc
-RUN mkdir -p /capture-backend
+FROM rust-builder AS analysis-builder
+RUN --mount=type=cache,id=genpolicy-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=genpolicy-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=genpolicy-analysis-target,target=/workspace/target \
+    cargo build --locked --release --package genpolicy-oci-compiler \
+    && mkdir -p /out \
+    && cp target/release/genpolicy-oci-compiler /out/
 
-FROM policy-builder AS capture-backend-runtime-rs
-RUN cargo build --locked --release \
+FROM rust-builder AS capture-runc-builder
+RUN --mount=type=cache,id=genpolicy-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=genpolicy-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=genpolicy-capture-target,target=/workspace/target \
+    cargo build --locked --release \
+    --package kata-createreq-capture \
+        --bin createreq-capture \
+    && mkdir -p /out \
+    && cp target/release/createreq-capture /out/
+
+FROM rust-builder AS capture-runtime-rs-builder
+RUN --mount=type=cache,id=genpolicy-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=genpolicy-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=genpolicy-capture-target,target=/workspace/target \
+    cargo build --locked --release \
         --package kata-createreq-capture \
         --features runtime-rs-capture \
         --bin containerd-shim-kata-capture-v2 \
-    && mkdir -p /capture-backend \
-    && cp target/release/containerd-shim-kata-capture-v2 /capture-backend/
+    && mkdir -p /out \
+    && cp target/release/containerd-shim-kata-capture-v2 /out/
 
-FROM capture-backend-${CAPTURE_BACKEND} AS capture-backend
+FROM rust-builder AS predictor-builder
+RUN --mount=type=cache,id=genpolicy-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=genpolicy-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=genpolicy-analysis-target,target=/workspace/target \
+    cargo build --locked --release --package kata-storage-predictor \
+    && mkdir -p /out \
+    && cp target/release/storage-predictor /out/
 
-FROM policy-builder AS legacy-builder
+FROM rust-builder AS legacy-builder
 
-RUN cargo build --locked --release --package genpolicy
+RUN --mount=type=cache,id=genpolicy-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=genpolicy-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=genpolicy-analysis-target,target=/workspace/target \
+    cargo build --locked --release --package genpolicy \
+    && mkdir -p /out \
+    && cp target/release/genpolicy /out/
 
-FROM debian:bookworm-slim AS appliance-runtime
+FROM debian:bookworm-slim AS capture-base
 
 ARG CAPTURE_BACKEND=runtime-rs
+ARG PROFILE_NAME=k8s-1.33-containerd-2.3-native
 ARG TARGETARCH=amd64
 ARG KUBERNETES_VERSION=v1.33.13
 ARG CONTAINERD_VERSION=v2.3.3
@@ -81,20 +107,16 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \
         conntrack \
-        cryptsetup-bin \
         curl \
         iproute2 \
         iptables \
         kmod \
-        liblz4-1 \
-        libuuid1 \
         openssl \
         python3 \
         python3-yaml \
         socat \
         tar \
         util-linux \
-        zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
@@ -125,26 +147,18 @@ RUN set -eux; \
         "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${TARGETARCH}-${CNI_PLUGINS_VERSION}.tgz" \
         | tar -xz -C /opt/cni/bin
 
-# mkfs.erofs >= 1.8.2 supports the opt-in in-appliance dm-verity root-hash
-# generation. The primary containerd 2.3 installation provides the EROFS
-# snapshotter and differ.
-COPY --from=erofs-utils-builder /usr/local/bin/mkfs.erofs /usr/local/bin/mkfs.erofs
-
 COPY --from=pause /pause /opt/genpolicy/rootfs/pause/pause
 COPY --from=busybox / /opt/genpolicy/rootfs/busybox
 RUN mkdir -p /opt/genpolicy/rootfs/busybox/work
-COPY --from=policy-builder /workspace/target/release/genpolicy-oci-compiler \
-    /usr/local/bin/genpolicy-oci-compiler
-COPY --from=policy-builder /workspace/target/release/storage-predictor \
-    /usr/local/bin/storage-predictor
-COPY --from=policy-builder /workspace/target/release/createreq-capture \
-    /usr/local/bin/createreq-capture
-COPY --from=capture-backend /capture-backend/ /usr/local/bin/
-COPY src/tools/genpolicy/appliance /opt/genpolicy/appliance
-COPY src/tools/genpolicy/rules.rego /opt/genpolicy/policy/rules.rego
-COPY src/tools/genpolicy/genpolicy-settings.json /opt/genpolicy/policy/settings/genpolicy-settings.json
-COPY src/tools/genpolicy/appliance/policy-settings.d \
-    /opt/genpolicy/policy/settings/genpolicy-settings.d
+COPY src/tools/genpolicy/appliance/config /opt/genpolicy/appliance/config
+COPY src/tools/genpolicy/appliance/profiles /opt/genpolicy/appliance/profiles
+COPY src/tools/genpolicy/appliance/scripts/capture_bundle.py \
+    src/tools/genpolicy/appliance/scripts/capture_image_metadata.py \
+    src/tools/genpolicy/appliance/scripts/entrypoint.sh \
+    src/tools/genpolicy/appliance/scripts/make_oci_image.py \
+    src/tools/genpolicy/appliance/scripts/runc-capture \
+    src/tools/genpolicy/appliance/scripts/submit_workload.py \
+    /opt/genpolicy/appliance/scripts/
 
 RUN set -eux; \
     chmod 0755 \
@@ -166,14 +180,59 @@ RUN set -eux; \
 ENV PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV GENPOLICY_APPLIANCE_ROOT=/opt/genpolicy/appliance
 ENV GENPOLICY_CAPTURE_BACKEND=${CAPTURE_BACKEND}
+ENV GENPOLICY_PROFILE_NAME=${PROFILE_NAME}
 
 ENTRYPOINT ["/opt/genpolicy/appliance/scripts/entrypoint.sh"]
 
-FROM appliance-runtime AS legacy-reference
+FROM capture-base AS capture-runtime-rs-native
+COPY --from=capture-runtime-rs-builder \
+    /out/containerd-shim-kata-capture-v2 /usr/local/bin/
+
+FROM capture-runtime-rs-native AS capture-runtime-rs-erofs-dmverity
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        cryptsetup-bin liblz4-1 libuuid1 udev zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=erofs-utils-builder /usr/local/bin/mkfs.erofs /usr/local/bin/mkfs.erofs
+COPY src/tools/genpolicy/appliance/scripts/watch_device_mapper_nodes.py \
+    /opt/genpolicy/appliance/scripts/watch_device_mapper_nodes.py
+
+FROM capture-base AS capture-runc-native
+COPY --from=capture-runc-builder /out/createreq-capture \
+    /usr/local/bin/createreq-capture
+
+FROM debian:bookworm-slim AS analysis-runtime
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends python3 python3-yaml \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=analysis-builder /out/genpolicy-oci-compiler \
+    /usr/local/bin/genpolicy-oci-compiler
+COPY --from=predictor-builder /out/storage-predictor \
+    /usr/local/bin/storage-predictor
+COPY src/tools/genpolicy/appliance /opt/genpolicy/appliance
+COPY src/tools/genpolicy/rules.rego /opt/genpolicy/policy/rules.rego
+COPY src/tools/genpolicy/genpolicy-settings.json /opt/genpolicy/policy/settings/genpolicy-settings.json
+COPY src/tools/genpolicy/appliance/policy-settings.d \
+    /opt/genpolicy/policy/settings/genpolicy-settings.d
+RUN chmod 0755 /opt/genpolicy/appliance/scripts/*.sh
+
+ENV GENPOLICY_APPLIANCE_ROOT=/opt/genpolicy/appliance
+ENTRYPOINT ["/opt/genpolicy/appliance/scripts/analyze_capture.sh"]
+
+FROM capture-${CAPTURE_BACKEND}-native AS legacy-reference
 
 COPY --from=registry /bin/registry /usr/local/bin/registry
-COPY --from=legacy-builder /workspace/target/release/genpolicy /usr/local/bin/genpolicy
+COPY --from=legacy-builder /out/genpolicy /usr/local/bin/genpolicy
+COPY --from=analysis-builder /out/genpolicy-oci-compiler \
+    /usr/local/bin/genpolicy-oci-compiler
+COPY src/tools/genpolicy/rules.rego /opt/genpolicy/policy/rules.rego
+COPY src/tools/genpolicy/genpolicy-settings.json /opt/genpolicy/policy/settings/genpolicy-settings.json
+COPY src/tools/genpolicy/appliance/policy-settings.d \
+    /opt/genpolicy/policy/settings/genpolicy-settings.d
+COPY src/tools/genpolicy/appliance /opt/genpolicy/appliance
 
 ENV GENPOLICY_LEGACY_REFERENCE=1
 
-FROM appliance-runtime
+FROM capture-runtime-rs-native

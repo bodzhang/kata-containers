@@ -1410,6 +1410,9 @@ allow_rootfs_storage_base(i_storage, bundle_id) if {
 allow_rootfs_mount_point(i_storage, bundle_id) if {
     i_storage.mount_point == concat("", ["/run/kata-containers/", bundle_id, "/rootfs"])
 }
+allow_rootfs_mount_point(i_storage, bundle_id) if {
+    i_storage.mount_point == concat("", ["/run/kata-containers/shared/containers/passthrough/", bundle_id, "/rootfs"])
+}
 
 # Validates all storage fields except driver and source.
 allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id) if {

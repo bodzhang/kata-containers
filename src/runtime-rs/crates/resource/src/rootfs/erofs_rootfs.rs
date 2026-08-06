@@ -29,6 +29,7 @@ use kata_types::gpt_disk::{
     extract_dmverity_annotation, extract_snapshot_id, generate_dmverity_options,
     generate_gpt_metadata, generate_padding_file, get_erofs_layer_size,
     parse_dmverity_metadata_file, ErofsLayer, GptDiskLayout, GptMetadataFiles,
+    X_CONTAINERD_DMVERITY,
 };
 use kata_types::mount::Mount;
 use oci_spec::runtime as oci;
@@ -921,6 +922,33 @@ impl ErofsMultiLayerRootfs {
                             })
                             .cloned()
                             .collect();
+
+                        let options_map: HashMap<String, String> = mount
+                            .options
+                            .iter()
+                            .filter_map(|option| {
+                                option
+                                    .split_once('=')
+                                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                            })
+                            .collect();
+                        if let Some(dmverity_path) = extract_dmverity_annotation(&options_map) {
+                            if erofs_devices.len() != 1 {
+                                return Err(anyhow!(
+                                    "dm-verity requires one EROFS device in fsmerge mode"
+                                ));
+                            }
+                            let metadata = parse_dmverity_metadata_file(dmverity_path)
+                                .context("failed to parse dm-verity metadata for EROFS rootfs")?;
+                            options.retain(|option| {
+                                option.split_once('=').map(|(key, _)| key)
+                                    != Some(X_CONTAINERD_DMVERITY)
+                            });
+                            options.extend(generate_dmverity_options(
+                                &metadata,
+                                Some(&mount.source),
+                            ));
+                        }
 
                         // Erofs layers are read-only lower layers (marked with X-kata.overlay-lower)
                         options.push("X-kata.overlay-lower".to_string());

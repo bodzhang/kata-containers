@@ -3,6 +3,9 @@
 This directory implements the versioned clean-room pipeline described in
 [`DESIGN.md`](DESIGN.md).
 
+The staged refactoring and build-optimization roadmap is maintained in
+[`SIMPLIFICATION_PLAN.md`](SIMPLIFICATION_PLAN.md).
+
 ## Dry-run capture pipeline
 
 The default backend runs the production Kubernetes and runtime-rs request
@@ -193,6 +196,46 @@ Successful runs produce the request-derived `policy.rego`,
 `policy-annotation.txt`, `workload-policy.yaml`, and `policy-oci-diff.json`.
 The production appliance contains the standalone Rust policy compiler and does
 not contain or invoke the legacy GenPolicy executable.
+
+Each successful run also writes an independently verifiable capture bundle to
+`output/capture/`. Its `manifest.json` records the normalized profile, exact
+component versions, capture backend and rootfs mode, configuration and capture
+binary hashes, external image-archive hashes, request counts, and the hash and
+size of every bundled artifact. The bundle contains immutable copies of the
+workload, API objects, raw OCI inputs, final create and exec requests, profile,
+configuration, resolved image manifests and configs, and capture-time logs.
+Image metadata is read from containerd's content store and stored by verified
+SHA-256 digest under `output/capture/images/`, allowing later analysis to
+distinguish image-config defaults from YAML and runtime mutations. Existing
+root-level outputs remain in place while capture and analysis orchestration are
+separated.
+
+Capture-only execution is the default. The appliance exits after validating
+`output/capture/` and does not generate policy artifacts. Set
+`GENPOLICY_CAPTURE_ONLY=0` only for temporary compatibility with the former
+combined capture-and-analysis workflow; new automation should run
+`analyze_capture.sh` separately.
+
+Validate a stored bundle without rerunning Kubernetes:
+
+```bash
+python3 scripts/capture_bundle.py validate \
+  --bundle output/capture \
+  --require-complete
+```
+
+Regenerate balanced policy from the stored bundle without rerunning Kubernetes:
+
+```bash
+scripts/analyze_capture.sh output/capture analysis
+```
+
+The driver validates the bundle first and writes `policy.rego`, dynamic tags,
+policy diff, annotation, and annotated workload under `analysis/`. Add
+`--agent-replay` and set `KATA_AGENT` and `AGENT_CTL` to run the optional
+policy-only Agent validation. `make e2e` performs a separate network-disabled
+analysis pass and requires its policy to match the combined run's balanced
+policy byte for byte.
 
 ## Environment sources
 

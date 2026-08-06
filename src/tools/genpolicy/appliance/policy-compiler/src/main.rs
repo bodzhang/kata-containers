@@ -1001,11 +1001,13 @@ fn compile_container(
         Sysctl: template.Linux.Sysctl.clone(),
         Seccomp: capture.linux.seccomp.clone().map(Into::into),
     };
+    let root_path = erofs_root_path_template(&capture.root.path)
+        .unwrap_or_else(|| template.Root.Path.clone());
     let oci = KataSpec {
         Version: capture.version.clone(),
         Process: process,
         Root: KataRoot {
-            Path: template.Root.Path.clone(),
+            Path: root_path,
             Readonly: capture.root.readonly,
         },
         Mounts: normalize_mounts(capture, template, predicted_mounts)?,
@@ -1073,6 +1075,26 @@ fn compile_container(
     Ok((policy, report))
 }
 
+fn erofs_root_path_template(path: &str) -> Option<String> {
+    let container_id = path
+        .strip_prefix("/run/kata-containers/shared/containers/passthrough/")?
+        .strip_suffix("/rootfs")?;
+    let concrete_id = container_id.len() == 64
+        && container_id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit());
+    let tagged_id = matches!(
+        container_id,
+        "{{GENPOLICY_DYNAMIC:sandbox.id}}" | "{{GENPOLICY_DYNAMIC:container.id}}"
+    );
+    if !concrete_id && !tagged_id {
+        return None;
+    }
+    Some(
+        "/run/kata-containers/shared/containers/passthrough/$(bundle-id)/rootfs".to_string(),
+    )
+}
+
 fn safe_termination_message_path(
     capture: &CapturedSpec,
     regex_policy_mode: &str,
@@ -1101,7 +1123,11 @@ fn safe_termination_message_path(
         .root
         .path
         .strip_prefix("/run/kata-containers/")
-        .and_then(|path| path.strip_suffix("/rootfs"));
+        .and_then(|path| path.strip_suffix("/rootfs"))
+        .and_then(|path| {
+            path.strip_prefix("shared/containers/passthrough/")
+                .or(Some(path))
+        });
     let copied_source = container_id.is_some_and(|container_id| {
         let prefix = format!(
             "/run/kata-containers/shared/containers/{container_id}-"
@@ -3169,6 +3195,63 @@ items:
         };
 
         assert!(safe_termination_message_path(&capture, "balanced").is_ok());
+    }
+
+    #[test]
+    fn termination_message_path_accepts_erofs_passthrough_root() {
+        let container_id = "a".repeat(64);
+        let capture = CapturedSpec {
+            root: CapturedRoot {
+                path: format!(
+                    "/run/kata-containers/shared/containers/passthrough/{container_id}/rootfs"
+                ),
+                ..Default::default()
+            },
+            mounts: vec![CapturedMount {
+                destination: "/dev/termination-log".to_string(),
+                source: format!(
+                    "/run/kata-containers/shared/containers/{container_id}-0123456789abcdef-termination-log"
+                ),
+                type_: "bind".to_string(),
+                options: vec![
+                    "rbind".to_string(),
+                    "rprivate".to_string(),
+                    "rw".to_string(),
+                ],
+            }],
+            ..Default::default()
+        };
+
+        assert!(safe_termination_message_path(&capture, "balanced").is_ok());
+    }
+
+    #[test]
+    fn erofs_root_path_template_preserves_dynamic_bundle_id() {
+        assert_eq!(
+            erofs_root_path_template(&format!(
+                "/run/kata-containers/shared/containers/passthrough/{}/rootfs",
+                "a".repeat(64)
+            )),
+            Some(
+                "/run/kata-containers/shared/containers/passthrough/$(bundle-id)/rootfs"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            erofs_root_path_template(
+                "/run/kata-containers/shared/containers/passthrough/{{GENPOLICY_DYNAMIC:sandbox.id}}/rootfs"
+            ),
+            Some(
+                "/run/kata-containers/shared/containers/passthrough/$(bundle-id)/rootfs"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            erofs_root_path_template(
+                "/run/kata-containers/shared/containers/passthrough/bad/rootfs"
+            ),
+            None
+        );
     }
 
     #[test]

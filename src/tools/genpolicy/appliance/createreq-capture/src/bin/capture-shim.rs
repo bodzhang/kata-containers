@@ -10,7 +10,10 @@ use agent::Agent;
 use anyhow::{anyhow, Context, Result};
 use common::message::Message;
 use common::{RuntimeInstance, Sandbox};
-use containerd_shim_protos::api;
+use containerd_shim_protos::{
+    api,
+    types::introspection::{RuntimeInfo, RuntimeVersion},
+};
 use hypervisor::Hypervisor;
 use kata_createreq_capture::{
     stage_direct_volume_mounts, CaptureSandbox, DryRunHypervisor, RecordingAgent,
@@ -31,6 +34,8 @@ const MESSAGE_BUFFER_SIZE: usize = 8;
 const CAPTURE_CONFIG_ENV: &str = "GENPOLICY_KATA_CONFIG";
 const DIRECT_VOLUME_MOUNTS_ENV: &str = "GENPOLICY_DIRECT_VOLUME_MOUNTS";
 const CAPTURE_OUTPUT_ENV: &str = "GENPOLICY_CAPTURE_OUTPUT";
+const ROOTFS_MODE_ENV: &str = "GENPOLICY_ROOTFS_MODE";
+const RUNTIME_ALLOW_MOUNTS: &str = "containerd.io/runtime-allow-mounts";
 const SERVER_FD_ENV: &str = "KATA_RUNTIME_BIND_FD";
 const SOCKET_ROOT: &str = "/run/containerd";
 
@@ -62,11 +67,13 @@ enum Action {
     Delete(Args),
     Help,
     Version,
+    Info,
 }
 
 fn parse_args(arguments: &[OsString]) -> Result<Action> {
     let mut help = false;
     let mut version = false;
+    let mut info = false;
     let mut args = Args::default();
     let rest = go_flag::parse_args_with_warnings::<String, _, _>(
         &arguments[1..],
@@ -80,6 +87,7 @@ fn parse_args(arguments: &[OsString]) -> Result<Action> {
             flags.add_flag("publish-binary", &mut args.publish_binary);
             flags.add_flag("help", &mut help);
             flags.add_flag("version", &mut version);
+            flags.add_flag("info", &mut info);
         },
     )?;
 
@@ -87,6 +95,8 @@ fn parse_args(arguments: &[OsString]) -> Result<Action> {
         Ok(Action::Help)
     } else if version {
         Ok(Action::Version)
+    } else if info {
+        Ok(Action::Info)
     } else if rest.is_empty() {
         Ok(Action::Run(args))
     } else if rest[0] == "start" {
@@ -96,6 +106,24 @@ fn parse_args(arguments: &[OsString]) -> Result<Action> {
     } else {
         Err(anyhow!("unsupported shim action {}", rest[0]))
     }
+}
+
+fn show_info() -> Result<()> {
+    let mut version = RuntimeVersion::new();
+    version.version = env!("CARGO_PKG_VERSION").to_string();
+
+    let mut info = RuntimeInfo::new();
+    info.name = "io.containerd.kata-capture.v2".to_string();
+    info.version = Some(version).into();
+    info.annotations.insert(
+        RUNTIME_ALLOW_MOUNTS.to_string(),
+        "mkdir/*,format/*,erofs,overlay".to_string(),
+    );
+    let data = protobuf::Message::write_to_bytes(&info).context("marshal RuntimeInfo")?;
+    std::io::stdout()
+        .write_all(&data)
+        .context("write RuntimeInfo")?;
+    Ok(())
 }
 
 fn resolve_hypervisor_config(config: &TomlConfig) -> HypervisorConfig {
@@ -223,7 +251,9 @@ async fn run_capture_shim(args: Args) -> Result<()> {
             format!("stage {DIRECT_VOLUME_MOUNTS_ENV} {}", Path::new(&path).display())
         })?;
     }
-    if !config
+    let rootfs_mode = std::env::var(ROOTFS_MODE_ENV).unwrap_or_else(|_| "native".to_string());
+    if rootfs_mode != "erofs-dmverity"
+        && !config
         .runtime
         .experimental
         .iter()
@@ -308,6 +338,7 @@ fn main() -> Result<()> {
             println!("containerd-shim-kata-capture-v2 0.1.0");
             Ok(())
         }
+        Action::Info => show_info(),
     }
 }
 
@@ -332,5 +363,11 @@ mod tests {
         assert!(flags >= 0);
         assert_eq!(flags & libc::FD_CLOEXEC, 0);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parses_runtime_info_action() {
+        let arguments = [OsString::from("shim"), OsString::from("-info")];
+        assert!(matches!(parse_args(&arguments).unwrap(), Action::Info));
     }
 }

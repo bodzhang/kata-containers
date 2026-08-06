@@ -8,22 +8,26 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 appliance_dir=$(cd "${script_dir}/.." && pwd)
 engine="${CONTAINER_ENGINE:?CONTAINER_ENGINE is required}"
 image="${IMAGE:?IMAGE is required}"
+analysis_image="${ANALYSIS_IMAGE:?ANALYSIS_IMAGE is required}"
 reference_image="${REFERENCE_IMAGE:?REFERENCE_IMAGE is required}"
 agent_ctl="${AGENT_CTL:?AGENT_CTL is required}"
 kata_agent="${KATA_AGENT:?KATA_AGENT is required}"
 temporary=$(mktemp -d)
 trap 'rm -rf "${temporary}"' EXIT
 
-mkdir -p "${temporary}/input/images" "${temporary}/output"
+mkdir -p "${temporary}/input/images" "${temporary}/output" "${temporary}/reanalysis"
 cp "${script_dir}/fixtures/complex-workload.yaml" \
 	"${temporary}/input/workload.yaml"
 cp "${script_dir}/fixtures/configuration.toml" \
     "${temporary}/input/configuration.toml"
 
 "${engine}" run --rm --entrypoint /bin/sh "${image}" -c \
-	'command -v genpolicy-oci-compiler >/dev/null && ! command -v genpolicy >/dev/null'
+    '! command -v genpolicy-oci-compiler >/dev/null && ! command -v genpolicy >/dev/null'
+"${engine}" run --rm --entrypoint /bin/sh "${analysis_image}" -c \
+    'command -v genpolicy-oci-compiler >/dev/null && ! command -v genpolicy >/dev/null'
 
 "${engine}" run --rm --privileged --network=none \
+    -e GENPOLICY_CAPTURE_ONLY=0 \
 	-e GENPOLICY_BALANCED=1 \
     -e GENPOLICY_KATA_CONFIG=/input/configuration.toml \
 	--cgroupns=host \
@@ -37,6 +41,9 @@ test -s "${temporary}/output/legacy-reference-policy.rego"
 test -s "${temporary}/output/policy-oci-diff.json"
 test -s "${temporary}/output/policy-annotation.txt"
 test -s "${temporary}/output/provenance.json"
+test -s "${temporary}/output/capture/manifest.json"
+test -s "${temporary}/output/capture/profile.json"
+test -s "${temporary}/output/capture/images/index.json"
 test -s "${temporary}/output/pods.json"
 test -s "${temporary}/output/workload-policy.yaml"
 test -s "${temporary}/output/policy-balanced.rego"
@@ -51,7 +58,39 @@ grep -R -q '{{GENPOLICY_DYNAMIC:' "${temporary}/output/tagged-requests"
 grep -q 'policy_data :=' "${temporary}/output/policy.rego"
 grep -q 'io.katacontainers.config.hypervisor.cc_init_data' \
 	"${temporary}/output/workload-policy.yaml"
-python3 - "${temporary}/output" <<'PY'
+python3 "${appliance_dir}/scripts/capture_bundle.py" validate \
+    --bundle "${temporary}/output/capture" \
+    --require-complete
+"${engine}" run --rm --network=none \
+    --entrypoint /bin/bash \
+    -v "${temporary}/output/capture:/capture:ro" \
+    -v "${temporary}/reanalysis:/analysis" \
+    "${analysis_image}" /opt/genpolicy/appliance/scripts/analyze_capture.sh \
+    /capture /analysis
+cmp "${temporary}/output/policy-balanced.rego" \
+    "${temporary}/reanalysis/policy.rego"
+test -s "${temporary}/reanalysis/request-transformations.json"
+test -s "${temporary}/reanalysis/request-field-provenance.json"
+python3 - "${temporary}/reanalysis" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+analysis = Path(sys.argv[1])
+transformations = json.loads(
+    (analysis / "request-transformations.json").read_text(encoding="utf-8")
+)
+provenance = json.loads(
+    (analysis / "request-field-provenance.json").read_text(encoding="utf-8")
+)
+assert len(transformations["requests"]) == 3
+assert all(request["status"] == "paired" for request in transformations["requests"])
+assert {entry["source"] for entry in provenance["entries"]} >= {
+    "kubernetes-resolved",
+    "profile-runtime",
+}
+PY
+python3 - "${temporary}/output" "${CAPTURE_BACKEND:-runtime-rs}" <<'PY'
 import base64
 import gzip
 import json
@@ -60,6 +99,7 @@ import tomllib
 from pathlib import Path
 
 output = Path(sys.argv[1])
+capture_backend = sys.argv[2]
 
 def policy_data(name):
     text = (output / name).read_text(encoding="utf-8")
@@ -159,6 +199,31 @@ assert "POD_UID=$(pod-uid)" in balanced_workload["OCI"]["Process"]["Env"]
 provenance = json.loads((output / "provenance.json").read_text())
 assert len(provenance["outputs"]["raw_create_requests"]) == 3
 assert "policy-balanced.rego" in provenance["outputs"]["generated"]
+capture_manifest = json.loads(
+    (output / "capture" / "manifest.json").read_text(encoding="utf-8")
+)
+assert capture_manifest["bundle_type"] == "genpolicy-request-capture"
+assert capture_manifest["capture"]["complete"] is True
+assert capture_manifest["capture"]["backend"] == capture_backend
+assert capture_manifest["capture"]["rootfs_mode"] == "native"
+assert capture_manifest["capture"]["counts"] == {
+    "createcontainer": 3,
+    "execprocess": 2 if capture_backend == "runtime-rs" else 0,
+    "expected_createcontainer": 3,
+    "raw_oci": 3,
+}
+image_index = json.loads(
+    (output / "capture" / "images" / "index.json").read_text(encoding="utf-8")
+)
+requested_images = {
+    line
+    for line in (output / "requested-images.txt").read_text(encoding="utf-8").splitlines()
+    if line
+}
+assert set(image_index["images"]) == requested_images
+for image in image_index["images"].values():
+    assert (output / "capture" / "images" / image["manifest_path"]).is_file()
+    assert (output / "capture" / "images" / image["config_path"]).is_file()
 comparison = mode_report["comparisons"]["legacy-reference-vs-oci-legacy"]
 assert comparison["rules_equal_ignoring_trailing_whitespace"]
 workload_comparison = comparison["containers"]["container/workload"]

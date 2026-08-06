@@ -144,7 +144,41 @@ The `/output` directory contains:
 - `submitted-objects.json`: API-server-defaulted input objects.
 - `pods.json`: synthetic bound Pods and their assigned UIDs.
 - `provenance.json`: compatibility profile and input/output hashes.
+- `capture/`: independently verifiable request-capture bundle containing the
+  workload, API objects, raw OCI, final Agent requests, configuration snapshots,
+  resolved image manifests and configs, logs, normalized profile, and
+  `manifest.json`.
 - service logs for diagnostics.
+
+The capture manifest uses schema version 1. It hashes every file stored in the
+bundle, records exact component versions and external input-image hashes, and
+records expected and observed raw OCI, create, and exec request counts. A
+capture is complete only when outbound traffic was sealed and the raw OCI and
+final create-request counts both match the sandbox and container count derived
+from `pods.json`. Capture-binary hashes and normalized profile identity bind the
+bundle to the code and configuration that produced it.
+
+For every digest-pinned workload image, `capture/images/index.json` maps the
+requested reference and top-level digest to the selected platform manifest and
+image config. The corresponding JSON blobs are stored under
+`capture/images/manifests/` and `capture/images/configs/` by SHA-256 digest. The
+extractor reads them from containerd's content store after image resolution and
+verifies each content digest before writing it. Bundle validation requires
+metadata for every requested image and verifies the manifest-to-config link.
+
+`capture_bundle.py validate` checks the artifact set, every file hash and size,
+request counts, and the completeness flag without starting Kubernetes. The
+root-level files remain available during the capture/analysis split for
+compatibility with the current combined workflow.
+
+`analyze_capture.sh` validates a complete stored bundle and regenerates dynamic
+tags, policy, annotation, annotated workload, and policy diff without access to
+Kubernetes, containerd, or the network. Its default and only request-derived
+mode is balanced policy. `--agent-replay` optionally runs the generated policy
+against every bundled create and exec request using the policy-only Agent.
+The appliance entrypoint defaults to capture-only execution and exits before
+tagging or compilation. `GENPOLICY_CAPTURE_ONLY=0` temporarily retains the old
+combined path for compatibility testing while image contents are separated.
 
 ## Dynamic marker format
 
