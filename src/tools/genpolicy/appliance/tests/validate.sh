@@ -13,6 +13,27 @@ export PYTHONPYCACHEPREFIX="${pycache_dir}"
 # shellcheck source=/dev/null
 source "${appliance_dir}/profiles/k8s-1.33-containerd-2.3-guest-pull.env"
 
+python3 - "${appliance_dir}/profiles/k8s-1.33-containerd-2.3-guest-pull.env" \
+	"${appliance_dir}/profiles/k8s-1.36-containerd-2.3-guest-pull.env" <<'PY'
+import sys
+from pathlib import Path
+
+
+def profile(path: str) -> dict[str, str]:
+	return dict(
+		line.split("=", 1)
+		for line in Path(path).read_text(encoding="utf-8").splitlines()
+		if line and not line.startswith("#")
+	)
+
+
+baseline = profile(sys.argv[1])
+candidate = profile(sys.argv[2])
+changed = {key for key in baseline.keys() | candidate.keys() if baseline.get(key) != candidate.get(key)}
+assert changed == {"KUBERNETES_VERSION", "PROFILE_NAME"}, changed
+assert candidate["KUBERNETES_VERSION"] == "v1.36.3"
+PY
+
 python3 -m compileall -q "${appliance_dir}/scripts" "${appliance_dir}/tests"
 python3 -m unittest discover -s "${appliance_dir}/tests" -p 'test_*.py'
 
