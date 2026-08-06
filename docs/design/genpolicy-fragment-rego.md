@@ -602,6 +602,21 @@ The CLI writes its report and exits nonzero by default while ownership or
 absence coverage is incomplete. `--allow-incomplete` permits candidate
 generation but leaves the report result as `incomplete`.
 
+Each candidate fragment carries the capture profile identity and a canonical
+digest of the complete static IR, including its measured UVM artifact. The
+compositor requires every selected fragment to match both values; partial,
+unbound, or mismatched fragment sets fail before claims are applied. Current
+capture profile manifests do not contain `UVM_IMAGE_DIGEST`, so the measured
+UVM input cannot yet be bound back to the captured profile and remains an
+explicit blocker.
+
+The PoC currently uses short container-name subjects for compatibility with the
+request-derived compiler. It rejects duplicate static or final-policy subject
+IDs rather than silently aliasing two workloads. Supporting repeated container
+names across multiple workload objects requires a canonical
+namespace/workload/container identity carried through capture and compiler
+output.
+
 ### Runtime absence coverage
 
 Policy-data reconstruction and final Agent-request coverage are separate
@@ -617,7 +632,9 @@ The current inventory therefore covers three of four observed removals and
 fails closed on the uncovered Seccomp absence. This does not imply Seccomp must
 always be absent: profiles that preserve guest Seccomp require an exact or
 bounded positive claim instead. The profile configuration and Agent feature
-set determine which branch applies.
+set determine which branch applies. Every inventory rule has exactly one
+explicit scope: all subjects, one exact subject, or one subject prefix. An
+omitted or multiply declared scope is invalid.
 
 ### Legacy settings contribution
 
