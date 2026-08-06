@@ -610,6 +610,43 @@ capture profile manifests do not contain `UVM_IMAGE_DIGEST`, so the measured
 UVM input cannot yet be bound back to the captured profile and remains an
 explicit blocker.
 
+### Kubernetes version profile evidence
+
+The Kubernetes stable release channel reported `v1.36.3` on August 6, 2026.
+The profile experiment compares it with `v1.33.13`, holding containerd
+`v2.3.3`, runc `v1.2.8`, etcd `v3.5.21`, CNI plugins `v1.7.1`, workload and
+image inputs, runtime-rs, rootfs mode, and configuration constant. Both cells
+were rebuilt from the same source tree so compiler or settings changes could
+not be misattributed to Kubernetes.
+
+| Measurement | Kubernetes 1.33.13 | Kubernetes 1.36.3 |
+| --- | ---: | ---: |
+| Policy-matrix workloads | 5/5 pass | 5/5 pass |
+| Request-derived policy replays | 13/13 pass | 13/13 pass |
+| Legacy policy replays | 13/13 pass | 13/13 pass |
+| Static owned roles, complex workload | 19 | 19 |
+| Candidate fragment claims, complex workload | 139 | 139 |
+| Ambiguous kubelet-or-containerd claims | 73 | 73 |
+| Exact canonical reconstruction | Pass | Pass |
+| Observed runtime absences covered | 3/4 | 3/4 |
+
+The controlled fragment reports have identical claim identities and values.
+This supports the current additive decomposition for the exercised workloads:
+the Kubernetes update did not require a static overwrite, claim removal, or
+new mutation claim. It does not establish fragment completeness because the
+kubelet CRI boundary, measured UVM binding, and sandbox Seccomp absence rule
+remain unresolved.
+
+The first 1.36 run also demonstrated why a profile is more than component
+version labels. Its environment file was present, but its companion Legacy
+settings patch was initially missing. Legacy therefore used the global OCI
+`1.1.0` default while the captured sandbox request used OCI `1.3.0`, and exact
+version comparison denied the first request. Adding the same OCI `1.3.0`
+settings patch used by the controlled 1.33 baseline restored all Legacy
+replays. Profile validation now requires the two companion settings documents
+to be semantically equal, and comparison treats `PROFILE_NAME` as metadata
+rather than an independent causal dimension.
+
 The PoC currently uses short container-name subjects for compatibility with the
 request-derived compiler. It rejects duplicate static or final-policy subject
 IDs rather than silently aliasing two workloads. Supporting repeated container
@@ -676,8 +713,9 @@ must be normalized by typed identity correlation before individual differences
 become fragment claims. Component-family attribution alone is insufficient.
 
 !!! warning "Current proof boundary"
-  The PoC now proves canonical policy-data reconstruction for two controlled
-  profiles, but it does not prove publishable fragment completeness. Seventy-
+  The PoC now proves canonical policy-data reconstruction for three controlled
+  profiles across containerd and Kubernetes version changes, but it does not
+  prove publishable fragment completeness. Seventy-
   three claims still cross the missing kubelet CRI capture boundary, the
   current profile manifests do not bind a measured UVM digest, and one
   observed sandbox Seccomp removal lacks runtime absence enforcement. The
