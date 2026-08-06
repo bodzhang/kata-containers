@@ -139,6 +139,7 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         fragments.append(
             {
                 "category": "runtime-rs",
+                "schema_version": 1,
                 "claims": [
                     {
                         "operation": "remove",
@@ -162,6 +163,7 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         fragments.append(
             {
                 "category": "runtime-rs",
+                "schema_version": 1,
                 "claims": [
                     {
                         "operation": "remove",
@@ -182,7 +184,9 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         claim = copy.deepcopy(fragments[0]["claims"][0])
         claim.pop("value")
         claim["operation"] = "remove"
-        fragments.append({"category": "runtime-rs", "claims": [claim]})
+        fragments.append(
+            {"category": "runtime-rs", "claims": [claim], "schema_version": 1}
+        )
 
         with self.assertRaisesRegex(composition.CompositionError, "overlapping claim"):
             composition.compose(self.static_baseline(), fragments)
@@ -191,7 +195,9 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         fragments = copy.deepcopy(self.fragments)
         claim = copy.deepcopy(fragments[0]["claims"][0])
         claim["operation"] = "remove"
-        fragments.append({"category": "runtime-rs", "claims": [claim]})
+        fragments.append(
+            {"category": "runtime-rs", "claims": [claim], "schema_version": 1}
+        )
 
         with self.assertRaisesRegex(
             composition.CompositionError, "absence assertion cannot contain a value"
@@ -215,6 +221,7 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         fragments = [
             {
                 "category": "kubelet-resolution",
+                "schema_version": 1,
                 "claims": [
                     {
                         "operation": "resolve",
@@ -316,6 +323,7 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         fragments = [
             {
                 "category": "containerd-oci",
+                "schema_version": 1,
                 "claims": [
                     {
                         "operation": "default",
@@ -342,6 +350,7 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         fragments = [
             {
                 "category": "containerd-oci",
+                "schema_version": 1,
                 "claims": [
                     {
                         "operation": "default",
@@ -355,6 +364,7 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
             },
             {
                 "category": "runtime-rs",
+                "schema_version": 1,
                 "claims": [
                     {
                         "operation": "rewrite",
@@ -376,6 +386,7 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         fragments = [
             {
                 "category": "policy-framework-settings",
+                "schema_version": 1,
                 "claims": [
                     {
                         "operation": "default",
@@ -393,6 +404,33 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         composed = composition.materialize(baseline, fragments, expected)
 
         self.assertEqual(composed, expected)
+
+    def test_rejects_unknown_fragment_schema(self):
+        fragments = copy.deepcopy(self.fragments)
+        fragments[0]["schema_version"] = 2
+
+        with self.assertRaisesRegex(composition.CompositionError, "schema_version 1"):
+            composition.validate_fragments(fragments)
+
+    def test_rejects_non_array_claims(self):
+        fragment = {"category": "containerd-oci", "claims": {}, "schema_version": 1}
+
+        with self.assertRaisesRegex(composition.CompositionError, "non-empty array"):
+            composition.validate_fragments([fragment])
+
+    def test_rejects_root_claim_target(self):
+        fragments = copy.deepcopy(self.fragments)
+        fragments[0]["claims"][0]["target"]["path"] = ""
+
+        with self.assertRaisesRegex(composition.CompositionError, "non-root JSON pointer"):
+            composition.validate_fragments(fragments)
+
+    def test_rejects_invalid_claim_pointer(self):
+        fragments = copy.deepcopy(self.fragments)
+        fragments[0]["claims"][0]["target"]["path"] = "OCI/Version"
+
+        with self.assertRaisesRegex(composition.CompositionError, "invalid JSON pointer"):
+            composition.validate_fragments(fragments)
 
 
 if __name__ == "__main__":

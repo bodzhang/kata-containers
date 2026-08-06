@@ -140,10 +140,19 @@ def add_child(parent, token: str, value) -> None:
 def validate_fragments(fragments: list[dict]) -> None:
     owners = []
     for fragment in fragments:
+        if not isinstance(fragment, dict):
+            raise CompositionError("fragment must be an object")
+        if fragment.get("schema_version") != 1:
+            raise CompositionError("fragment requires schema_version 1")
         category = fragment.get("category")
         if not isinstance(category, str) or not category:
             raise CompositionError("fragment category must be a non-empty string")
-        for claim in fragment.get("claims", []):
+        claims = fragment.get("claims")
+        if not isinstance(claims, list) or not claims:
+            raise CompositionError("fragment claims must be a non-empty array")
+        for claim in claims:
+            if not isinstance(claim, dict):
+                raise CompositionError("fragment claim must be an object")
             operation = claim.get("operation")
             if operation not in SEMANTIC_OPERATIONS:
                 raise CompositionError(f"unsupported semantic operation: {operation}")
@@ -151,7 +160,16 @@ def validate_fragments(fragments: list[dict]) -> None:
                 raise CompositionError("materialized claim requires a value")
             if operation == "remove" and "value" in claim:
                 raise CompositionError("absence assertion cannot contain a value")
-            target = claim.get("target", {})
+            target = claim.get("target")
+            if not isinstance(target, dict):
+                raise CompositionError("claim target must be an object")
+            subject = target.get("subject")
+            if not isinstance(subject, str) or not subject:
+                raise CompositionError("target subject must be a non-empty string")
+            path = target.get("path")
+            if not isinstance(path, str) or not path:
+                raise CompositionError("target path must be a non-root JSON pointer")
+            pointer_tokens(path)
             identity = target_identity(target)
             for owned_target, owner in owners:
                 if targets_overlap(owned_target, target):
