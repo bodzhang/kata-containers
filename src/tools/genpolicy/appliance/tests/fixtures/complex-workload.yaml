@@ -40,6 +40,9 @@ spec:
         app: balanced-mode
     spec:
       runtimeClassName: kata
+      securityContext:
+        supplementalGroups:
+          - 10
       containers:
         - name: workload
           image: genpolicy.local:5000/busybox@sha256:c0aae9d756395ade52df06b55e160e6e32d2ecfe0181ed2c14c68effc5e3fe45

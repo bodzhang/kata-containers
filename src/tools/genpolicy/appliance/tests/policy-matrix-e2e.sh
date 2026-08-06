@@ -21,7 +21,10 @@ output_root=${POLICY_MATRIX_OUTPUT:-${appliance_dir}/../../../../target/genpolic
 if (($# == 0)); then
 	set -- \
 		"${script_dir}/fixtures/pod.yaml" \
-		"${script_dir}/fixtures/policy-matrix-env-pod.yaml"
+		"${script_dir}/fixtures/policy-matrix-env-pod.yaml" \
+		"${script_dir}/fixtures/policy-matrix-process-pod.yaml" \
+		"${script_dir}/fixtures/complex-workload.yaml" \
+		"${script_dir}/fixtures/storage-classes-workload.yaml"
 fi
 
 case "${output_root}" in

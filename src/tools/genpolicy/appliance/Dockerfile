@@ -155,6 +155,7 @@ COPY src/tools/genpolicy/appliance/config /opt/genpolicy/appliance/config
 COPY src/tools/genpolicy/appliance/profiles /opt/genpolicy/appliance/profiles
 COPY src/tools/genpolicy/appliance/scripts/capture_bundle.py \
     src/tools/genpolicy/appliance/scripts/capture_image_metadata.py \
+    src/tools/genpolicy/appliance/scripts/derive_genpolicy_settings.py \
     src/tools/genpolicy/appliance/scripts/entrypoint.sh \
     src/tools/genpolicy/appliance/scripts/make_oci_image.py \
     src/tools/genpolicy/appliance/scripts/runc-capture \

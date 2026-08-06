@@ -474,10 +474,19 @@ pub struct ClusterConfig {
     /// Supported values are "shared-fs", "block-encrypted", and "block-plain".
     pub emptydir_type: String,
 
+    /// Whether the target runtime provides a host-to-guest shared filesystem.
+    /// When false, shared-fs emptyDirs use Agent-local guest storage.
+    #[serde(default = "default_fs_sharing_supported")]
+    pub fs_sharing_supported: bool,
+
     /// Cgroup v2 mount options that may appear beyond what genpolicy embeds
     /// (e.g. "nsdelegate", "memory_recursiveprot" on newer kernels).
     #[serde(default)]
     pub cgroup_mount_extras_allowed: Vec<String>,
+}
+
+fn default_fs_sharing_supported() -> bool {
+    true
 }
 
 /// Describes patterns for supported VFIO devices.

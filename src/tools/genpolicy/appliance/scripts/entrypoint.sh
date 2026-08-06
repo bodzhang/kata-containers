@@ -317,6 +317,10 @@ captures=$(find "${output_dir}/raw" -type f -name '*.config.json' | wc -l)
 [[ -n "${GENPOLICY_KATA_CONFIG:-}" && -f "${GENPOLICY_KATA_CONFIG}" ]] ||
 	fail "GENPOLICY_KATA_CONFIG must name a readable Kata configuration"
 
+python3 "${appliance_root}/scripts/derive_genpolicy_settings.py" \
+	--kata-config "${GENPOLICY_KATA_CONFIG}" \
+	--output "${settings_dir}/genpolicy-settings.d/30-kata-config.json"
+
 if [[ "${GENPOLICY_CAPTURE_BACKEND:-runtime-rs}" == "runc" ]]; then
 	mkdir -p "${output_dir}/createcontainer-requests"
 	direct_vol_arg=()

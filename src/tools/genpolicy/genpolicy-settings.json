@@ -345,6 +345,7 @@
         "pause_container_image": "mcr.microsoft.com/oss/kubernetes/pause:3.6",
         "guest_pull": true,
         "emptydir_type": "block-encrypted",
+        "fs_sharing_supported": true,
         "cgroup_mount_extras_allowed": [
             "nsdelegate",
             "memory_recursiveprot"

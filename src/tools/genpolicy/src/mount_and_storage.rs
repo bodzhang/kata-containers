@@ -166,7 +166,13 @@ fn get_empty_dir_mount(
         ),
     };
 
-    if emptyDir.medium.as_deref() == Some("Memory") || block_emptydir {
+    // A shared-fs emptyDir can only use a host mount when the trusted Kata
+    // configuration enables filesystem sharing. Otherwise runtime-rs falls
+    // back to Agent-local storage, which the policy must authorize explicitly.
+    if emptyDir.medium.as_deref() == Some("Memory")
+        || block_emptydir
+        || !settings.cluster_config.fs_sharing_supported
+    {
         get_guest_empty_dir_mount_and_storage(
             settings,
             p_mounts,
@@ -537,4 +543,99 @@ pub fn get_image_mount_and_storage(
         source,
         options: settings_image.options.clone(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared_fs_test_inputs() -> (
+        settings::Settings,
+        volume::EmptyDirVolumeSource,
+        pod::VolumeMount,
+        Option<pod::PodSecurityContext>,
+    ) {
+        let settings_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("genpolicy-settings.json");
+        let mut settings = settings::Settings::new(settings_path.to_str().unwrap());
+        settings.cluster_config.emptydir_type = EMPTYDIR_TYPE_SHARED_FS.to_string();
+        let empty_dir = volume::EmptyDirVolumeSource {
+            medium: None,
+            sizeLimit: None,
+        };
+        let yaml_mount = pod::VolumeMount {
+            mountPath: "/scratch-disk".to_string(),
+            name: "scratch-disk".to_string(),
+            mountPropagation: None,
+            subPathExpr: None,
+            readOnly: None,
+            subPath: None,
+        };
+        let pod_security_context = Some(pod::PodSecurityContext {
+            runAsUser: None,
+            sysctls: None,
+            runAsGroup: None,
+            fsGroup: Some(2000),
+            supplementalGroups: None,
+            allowPrivilegeEscalation: None,
+        });
+
+        (settings, empty_dir, yaml_mount, pod_security_context)
+    }
+
+    #[test]
+    fn shared_fs_emptydir_uses_local_storage_when_fs_sharing_is_unavailable() {
+        let (mut settings, empty_dir, yaml_mount, pod_security_context) = shared_fs_test_inputs();
+        settings.cluster_config.fs_sharing_supported = false;
+        let mut mounts = Vec::new();
+        let mut storages = Vec::new();
+
+        get_empty_dir_mount(
+            &settings,
+            &mut mounts,
+            &mut storages,
+            &empty_dir,
+            &yaml_mount,
+            &pod_security_context,
+        );
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].type_, "local");
+        assert_eq!(
+            mounts[0].source,
+            "^$(cpath)/$(sandbox-id)/rootfs/local/scratch-disk$"
+        );
+        assert_eq!(storages.len(), 1);
+        assert_eq!(storages[0].driver, "local");
+        assert_eq!(storages[0].source, "local");
+        assert_eq!(
+            storages[0].mount_point,
+            "^$(cpath)/$(sandbox-id)/rootfs/local/scratch-disk$"
+        );
+        assert_eq!(storages[0].options, ["mode=0777", "fsgid=2000"]);
+    }
+
+    #[test]
+    fn shared_fs_emptydir_uses_host_mounts_when_fs_sharing_is_available() {
+        let (settings, empty_dir, yaml_mount, pod_security_context) = shared_fs_test_inputs();
+        let mut mounts = Vec::new();
+        let mut storages = Vec::new();
+
+        get_empty_dir_mount(
+            &settings,
+            &mut mounts,
+            &mut storages,
+            &empty_dir,
+            &yaml_mount,
+            &pod_security_context,
+        );
+
+        assert!(storages.is_empty());
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts.iter().all(|mount| mount.type_ == "bind"));
+        assert_eq!(
+            mounts[0].source,
+            "^$(cpath)/sandbox-[0-9a-f]{16}-scratch\\-disk$"
+        );
+        assert_eq!(mounts[1].source, "$(sfprefix)scratch\\-disk$");
+    }
 }
