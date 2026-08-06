@@ -47,6 +47,15 @@ def target_identity(target: dict) -> str:
     return json.dumps(target, sort_keys=True, separators=(",", ":"))
 
 
+def targets_overlap(first: dict, second: dict) -> bool:
+    if first.get("subject") != second.get("subject"):
+        return False
+    first_tokens = pointer_tokens(first.get("path", ""))
+    second_tokens = pointer_tokens(second.get("path", ""))
+    common = min(len(first_tokens), len(second_tokens))
+    return first_tokens[:common] == second_tokens[:common]
+
+
 def resolve_target(document: dict, target: dict):
     subject = target.get("subject")
     if not isinstance(subject, str) or not subject:
@@ -54,6 +63,11 @@ def resolve_target(document: dict, target: dict):
     relative_pointer = target.get("path")
     if not isinstance(relative_pointer, str):
         raise CompositionError("target requires a string path")
+    if subject == "policy":
+        policy_data = document.get("policy_data")
+        if not isinstance(policy_data, dict):
+            raise CompositionError("static policy has no global policy_data object")
+        return policy_data, relative_pointer
     subjects = document.get("subjects", [])
     selected = [item for item in subjects if item.get("id") == subject]
     if len(selected) != 1:
@@ -76,6 +90,26 @@ def pointer_parent(document, pointer: str):
             parent = parent[token]
         else:
             raise CompositionError(f"pointer parent does not exist: {pointer}")
+    return parent, tokens[-1]
+
+
+def pointer_parent_for_add(document, pointer: str):
+    tokens = pointer_tokens(pointer)
+    if not tokens:
+        raise CompositionError("a fragment cannot patch the selected object root")
+    parent = document
+    for token in tokens[:-1]:
+        if isinstance(parent, list):
+            try:
+                parent = parent[int(token)]
+            except (ValueError, IndexError) as error:
+                raise CompositionError(f"pointer parent does not exist: {pointer}") from error
+        elif isinstance(parent, dict):
+            if token not in parent:
+                parent[token] = {}
+            parent = parent[token]
+        else:
+            raise CompositionError(f"pointer parent is not a collection: {pointer}")
     return parent, tokens[-1]
 
 
@@ -104,7 +138,7 @@ def add_child(parent, token: str, value) -> None:
 
 
 def validate_fragments(fragments: list[dict]) -> None:
-    owners = {}
+    owners = []
     for fragment in fragments:
         category = fragment.get("category")
         if not isinstance(category, str) or not category:
@@ -117,17 +151,19 @@ def validate_fragments(fragments: list[dict]) -> None:
                 raise CompositionError("materialized claim requires a value")
             if operation == "remove" and "value" in claim:
                 raise CompositionError("absence assertion cannot contain a value")
-            identity = target_identity(claim.get("target", {}))
-            if identity in owners:
-                raise CompositionError(
-                    f"duplicate claim owned by {owners[identity]} and {category}: {identity}"
-                )
-            owners[identity] = category
+            target = claim.get("target", {})
+            identity = target_identity(target)
+            for owned_target, owner in owners:
+                if targets_overlap(owned_target, target):
+                    raise CompositionError(
+                        f"overlapping claim owned by {owner} and {category}: {identity}"
+                    )
+            owners.append((target, category))
 
 
 def apply_claim(document: dict, claim: dict) -> None:
     selected, pointer = resolve_target(document, claim["target"])
-    parent, token = pointer_parent(selected, pointer)
+    parent, token = pointer_parent_for_add(selected, pointer)
     exists = has_child(parent, token)
     if exists:
         raise CompositionError(f"claim would overwrite static data: {target_identity(claim['target'])}")

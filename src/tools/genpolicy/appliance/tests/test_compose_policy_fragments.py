@@ -113,7 +113,7 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         fragments = copy.deepcopy(self.fragments)
         fragments[1]["claims"].append(copy.deepcopy(fragments[0]["claims"][0]))
 
-        with self.assertRaisesRegex(composition.CompositionError, "duplicate claim"):
+        with self.assertRaisesRegex(composition.CompositionError, "overlapping claim"):
             composition.compose(self.static_baseline(), fragments)
 
     def test_fragment_cannot_overwrite_static_data(self):
@@ -184,7 +184,7 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         claim["operation"] = "remove"
         fragments.append({"category": "runtime-rs", "claims": [claim]})
 
-        with self.assertRaisesRegex(composition.CompositionError, "duplicate claim"):
+        with self.assertRaisesRegex(composition.CompositionError, "overlapping claim"):
             composition.compose(self.static_baseline(), fragments)
 
     def test_absence_assertion_rejects_value(self):
@@ -258,6 +258,94 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(composition.CompositionError, "invalid variable name"):
             composition.materialize(baseline, [])
+
+    def test_leaf_claim_creates_missing_object_parents(self):
+        baseline = {
+            "policy_data": {},
+            "subjects": [
+                {"id": "container/app", "ordinal": 0, "policy": {}}
+            ],
+        }
+        fragments = [
+            {
+                "category": "containerd-oci",
+                "claims": [
+                    {
+                        "operation": "default",
+                        "target": {
+                            "subject": "container/app",
+                            "path": "/OCI/Linux/Namespaces",
+                        },
+                        "value": [{"Type": "pid"}],
+                    }
+                ],
+            }
+        ]
+        expected = {
+            "containers": [
+                {"OCI": {"Linux": {"Namespaces": [{"Type": "pid"}]}}}
+            ]
+        }
+
+        composed = composition.materialize(baseline, fragments, expected)
+
+        self.assertEqual(composed, expected)
+
+    def test_parent_and_child_claims_overlap(self):
+        fragments = [
+            {
+                "category": "containerd-oci",
+                "claims": [
+                    {
+                        "operation": "default",
+                        "target": {
+                            "subject": "container/app",
+                            "path": "/OCI/Linux",
+                        },
+                        "value": {},
+                    }
+                ],
+            },
+            {
+                "category": "runtime-rs",
+                "claims": [
+                    {
+                        "operation": "rewrite",
+                        "target": {
+                            "subject": "container/app",
+                            "path": "/OCI/Linux/Namespaces",
+                        },
+                        "value": [],
+                    }
+                ],
+            },
+        ]
+
+        with self.assertRaisesRegex(composition.CompositionError, "overlapping claim"):
+            composition.validate_fragments(fragments)
+
+    def test_global_policy_leaf_claim(self):
+        baseline = {"policy_data": {}, "subjects": []}
+        fragments = [
+            {
+                "category": "policy-framework-settings",
+                "claims": [
+                    {
+                        "operation": "default",
+                        "target": {"subject": "policy", "path": "/common/cpath"},
+                        "value": "/run/kata-containers/shared/containers/",
+                    }
+                ],
+            }
+        ]
+        expected = {
+            "common": {"cpath": "/run/kata-containers/shared/containers/"},
+            "containers": [],
+        }
+
+        composed = composition.materialize(baseline, fragments, expected)
+
+        self.assertEqual(composed, expected)
 
 
 if __name__ == "__main__":
