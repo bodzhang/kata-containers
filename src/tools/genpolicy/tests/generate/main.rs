@@ -290,6 +290,93 @@ spec:
 }
 
 #[test]
+fn guest_pull_policy_pins_pause_and_workload_images() -> Result<(), Box<dyn std::error::Error>> {
+    let test_case_dir = "guest_pull_policy_pins_pause_and_workload_images";
+    let workdir = prepare_workdir(test_case_dir, &["simple_pod.yaml"]);
+    let pod_yaml_path = workdir.join("simple_pod.yaml");
+    let workload_image = "quay.io/prometheus/busybox:latest";
+
+    let mut cmd = Command::cargo_bin("genpolicy")?;
+    let output = cmd
+        .arg("--yaml-file")
+        .arg(&pod_yaml_path)
+        .arg("--raw-out")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let (_, policy_data) = stdout
+        .split_once("policy_data := ")
+        .expect("raw policy should contain policy_data");
+    let policy_data: serde_json::Value = serde_json::from_str(policy_data)?;
+    let containers = policy_data["containers"]
+        .as_array()
+        .expect("policy containers should be an array");
+    let marker_images = containers
+        .iter()
+        .map(|container| {
+            let markers: Vec<_> = container["storages"]
+                .as_array()
+                .expect("container storages should be an array")
+                .iter()
+                .filter(|storage| storage["driver"] == "guest-pull-images")
+                .collect();
+            assert_eq!(markers.len(), 1);
+            markers[0]["options"][0]
+                .as_str()
+                .expect("marker should contain one image")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(marker_images, ["pause", workload_image]);
+    assert_eq!(
+        containers[0]["OCI"]["Annotations"]["io.kubernetes.cri.sandbox-namespace"],
+        "default"
+    );
+    Ok(())
+}
+
+#[test]
+fn container_working_dir_overrides_image_config() -> Result<(), Box<dyn std::error::Error>> {
+    let test_case_dir = "container_working_dir_overrides_image_config";
+    let workdir = prepare_workdir(test_case_dir, &["working_dir_pod.yaml"]);
+    let pod_yaml_path = workdir.join("working_dir_pod.yaml");
+
+    let mut cmd = Command::cargo_bin("genpolicy")?;
+    let output = cmd
+        .arg("--yaml-file")
+        .arg(&pod_yaml_path)
+        .arg("--raw-out")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let (_, policy_data) = stdout
+        .split_once("policy_data := ")
+        .expect("raw policy should contain policy_data");
+    let policy_data: serde_json::Value = serde_json::from_str(policy_data)?;
+    let workload = policy_data["containers"]
+        .as_array()
+        .expect("policy containers should be an array")
+        .iter()
+        .find(|container| {
+            container["OCI"]["Annotations"]["io.kubernetes.cri.container-name"] == "workload"
+        })
+        .expect("workload policy container should exist");
+
+    assert_eq!(workload["OCI"]["Process"]["Cwd"], "/work");
+    Ok(())
+}
+
+#[test]
 fn output_behavior() -> Result<(), Box<dyn std::error::Error>> {
     struct TestCase {
         name: &'static str,

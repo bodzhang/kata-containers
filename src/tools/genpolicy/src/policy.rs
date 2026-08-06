@@ -678,7 +678,7 @@ impl AgentPolicy {
         let mut root = c_settings.Root.clone();
         root.Readonly = yaml_container.read_only_root_filesystem();
 
-        let namespace = resource.get_namespace().unwrap_or_default();
+        let namespace = resource.get_namespace().unwrap_or("default".to_string());
 
         let use_host_network = resource.use_host_network();
         let annotations = get_container_annotations(
@@ -718,6 +718,19 @@ impl AgentPolicy {
             yaml_container,
             &self.config.settings,
         );
+
+        if self.config.settings.cluster_config.guest_pull {
+            let image = if is_pause_container {
+                "pause"
+            } else {
+                &yaml_container.image
+            };
+            storages.push(agent::Storage {
+                driver: "guest-pull-images".to_string(),
+                options: vec![image.to_string()],
+                ..Default::default()
+            });
+        }
 
         let mut linux = containerd::get_linux(is_privileged);
         linux.Namespaces = get_kata_namespaces(is_pause_container, use_host_network);
@@ -991,6 +1004,12 @@ impl AgentPolicy {
         // primary GID, including GID 0 for the default root user.
         if !is_pause_container {
             process.User.AdditionalGids.insert(process.User.GID);
+        }
+
+        if let Some(working_dir) = &yaml_container.workingDir {
+            if !working_dir.is_empty() {
+                process.Cwd.clone_from(working_dir);
+            }
         }
 
         if let Some(tty) = yaml_container.tty {

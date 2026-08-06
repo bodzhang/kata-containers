@@ -89,6 +89,51 @@ fn effective_log_level(enable_debug: bool, log_level: &str) -> &str {
     }
 }
 
+pub fn prepare_sandbox_network_env(spec: &mut oci::Spec) -> Result<SandboxNetworkEnv> {
+    let mut network_created = false;
+    let mut netns = None;
+    if let Some(linux) = &spec.linux() {
+        let linux_namespaces = linux.namespaces().clone().unwrap_or_default();
+        for ns in &linux_namespaces {
+            if ns.typ() != oci::LinuxNamespaceType::Network {
+                continue;
+            }
+            if ns.path().is_some() {
+                netns = ns.path().clone().map(|path| path.display().to_string());
+            } else {
+                let ns_name = generate_netns_name();
+                let raw_netns = NetNs::new(ns_name)?;
+                netns = Some(PathBuf::from(raw_netns.path()).display().to_string());
+                network_created = true;
+            }
+            break;
+        }
+    }
+
+    if netns.as_deref() == Some("/proc/0/ns/net") {
+        netns = None;
+    }
+    if netns.is_none() {
+        if let Some(path) = kata_sys_util::oci_docker::docker_netns_path(spec) {
+            netns = Some(path);
+        }
+    }
+
+    if let Some(netns_path) = &netns {
+        if spec.annotations_mut().is_none() {
+            spec.set_annotations(Some(HashMap::new()));
+        }
+        if let Some(annotations) = spec.annotations_mut().as_mut() {
+            annotations.insert("nerdctl/network-namespace".to_string(), netns_path.clone());
+        }
+    }
+
+    Ok(SandboxNetworkEnv {
+        netns,
+        network_created,
+    })
+}
+
 struct RuntimeHandlerManagerInner {
     id: String,
     msg_sender: Sender<Message>,
@@ -388,61 +433,7 @@ impl RuntimeHandlerManager {
             }
         }
 
-        let mut network_created = false;
-        let mut netns = None;
-        if let Some(linux) = &spec.linux() {
-            let linux_namespaces = linux.namespaces().clone().unwrap_or_default();
-            for ns in &linux_namespaces {
-                if ns.typ() != oci::LinuxNamespaceType::Network {
-                    continue;
-                }
-                // get netns path from oci spec
-                if ns.path().is_some() {
-                    netns = ns.path().clone().map(|p| p.display().to_string());
-                }
-                // if we get empty netns from oci spec, we need to create netns for the VM
-                else {
-                    let ns_name = generate_netns_name();
-                    let raw_netns = NetNs::new(ns_name)?;
-                    let path = Some(PathBuf::from(raw_netns.path()).display().to_string());
-                    netns = path;
-                    network_created = true;
-                }
-                break;
-            }
-        }
-
-        // When the OCI spec contains a network namespace with path `/proc/0/ns/net`,
-        // it means the task PID was not yet known at spec generation time (PID 0 is a
-        // placeholder).  containerd populates the netns path before the shim returns
-        // a real PID via the Connect RPC.  Treat this as "no netns provided" so the
-        // rescan mechanism can discover the correct namespace later.
-        if netns.as_deref() == Some("/proc/0/ns/net") {
-            netns = None;
-        }
-        // Docker 26+ may not publish the network namespace in `linux.namespaces` at create; use
-        // `libnetwork-setkey` hook args (see Go `DockerNetnsPath` and #9340).
-        if netns.is_none() {
-            if let Some(p) = kata_sys_util::oci_docker::docker_netns_path(spec) {
-                netns = Some(p);
-            }
-        }
-
-        // A nerdctl network namespace to let nerdctl know which namespace to use when calling the
-        // selected CNI plugin.
-        if let Some(netns_path) = &netns {
-            if spec.annotations_mut().is_none() {
-                spec.set_annotations(Some(HashMap::new()));
-            }
-            if let Some(annotations) = spec.annotations_mut().as_mut() {
-                annotations.insert("nerdctl/network-namespace".to_string(), netns_path.clone());
-            }
-        }
-
-        let network_env = SandboxNetworkEnv {
-            netns,
-            network_created,
-        };
+        let network_env = prepare_sandbox_network_env(spec)?;
 
         let shm_size = get_shm_size(spec)?;
 
@@ -1065,6 +1056,35 @@ mod tests {
         assert_eq!(effective_log_level(true, "info"), "debug");
         assert_eq!(effective_log_level(true, "trace"), "trace");
         assert_eq!(effective_log_level(true, "warn"), "warn");
+    }
+
+    #[test]
+    fn test_prepare_sandbox_network_env_adds_network_annotation() {
+        let mut spec: oci::Spec = serde_json::from_value(serde_json::json!({
+            "ociVersion": "1.1.0",
+            "linux": {
+                "namespaces": [{
+                    "type": "network",
+                    "path": "/var/run/netns/cni-test"
+                }]
+            }
+        }))
+        .unwrap();
+
+        let network_env = prepare_sandbox_network_env(&mut spec).unwrap();
+
+        assert_eq!(
+            network_env.netns.as_deref(),
+            Some("/var/run/netns/cni-test")
+        );
+        assert!(!network_env.network_created);
+        assert_eq!(
+            spec.annotations()
+                .as_ref()
+                .and_then(|annotations| annotations.get("nerdctl/network-namespace"))
+                .map(String::as_str),
+            Some("/var/run/netns/cni-test")
+        );
     }
 
     #[derive(Debug)]

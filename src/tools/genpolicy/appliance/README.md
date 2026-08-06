@@ -157,6 +157,7 @@ Run it inside a disposable Linux VM:
 ```bash
 mkdir -p input/images output
 cp tests/fixtures/pod.yaml input/workload.yaml
+cp tests/fixtures/configuration.toml input/configuration.toml
 
 docker run --rm --privileged --network=none \
   --cgroupns=host \
@@ -185,15 +186,16 @@ with `KATA_AGENT_POLICY_ONLY=true`. It installs the generated policy and uses
 policy evaluation, and policy-state updates, then returns success before guest
 mount, device, or process setup. Any policy denial fails the test, and the
 evaluated inputs are retained as `policy-runtime-inputs.jsonl` for diagnostics.
-This mode is disabled by default and is intended only for policy compatibility
-testing outside a guest VM.
+This replay is disabled during ordinary capture and is intended only for policy
+compatibility testing outside a guest VM.
 
-Successful runs produce the request-derived `policy.rego`,
-`policy-annotation.txt`, `workload-policy.yaml`, and `policy-oci-diff.json`.
-The production appliance contains the standalone Rust policy compiler and does
-not contain or invoke the legacy GenPolicy executable.
+An ordinary production-image run is capture-only and produces `output/capture/`.
+The production capture image contains neither policy generator. The separate
+analysis image contains the request-derived compiler but not native Legacy
+GenPolicy. Successful analysis writes `policy.rego`, `policy-annotation.txt`,
+`workload-policy.yaml`, and `policy-oci-diff.json`.
 
-Each successful run also writes an independently verifiable capture bundle to
+Each successful capture run writes an independently verifiable capture bundle to
 `output/capture/`. Its `manifest.json` records the normalized profile, exact
 component versions, capture backend and rootfs mode, configuration and capture
 binary hashes, external image-archive hashes, request counts, and the hash and
@@ -207,10 +209,11 @@ root-level outputs remain in place while capture and analysis orchestration are
 separated.
 
 Capture-only execution is the default. The appliance exits after validating
-`output/capture/` and does not generate policy artifacts. Set
-`GENPOLICY_CAPTURE_ONLY=0` only for temporary compatibility with the former
-combined capture-and-analysis workflow; new automation should run
-`analyze_capture.sh` separately.
+`output/capture/` and does not generate policy artifacts. Production capture
+images do not contain a compiler, so new automation must run the analysis image
+or `analyze_capture.sh` separately. `GENPOLICY_CAPTURE_ONLY=0` is retained only
+for test-only images, such as `legacy-reference`, that deliberately include a
+generator.
 
 Validate a stored bundle without rerunning Kubernetes:
 
@@ -220,18 +223,33 @@ python3 scripts/capture_bundle.py validate \
   --require-complete
 ```
 
-Regenerate balanced policy from the stored bundle without rerunning Kubernetes:
+Generate the request-derived policy from the stored bundle without rerunning
+Kubernetes:
 
 ```bash
-scripts/analyze_capture.sh output/capture analysis
+make analysis-image
+
+docker run --rm --network=none \
+  -v "$PWD/output/capture:/capture:ro" \
+  -v "$PWD/analysis:/analysis" \
+  genpolicy-analysis:latest /capture /analysis
 ```
 
 The driver validates the bundle first and writes `policy.rego`, dynamic tags,
-policy diff, annotation, and annotated workload under `analysis/`. Add
-`--agent-replay` and set `KATA_AGENT` and `AGENT_CTL` to run the optional
+policy diff, annotation, annotated workload, request provenance, and
+`storage-mount-analysis.json` under `analysis/`. The storage/mount report marks
+each known request-shape claim as `confirmed`, `not-exercised`, or
+`not-authoritative` and links confirmations to request JSON pointers. The
+report names unsupported rootfs, generic block/direct-volume storage,
+non-watchable shared-filesystem mounts, and block/VFIO/other Agent device
+shapes instead of folding them into an undifferentiated `other` class.
+`policy-oci-diff.json` separately records the sandbox storage contract copied
+from versioned settings with `capture_status = not-captured`; the real
+`CreateSandboxRequest` remains VM-coupled and is not reconstructed as evidence.
+Add `--agent-replay` and set `KATA_AGENT` and `AGENT_CTL` to run the optional
 policy-only Agent validation. `make e2e` performs a separate network-disabled
-analysis pass and requires its policy to match the combined run's balanced
-policy byte for byte.
+analysis pass and requires its `policy.rego` to match the test-only reference run's
+request-derived policy byte for byte.
 
 Select an exact capture profile with `PROFILE`. The authoritative runtime-rs
 profiles cover strict EROFS dm-verity and image guest-pull. A separate runc
@@ -283,7 +301,7 @@ bounded deployment-time identity. For example:
 | `configMapKeyRef` or `secretKeyRef` | The selected kubelet-expanded value is exact. |
 | `fieldRef` for generated Pod name, Pod UID, or node name | Replaced with `$(sandbox-name)`, `$(pod-uid)`, or `$(node-name)` after matching an API-server/profile value. Other resolved fields remain exact. |
 | `resourceFieldRef` | The quantity calculated by kubelet is captured exactly. |
-| Kubernetes service environment variable | Legacy-compatible mode uses the inherited bounded service-variable regexes. Balanced mode retains the captured endpoint exactly. |
+| Kubernetes service environment variable | The compiler emits one anchored, typed regex for each captured variable name, allowing production ClusterIP and port reassignment without authorizing undeclared service variables. |
 
 The original GenPolicy handles the same YAML forms by reconstructing values
 offline rather than observing kubelet. Its important fidelity limits are:
@@ -301,56 +319,133 @@ policy data, and related reports. Treat the complete output directory as
 sensitive and regenerate policy whenever an exact ConfigMap or Secret value
 changes.
 
-## Balanced policy mode
+## Compile or test a policy
 
-The legacy-compatible policy remains the default. To generate the supported
-balanced policy alongside it, set `GENPOLICY_BALANCED=1`:
+The request-derived compiler emits one deployable policy flavor. It clears
+inherited environment regexes, adds one anchored typed regex per captured
+service-variable name, and restricts termination messages to the proven
+external `/dev/termination-log` mount. Compile that policy from a stored
+capture bundle with the analysis image shown above, or directly when
+`genpolicy-oci-compiler` is available in `PATH`:
 
 ```bash
-docker run --rm --privileged --network=none \
-  -e GENPOLICY_BALANCED=1 \
-  --cgroupns=host \
-  -v "$PWD/input:/input:ro" \
-  -v "$PWD/output:/output" \
-  genpolicy-appliance:k8s-1.33.13-containerd-2.3.3
+scripts/analyze_capture.sh output/capture analysis
 ```
 
-The run additionally emits:
+The command writes `policy.rego`, `policy-annotation.txt`,
+`workload-policy.yaml`, `policy-oci-diff.json`, and the analysis reports. It
+does not generate a Legacy-compatible request-derived variant. Use native
+Legacy GenPolicy when that policy flavor is required.
 
-- `policy-balanced.rego`: pins service endpoints and the special
-  termination-message path to the externally backed
-  `/dev/termination-log` mount and clears inherited environment regexes.
-  It emulates Kata's `nerdctl/network-namespace` injection from the sandbox OCI
-  network namespace and generalizes the generated CNI path with a bounded
-  regex. It also retains generated name/UID markers wherever those values
-  occur, so this mode still has documented correlation risks;
-- `policy-mode-report.json`: compares balanced behavior against the
-  default legacy-compatible policy. The
-  legacy-reference image also compares the original GenPolicy output with the
-  request-derived legacy-compatible policy, including environment, mount, working
-  directory, and exec-probe differences.
+To test an existing Agent policy instead of compiling one, provide it with
+`--policy` and the policy-enabled Agent tools. Build those host tools first:
 
-Balanced mode reduces regex authorization while preserving deployment-time
-generated identities. It requires policy regeneration when an exact service
-ClusterIP or port changes. Raw requests under `createcontainer-requests/` are
-the reference for fields that cannot be made portable safely; the appliance
-does not emit a knowingly undeployable exact policy.
+```bash
+make policy-tools
+repo_root=$(git rev-parse --show-toplevel)
+rust_host=$(rustc -vV | awk '/^host:/ { print $2 }')
 
-The report also records unresolved enforcement needs: request capture does not yet
-retain per-environment-variable provenance or required/duplicate-key
+KATA_AGENT="$repo_root/target/$rust_host/release/kata-agent" \
+AGENT_CTL="$repo_root/target/debug/kata-agent-ctl" \
+  scripts/analyze_capture.sh --policy input/policy.rego \
+  output/capture policy-test
+```
+
+This action validates the capture bundle and replays its captured create and
+exec requests against the supplied policy. It does not invoke Legacy
+GenPolicy, the request-derived compiler, the tagger, or policy comparison. The
+policy may have been produced by either generator or another source. Success
+writes `policy-test-result.json` with `result: pass`; a policy denial writes
+`result: fail`, records the failed phase and request, and returns a nonzero exit
+status. `policy-runtime-inputs.jsonl` is retained for diagnostics. No policy or
+annotated workload is generated in test mode.
+
+ClusterIP and assigned-port changes within the typed grammars do not require
+compiler-policy regeneration. A service topology change, such as a service
+being added, removed, or renamed or its protocol changing, does require
+regeneration because the compiler pins the captured variable-name set. Raw
+requests under `createcontainer-requests/` are the reference for fields that
+cannot be made portable safely.
+
+The compiler report also records unresolved enforcement needs: request capture
+does not yet retain per-environment-variable provenance or required/duplicate-key
 semantics, and a more portable external-endpoint mode needs structured
 exclusion of UVM-local/control addresses rather than a generic IP regex.
 
-Balanced generation rejects custom termination-message paths unless
+Request-derived generation rejects custom termination-message paths unless
 they can be proven equivalent to the dedicated external kubelet bind mount.
 This prevents a termination write from being redirected into image code or
 other UVM-internal trusted state. The proof matches the kubelet path role and
 suffix, not an appliance-specific host installation directory.
 
 `make e2e` additionally builds a test-only `legacy-reference` image. That image
-runs both compilers against the same capture so the standalone result can be
-checked against legacy behavior without adding the legacy executable to the
-production appliance.
+runs the request-derived compiler and native Legacy GenPolicy against the same
+workload and capture. It retains both outputs for inspection without adding the
+legacy executable to the production appliance. It does not make Legacy output
+a request-derived compiler mode.
+
+### Local policy matrix
+
+Run a small local CI matrix that generates both policies and independently
+replays each one against the authoritative requests captured for every input
+YAML:
+
+```bash
+make policy-matrix
+```
+
+The default matrix covers `tests/fixtures/pod.yaml` and
+`tests/fixtures/policy-matrix-env-pod.yaml`. A case passes only when capture and
+both generators succeed and both policies authorize every captured create and
+exec request. The command exits nonzero if any case or policy fails. There is no
+expected-failure allowlist: a denial remains a visible compatibility failure.
+
+The current baseline passes both default cases with request-derived and native
+Legacy GenPolicy. The fixtures explicitly declare the synthetic image's
+supplementary group so Legacy guest-pull generation remains fail-closed rather
+than relying on host-side image-layer group discovery at deployment time.
+
+Run the same matrix with the containerd 1.7 compatibility profile and keep its
+artifacts separate from the default containerd 2.3 run:
+
+```bash
+make PROFILE=k8s-1.33-containerd-1.7-guest-pull \
+  POLICY_MATRIX_OUTPUT="$PWD/../../../../target/genpolicy-policy-matrix-containerd-1.7" \
+  policy-matrix
+```
+
+This profile uses containerd `v1.7.29`, its version-2 configuration schema, and
+the Legacy OCI `1.1.0` baseline. Both policies pass both default cases. The
+capture shim applies the same sandbox network normalization as production
+runtime-rs, so the final request and Legacy policy both contain the bounded
+`nerdctl/network-namespace` annotation. The appliance imports synthetic
+workloads under their requested digest-qualified references. Guest-pull
+authorization compares only the manifest digest, so changing the repository
+location does not change image identity.
+
+Supply a whitespace-separated YAML set with `POLICY_MATRIX_YAMLS`:
+
+```bash
+make policy-matrix \
+  POLICY_MATRIX_YAMLS="tests/fixtures/pod.yaml /absolute/path/workload.yaml"
+```
+
+Every workload must satisfy the appliance's normal immutable-image and
+readiness requirements and must be supported by both generators. Override the
+Kata configuration for the complete matrix with:
+
+```bash
+make policy-matrix \
+  POLICY_MATRIX_CONFIGURATION=/absolute/path/configuration.toml
+```
+
+Results are written to `target/genpolicy-policy-matrix/` by default. The
+top-level `policy-matrix-results.json` contains the aggregate result and embeds
+each case result. Per-case directories retain generation and replay logs,
+generated policies, the capture bundle, `policy-test-result.json` for each
+generator, and `policy-runtime-inputs.jsonl`. Set `POLICY_MATRIX_OUTPUT` to use
+a different generated-artifact directory; the runner replaces that directory
+at the start of each run.
 
 ## Legacy request defaults and stream I/O
 
@@ -402,11 +497,28 @@ is added.
 |---|---|---|
 | Non-VFIO `CreateContainerRequest.devices` | Supported for final-request shape admission. | The compiler retains captured records. Rego requires exact cardinality and unique paths; non-empty captured `id`, type, `vm_path`, and options are exact. Empty legacy placeholder fields remain path-only. This does not bind a resolved physical device identity. |
 | Kubernetes `volumeDevices` | Supported as a bounded container-visible device path, subject to authoritative final request capture. | Workload YAML supplies the declared path as an additional OCI policy check. It does not prove the backing block device's identity, integrity, confidentiality, or contents. |
-| NVIDIA pGPU through VFIO/CDI | Supported at the request-shape level, not as physical-device identity enforcement. | The compiler preserves one unsuffixed VFIO requirement per declared pGPU instead of pinning captured runtime numbers. Rego checks count, type, guest path shape, PCI option grammar, unique runtime device numbers, and CDI suffix correlation. A no-GPU clean room cannot identify the production device; trusted hotplug registry binding and post-CDI effective-plan authorization require future Agent changes. |
+| NVIDIA pGPU through VFIO/CDI | Rule-tested at the request-shape level, not capture-confirmed or physical-device identity enforcement. | The compiler preserves one unsuffixed VFIO requirement per declared pGPU instead of pinning captured runtime numbers. Rego checks count, type, guest path shape, PCI option grammar, unique runtime device numbers, and CDI suffix correlation. Current profiles have no GPU device plugin, extended-resource capacity, CDI installation, or VFIO hardware; trusted hotplug registry binding and post-CDI effective-plan authorization require future Agent changes. |
 | Probe and lifecycle exec actions | Supported with exact argv arrays read from trusted workload YAML. | These future requests are absent from `CreateContainerRequest`. Rego also checks the target container's recorded state and process user, environment, cwd, no-new-privileges, empty exec capabilities, and terminal semantics. Authorization is command-based, not caller/probe provenance-based: the same exact request can be issued through another exec client. |
 | Arbitrary `kubectl exec` | Denied by default. | The appliance defaults contain no global allowed commands or exec regexes. A command identical to an allowed probe or lifecycle action is nevertheless admitted. Until one-shot stream binding is implemented in the Agent, exec-process passfd ports are required to be zero. |
 | Runtime-rs `CopyFileRequest` for ConfigMap, Secret, projected, and runtime files | Supported within the configured Kata shared-directory domain. | Capture executes but does not record individual copy requests. Shared Rego constrains path, regular/directory/symlink type, traversal, relative symlink targets, and non-negative in-range offsets using the static `$(sfprefix)` rule. It does not authorize exact file sets, metadata, sizes, chunk sequences, or content. Agent `pathrs` handling confines writes beneath the guest shared directory. Host-provided contents remain mutable and untrusted. |
 | `kubectl cp` | Not a `CopyFileRequest` feature and denied by default. | `kubectl cp` normally invokes `tar` through `ExecProcessRequest`; it works only if the resulting exact exec command is separately authorized. |
+
+The current guest-pull, EROFS dm-verity, and runc-native profiles cannot process
+a GPU-requesting workload end to end. A container limit such as
+`nvidia.com/pgpu: 1` is submitted to the synthetic node, but kubelet cannot
+allocate the absent extended resource. The Pod does not become Ready, the
+180-second readiness wait fails, and the appliance exits without a complete
+capture bundle or policy. Exposing a GPU on the host does not change this
+without installing the device plugin, advertising capacity, and configuring
+CDI inside the throwaway cluster.
+
+`nvidia.com/pgpu` is the default YAML resource key interpreted as a pGPU policy
+declaration. `nvidia.com/gpu` is currently expected only in runtime-injected CDI
+annotation values; using it as a resource limit still requests an unavailable
+extended resource and does not create a pGPU policy requirement unless it is
+added to the versioned `pgpu_resource_keys` setting. Likewise,
+`volumeDevices` requires an authoritative final device capture, but the current
+cluster has no CSI driver to provision a raw-block PVC.
 
 ## Volume and shared-mount handling
 
@@ -415,13 +527,24 @@ every container. Missing or incomplete request capture fails generation. The
 storage predictor remains an audit artifact and workload YAML supplies only
 policy data for operations absent from container creation, such as exec probes.
 
+The evidence labels below are deliberate. **Capture-confirmed** means a final
+request recorded by `RecordingAgent` exercised the class. **Rule-tested** means
+compiler/Rego fixtures establish admission behavior but no current authoritative
+bundle exercises it. **Fail-closed** means capture or analysis may identify the
+shape, but generated policy does not admit it.
+
 | Volume form | Legacy GenPolicy | Appliance handling | Policy result |
 |---|---|---|---|
-| ConfigMap/Secret with `shared_fs = "none"` | Predicts a settings-based `$(sfprefix)` bind mount and, by default, no Agent `Storage`; it does not execute the shim's `CopyFile` path. | Runs the real runtime-rs copy-to-guest path. The recording Agent accepts `CopyFile` calls, and the captured final request contains no `Storage` but has a rewritten bind source matching `<cpath>/<cid>-<16 hex>-<destination basename>`. | Supported. Pins the rewritten mount shape and confines `CopyFile` paths and file types; it does not attest the host-supplied file contents. |
+| ConfigMap, Secret, and downward API with `shared_fs = "none"` | Predicts a settings-based `$(sfprefix)` bind mount and, by default, no Agent `Storage`; it does not execute the shim's `CopyFile` path. | Runs the real runtime-rs copy-to-guest path. The recording Agent accepts `CopyFile` calls, and the captured final request contains no `Storage` but has a rewritten bind source matching `<cpath>/<cid>-<16 hex>-<destination basename>`. | **Capture-confirmed.** Pins the rewritten mount shape and confines `CopyFile` paths and file types; it does not attest the host-supplied file contents. A composite Kubernetes `projected` volume is not yet capture-confirmed. |
 | Raw-block PVC through `volumeDevices` | Emits an `agent::Device` and OCI Linux device from the declared `devicePath`; pins only the container path. | Uses the final captured request devices. | Supported. Bounds the device path, not the device identity, integrity, confidentiality, or mutable contents. |
 | Filesystem PVC through shared fs | Emits a generic shared bind mount and no block `Storage`. | The clean-room cluster has no CSI driver, so it cannot materialize an ordinary PVC from YAML. | Fail-closed unless a separately supported authoritative fixture can reproduce the final shim request. |
-| Plain block-backed `emptyDir` | Emits the configured plain block-storage template. | Runs the real runtime-rs block-`emptyDir` handler with the dry-run device manager and captures its final `blk`, `scsi`, or platform-equivalent storage and rewritten mount. | Supported. Pins filesystem, options, `fsGroup`, sharing, and the mount-point/device-ID relationship. |
-| CDH-managed encrypted block `emptyDir` | Emits the configured encrypted block-storage template. | Runs the real runtime-rs `block-encrypted` handler and captures the final request containing `encryption_key=ephemeral`, `create_filesystem`, the block storage, and rewritten mount. The recording Agent stops at the request boundary; it does not run CDH or create a LUKS mapping. | High-fidelity request capture. Policy pins the CDH trigger and the complete storage/mount relationship. Production CDH/LUKS execution is covered by Kata's confidential Kubernetes integration test, not by this no-VM appliance. |
+| Memory `emptyDir` | Emits `ephemeral`/`tmpfs` storage. | Runs the real runtime-rs ephemeral-volume handler. | **Capture-confirmed.** Pins source, filesystem, options, sharing, and the exact guest mount point. |
+| Disk `emptyDir` in shared-fs mode | Emits `local` storage. | Runs the real runtime-rs local-volume handler. | **Capture-confirmed.** Pins source, filesystem, options, sharing, and the sandbox-correlated guest path. |
+| Hugepage `emptyDir` | Emits `ephemeral`/`hugetlbfs` storage. | The current host has no usable hugepage pool, so no authoritative workload is admitted. | **Rule-tested.** Source, options, and mount point are pinned; capture remains `not-exercised`. |
+| Plain block-backed `emptyDir` | Emits the configured plain block-storage template. | Runs the real runtime-rs block-`emptyDir` handler with the dry-run device manager and captures its final `blk`, `scsi`, `mmioblk`, `blk-ccw`, or `nvdimm` storage and rewritten mount. | **Capture-confirmed for `blk`; rule-tested for the other transports.** Pins source grammar, filesystem, options, `fsGroup`, sharing, and the source-derived mount point. |
+| CDH-managed encrypted block `emptyDir` | Emits the configured encrypted block-storage template. | Runs the real runtime-rs `block-encrypted` handler and captures the final request containing `encryption_key=ephemeral`, `create_filesystem`, the block storage, and rewritten mount. The recording Agent stops at the request boundary; it does not run CDH or create a LUKS mapping. | **Capture-confirmed for the request boundary.** Policy pins the CDH trigger and storage/mount relationship. Production CDH/LUKS execution is covered by Kata's confidential Kubernetes integration test, not by this no-VM appliance. |
+| Watchable virtio-fs ConfigMap, Secret, or projected volume | Emits `watchable-bind` storage plus a rewritten bind mount. | No-VM capture does not initialize production ShareFs. | **Rule-tested, not capture-confirmed.** The random path segment is bounded and the volume name is pinned. |
+| Non-watchable virtio-fs hostPath, projected volume, or filesystem PVC | Emits a rewritten shared-filesystem bind mount and may emit no Agent storage. | No production ShareFs initialization is available in the current no-VM boundary. | **Rule-tested where a recognized runtime-rs path is supplied; otherwise fail-closed.** |
 | CSI direct filesystem-mounted block volume | Has no direct-volume or `mountInfo.json` model; the extra runtime storage and rewritten mount are denied. | `GENPOLICY_DIRECT_VOLUME_MOUNTS` replays operator-supplied `mountInfo.json` data so `createreq-capture` records the real shim storage and mount. The compiler does not yet admit this storage class. | Captured but fail-closed. A dedicated direct-volume path template and Rego clause are required. |
 | CDH/KBS-backed persistent encrypted volume | Not represented for persistent PVCs. | Raw CSI direct volumes do not add a CDH key identity or encryption operation to the Agent request. | Unsupported in the production runtime/Agent contract; adding real CSI components to the appliance would not close this gap. |
 | Cross-container `shared_mounts` annotation | Not represented in `ContainerPolicy`; the shared Rego requires `count(input.shared_mounts) == 0`, so a non-empty request is denied at runtime. | Captures the final destination-container mappings but rejects any non-empty list during policy generation. | Unsupported and fail-closed in both. Potential future support requires exact policy declarations plus Agent-side mount-identity registration, fd-relative path confinement, and checked one-time cloning; path-string allowlisting alone is insufficient. |
@@ -445,6 +568,13 @@ checks the active dm-crypt cipher and integrity mode and verifies filesystem I/O
 The appliance tests instead verify that the captured CDH trigger and correlated
 storage, device, mount, ownership, and sharing fields are admitted exactly and
 that altered requests are denied.
+
+Run the authoritative shared-fs, plain block, and block-encrypted storage matrix
+with:
+
+```bash
+make storage-e2e PROFILE=k8s-1.33-containerd-2.3-guest-pull
+```
 
 ### Configure encrypted `emptyDir` capture
 
@@ -495,16 +625,56 @@ output directory preserved on the host:
 
 ```bash
 cp tests/fixtures/storage-boundary-workload.yaml input/workload.yaml
+cp tests/fixtures/configuration.toml input/configuration.toml
 
 docker run --rm --privileged --network=none \
   --cgroupns=host \
+  -e GENPOLICY_KATA_CONFIG=/input/configuration.toml \
   -v "$PWD/input:/input:ro" \
   -v "$PWD/output:/output" \
   genpolicy-appliance:k8s-1.33.13-containerd-2.3.3
+
+make analysis-image
+
+docker run --rm --network=none \
+  -v "$PWD/output/capture:/capture:ro" \
+  -v "$PWD/analysis:/analysis" \
+  genpolicy-analysis:latest /capture /analysis
 ```
 
 Kubelet and containerd materialize the YAML volumes as bind mounts in
-`output/raw/*.config.json`. Policy generation then fails on the first
-unsupported workload bind mount. This is intentional: the raw OCI demonstrates
-the transformation, but the appliance does not authorize the source until it
-can prove whether the resolved backing object is external to the UVM.
+`output/raw/*.config.json`, and the first command preserves a complete capture
+bundle. The separate analysis command then fails on the first unsupported
+workload bind mount. This is intentional: the raw OCI demonstrates the
+transformation, but the compiler does not authorize the source until it can
+prove whether the resolved backing object is external to the UVM.
+
+This final transformation example does **not** test a policy produced by native
+Legacy GenPolicy. The production capture image contains neither Legacy
+GenPolicy nor the request-derived compiler, capture-only mode is the default,
+and this deliberately unsupported fixture fails only when the separate
+request-derived analysis is attempted.
+
+To compare both generators for a supported user-provided
+`input/workload.yaml`, build and run the test-only reference image:
+
+```bash
+make reference-image PROFILE=k8s-1.33-containerd-2.3-guest-pull
+
+docker run --rm --privileged --network=none \
+  --cgroupns=host \
+  -e GENPOLICY_CAPTURE_ONLY=0 \
+  -e GENPOLICY_KATA_CONFIG=/input/configuration.toml \
+  -v "$PWD/input:/input:ro" \
+  -v "$PWD/output:/output" \
+  genpolicy-appliance:k8s-1.33-containerd-2.3-guest-pull-legacy-reference
+```
+
+The reference image passes `/input/workload.yaml` directly to native Legacy
+GenPolicy and writes `output/legacy-reference-policy.rego`. It also writes the
+single request-derived `output/policy.rego`. A failure in the request-derived
+compiler occurs before Legacy GenPolicy runs, so this reference command
+requires a workload supported by both paths. The canonical `make e2e` test
+runs both generators with the checked-in
+`tests/fixtures/complex-workload.yaml`, not with the caller's existing
+`input/workload.yaml`.

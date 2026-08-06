@@ -24,6 +24,7 @@ use kata_types::mount::KATA_IMAGE_FORCE_GUEST_PULL;
 use oci_spec::runtime as oci;
 use resource::cpu_mem::initial_size::InitialSizeManager;
 use resource::ResourceManager;
+use runtimes::manager::prepare_sandbox_network_env;
 use runtimes::RuntimeHandlerManager;
 use service::ServiceManager;
 use sha2::{Digest, Sha256};
@@ -75,21 +76,17 @@ fn parse_args(arguments: &[OsString]) -> Result<Action> {
     let mut version = false;
     let mut info = false;
     let mut args = Args::default();
-    let rest = go_flag::parse_args_with_warnings::<String, _, _>(
-        &arguments[1..],
-        None,
-        |flags| {
-            flags.add_flag("address", &mut args.address);
-            flags.add_flag("bundle", &mut args.bundle);
-            flags.add_flag("debug", &mut args.debug);
-            flags.add_flag("id", &mut args.id);
-            flags.add_flag("namespace", &mut args.namespace);
-            flags.add_flag("publish-binary", &mut args.publish_binary);
-            flags.add_flag("help", &mut help);
-            flags.add_flag("version", &mut version);
-            flags.add_flag("info", &mut info);
-        },
-    )?;
+    let rest = go_flag::parse_args_with_warnings::<String, _, _>(&arguments[1..], None, |flags| {
+        flags.add_flag("address", &mut args.address);
+        flags.add_flag("bundle", &mut args.bundle);
+        flags.add_flag("debug", &mut args.debug);
+        flags.add_flag("id", &mut args.id);
+        flags.add_flag("namespace", &mut args.namespace);
+        flags.add_flag("publish-binary", &mut args.publish_binary);
+        flags.add_flag("help", &mut help);
+        flags.add_flag("version", &mut version);
+        flags.add_flag("info", &mut info);
+    })?;
 
     if help {
         Ok(Action::Help)
@@ -149,9 +146,7 @@ fn socket_address(args: &Args, id: &str) -> Result<PathBuf> {
         .iter()
         .map(|byte| format!("{byte:02X}"))
         .collect::<String>();
-    Ok(PathBuf::from(format!(
-        "unix://{SOCKET_ROOT}/s/{digest}"
-    )))
+    Ok(PathBuf::from(format!("unix://{SOCKET_ROOT}/s/{digest}")))
 }
 
 fn socket_file(address: &Path) -> Result<PathBuf> {
@@ -183,9 +178,12 @@ fn start_shim(args: Args) -> Result<()> {
     let spec = oci::Spec::load("config.json").context("load start OCI config")?;
     let (container_type, sandbox_id) = kata_types::k8s::container_type_with_id(&spec);
     let address = match container_type {
-        kata_types::container::ContainerType::PodContainer => {
-            socket_address(&args, sandbox_id.as_deref().context("pod container has no sandbox id")?)?
-        }
+        kata_types::container::ContainerType::PodContainer => socket_address(
+            &args,
+            sandbox_id
+                .as_deref()
+                .context("pod container has no sandbox id")?,
+        )?,
         _ => {
             let address = socket_address(&args, &args.id)?;
             let socket_path = socket_file(&address)?;
@@ -244,24 +242,32 @@ async fn run_capture_shim(args: Args) -> Result<()> {
         .context("parse inherited containerd shim server fd")?;
     let config_path = std::env::var(CAPTURE_CONFIG_ENV)
         .with_context(|| format!("{CAPTURE_CONFIG_ENV} must name the Kata configuration"))?;
-    let output_dir = PathBuf::from(
-        std::env::var(CAPTURE_OUTPUT_ENV).unwrap_or_else(|_| "/output".to_string()),
-    );
-    let spec = oci::Spec::load("config.json").context("load sandbox OCI config.json")?;
+    let output_dir =
+        PathBuf::from(std::env::var(CAPTURE_OUTPUT_ENV).unwrap_or_else(|_| "/output".to_string()));
+    let mut spec = oci::Spec::load("config.json").context("load sandbox OCI config.json")?;
+    prepare_sandbox_network_env(&mut spec).context("prepare sandbox network environment")?;
+    std::fs::write(
+        "config.json",
+        serde_json::to_vec(&spec).context("serialize normalized sandbox OCI config.json")?,
+    )
+    .context("write normalized sandbox OCI config.json")?;
     let (mut config, _) = TomlConfig::load_raw_from_file(&config_path)
         .with_context(|| format!("load capture Kata configuration {config_path}"))?;
     if let Some(path) = std::env::var_os(DIRECT_VOLUME_MOUNTS_ENV) {
         stage_direct_volume_mounts(Path::new(&path)).with_context(|| {
-            format!("stage {DIRECT_VOLUME_MOUNTS_ENV} {}", Path::new(&path).display())
+            format!(
+                "stage {DIRECT_VOLUME_MOUNTS_ENV} {}",
+                Path::new(&path).display()
+            )
         })?;
     }
     let rootfs_mode = std::env::var(ROOTFS_MODE_ENV).unwrap_or_else(|_| "native".to_string());
     if force_guest_pull(&rootfs_mode)
         && !config
-        .runtime
-        .experimental
-        .iter()
-        .any(|feature| feature == KATA_IMAGE_FORCE_GUEST_PULL)
+            .runtime
+            .experimental
+            .iter()
+            .any(|feature| feature == KATA_IMAGE_FORCE_GUEST_PULL)
     {
         config
             .runtime
@@ -273,8 +279,7 @@ async fn run_capture_shim(args: Args) -> Result<()> {
     let config = Arc::new(config);
 
     let agent: Arc<dyn Agent> = Arc::new(RecordingAgent::to_directory(output_dir)?);
-    let hypervisor: Arc<dyn Hypervisor> =
-        Arc::new(DryRunHypervisor::new(hypervisor_config));
+    let hypervisor: Arc<dyn Hypervisor> = Arc::new(DryRunHypervisor::new(hypervisor_config));
     let initial_size_manager =
         InitialSizeManager::new(&spec).context("construct capture InitialSizeManager")?;
     let resource_manager = Arc::new(
@@ -290,10 +295,8 @@ async fn run_capture_shim(args: Args) -> Result<()> {
     );
 
     let (message_sender, message_receiver) = channel::<Message>(MESSAGE_BUFFER_SIZE);
-    let sandbox: Arc<dyn Sandbox> = Arc::new(CaptureSandbox::new(
-        args.id.clone(),
-        message_sender.clone(),
-    ));
+    let sandbox: Arc<dyn Sandbox> =
+        Arc::new(CaptureSandbox::new(args.id.clone(), message_sender.clone()));
     let container_manager = Arc::new(VirtContainerManager::new(
         &args.id,
         std::process::id(),

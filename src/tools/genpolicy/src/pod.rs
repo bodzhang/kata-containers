@@ -153,6 +153,9 @@ pub struct Container {
     pub args: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub workingDir: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     lifecycle: Option<Lifecycle>,
 
     #[serde(skip_serializing_if = "Option::is_none")]

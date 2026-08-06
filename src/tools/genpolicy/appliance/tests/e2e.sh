@@ -15,7 +15,8 @@ kata_agent="${KATA_AGENT:?KATA_AGENT is required}"
 temporary=$(mktemp -d)
 trap 'rm -rf "${temporary}"' EXIT
 
-mkdir -p "${temporary}/input/images" "${temporary}/output" "${temporary}/reanalysis"
+mkdir -p "${temporary}/input/images" "${temporary}/output" \
+    "${temporary}/reanalysis" "${temporary}/policy-test"
 cp "${script_dir}/fixtures/complex-workload.yaml" \
 	"${temporary}/input/workload.yaml"
 cp "${script_dir}/fixtures/configuration.toml" \
@@ -28,7 +29,6 @@ cp "${script_dir}/fixtures/configuration.toml" \
 
 "${engine}" run --rm --privileged --network=none \
     -e GENPOLICY_CAPTURE_ONLY=0 \
-	-e GENPOLICY_BALANCED=1 \
     -e GENPOLICY_KATA_CONFIG=/input/configuration.toml \
 	--cgroupns=host \
 	-v "${temporary}/input:/input:ro" \
@@ -46,8 +46,6 @@ test -s "${temporary}/output/capture/profile.json"
 test -s "${temporary}/output/capture/images/index.json"
 test -s "${temporary}/output/pods.json"
 test -s "${temporary}/output/workload-policy.yaml"
-test -s "${temporary}/output/policy-balanced.rego"
-test -s "${temporary}/output/policy-mode-report.json"
 test "$(find "${temporary}/output/tagged-requests" -type f -name '*.json' | wc -l)" -ge 2
 if [[ "${CAPTURE_BACKEND:-runtime-rs}" == "runtime-rs" ]]; then
     test "$(find "${temporary}/output/execprocess-requests" -type f -name '*.json' | wc -l)" -ge 1
@@ -67,10 +65,11 @@ python3 "${appliance_dir}/scripts/capture_bundle.py" validate \
     -v "${temporary}/reanalysis:/analysis" \
     "${analysis_image}" /opt/genpolicy/appliance/scripts/analyze_capture.sh \
     /capture /analysis
-cmp "${temporary}/output/policy-balanced.rego" \
+cmp "${temporary}/output/policy.rego" \
     "${temporary}/reanalysis/policy.rego"
 test -s "${temporary}/reanalysis/request-transformations.json"
 test -s "${temporary}/reanalysis/request-field-provenance.json"
+test -s "${temporary}/reanalysis/storage-mount-analysis.json"
 python3 - "${temporary}/reanalysis" <<'PY'
 import json
 import sys
@@ -83,12 +82,26 @@ transformations = json.loads(
 provenance = json.loads(
     (analysis / "request-field-provenance.json").read_text(encoding="utf-8")
 )
+storage_mounts = json.loads(
+    (analysis / "storage-mount-analysis.json").read_text(encoding="utf-8")
+)
 assert len(transformations["requests"]) == 3
 assert all(request["status"] == "paired" for request in transformations["requests"])
 assert {entry["source"] for entry in provenance["entries"]} >= {
     "kubernetes-resolved",
     "profile-runtime",
 }
+claims = {entry["id"]: entry for entry in storage_mounts["claims"]}
+if storage_mounts["capture"]["request_authority"] == "recording-agent":
+    assert claims["kubernetes-generated-files"]["status"] == "confirmed"
+    assert claims["uvm-dev-shm"]["status"] == "confirmed"
+    rootfs_claim = {
+        "guest-pull": "guest-pull-rootfs",
+        "erofs-dmverity": "erofs-overlay-rootfs",
+    }[storage_mounts["capture"]["rootfs_mode"]]
+    assert claims[rootfs_claim]["status"] == "confirmed"
+else:
+    assert all(entry["status"] == "not-authoritative" for entry in claims.values())
 PY
 python3 - "${temporary}/output" "${CAPTURE_BACKEND:-runtime-rs}" \
     "${ROOTFS_MODE:?ROOTFS_MODE is required}" \
@@ -159,7 +172,10 @@ pause = next(
         "io.kubernetes.cri.container-type"
     ) == "sandbox"
 )
-assert "nerdctl/network-namespace" not in pause["OCI"]["Annotations"]
+assert pause["OCI"]["Annotations"]["nerdctl/network-namespace"] == (
+    "^/var/run/netns/cni-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    "[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 assert pause["OCI"]["Annotations"]["io.kubernetes.cri.sandbox-log-directory"].startswith(
     "^/var/log/pods/$(sandbox-namespace)_$(sandbox-name)_"
 )
@@ -168,41 +184,51 @@ initdata = tomllib.loads(gzip.decompress(base64.b64decode(annotation)).decode())
 assert initdata["data"]["policy.rego"] == (output / "policy.rego").read_text()
 
 report = json.loads((output / "policy-oci-diff.json").read_text())
+assert report["schema_version"] == 3
+assert report["policy_mode"] == "request-derived"
+sandbox_contract = report["sandbox_storage_contract"]
+assert sandbox_contract["authority"] == "versioned-settings"
+assert sandbox_contract["capture_status"] == "not-captured"
+assert sandbox_contract["storages"] == final_data["sandbox"]["storages"]
 entry = next(
     item
     for item in report["containers"]
     if item["identity"]["container_name"] == "workload"
 )
 assert entry["fields"]["/OCI/Process"]["source"] == "captured-oci"
-assert entry["legacy_service_env_regex_coverage"]["checked"] > 0
-assert entry["legacy_service_env_regex_coverage"]["uncovered"] == 0
-
-mode_report = json.loads((output / "policy-mode-report.json").read_text())
-legacy = mode_report["modes"]["legacy"]["policy"]
-balanced = mode_report["modes"]["balanced"]["policy"]
-reference = mode_report["modes"]["legacy-reference"]["policy"]
-balanced_workload = workload(policy_data("policy-balanced.rego"))
-assert legacy["service_endpoint_regex_count"] > 0
-assert reference["allow_env_regex_count"] == legacy["allow_env_regex_count"]
+env_regexes = final_data["request_defaults"]["CreateContainerRequest"][
+    "allow_env_regex"
+]
+assert any(
+    regex.startswith("^BACKEND_SERVICE_HOST=") for regex in env_regexes
+), env_regexes
+assert not any("$(svc_name_downward_env)" in regex for regex in env_regexes)
+explicit_service_env = [
+    value
+    for container in final_data["containers"]
+    if container["OCI"]["Annotations"].get("io.kubernetes.cri.container-type")
+    != "sandbox"
+    for value in container["OCI"]["Process"]["Env"]
+    if "_SERVICE_" in value or "_PORT=" in value
+]
+assert not explicit_service_env, explicit_service_env
+termination_patterns = {
+    value
+    for container in final_data["containers"]
+    for key, value in container["runtime_anno_patterns"].items()
+    if "terminationMessagePath" in key
+}
+assert termination_patterns == {"^/dev/termination\\-log$"}
 assert (
-    reference["service_endpoint_regex_count"]
-    == legacy["service_endpoint_regex_count"]
-)
-assert balanced["service_endpoint_regex_count"] == 0
-assert balanced["identity_or_partition_regex_count"] == 0
-assert balanced["exact_service_env_count"] > 0
-assert balanced["termination_path_patterns"] == ["^/dev/termination\\-log$"]
-assert balanced["network_namespace_patterns"] == []
-assert (
-    balanced_workload["OCI"]["Annotations"]["io.kubernetes.cri.sandbox-name"]
+    final["OCI"]["Annotations"]["io.kubernetes.cri.sandbox-name"]
     == legacy_reference_workload["OCI"]["Annotations"][
         "io.kubernetes.cri.sandbox-name"
     ]
 )
-assert "POD_UID=$(pod-uid)" in balanced_workload["OCI"]["Process"]["Env"]
+assert "POD_UID=$(pod-uid)" in final["OCI"]["Process"]["Env"]
 provenance = json.loads((output / "provenance.json").read_text())
 assert len(provenance["outputs"]["raw_create_requests"]) == 3
-assert "policy-balanced.rego" in provenance["outputs"]["generated"]
+assert "policy.rego" in provenance["outputs"]["generated"]
 capture_manifest = json.loads(
     (output / "capture" / "manifest.json").read_text(encoding="utf-8")
 )
@@ -229,23 +255,39 @@ assert set(image_index["images"]) == requested_images
 for image in image_index["images"].values():
     assert (output / "capture" / "images" / image["manifest_path"]).is_file()
     assert (output / "capture" / "images" / image["config_path"]).is_file()
-comparison = mode_report["comparisons"]["legacy-reference-vs-oci-legacy"]
-assert comparison["rules_equal_ignoring_trailing_whitespace"]
-workload_comparison = comparison["containers"]["container/workload"]
-assert workload_comparison["cwd"] == {
-    "reference": "/",
-    "candidate": "/work",
-}
-assert workload_comparison["exec_commands"] == {
-    "reference": [["/bin/busybox", "true"]],
-    "candidate": [["/bin/busybox", "true"]],
-}
-assert "/var/run/secrets/kubernetes.io/serviceaccount" in (
-    workload_comparison["mount_destinations_only_in_reference"]
-)
+captured_images = set()
+for request_path in (output / "capture" / "createcontainer-requests").glob("*.json"):
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    annotations = request["oci"]["annotations"]
+    if annotations.get("io.kubernetes.cri.container-type") == "container":
+        captured_images.add(annotations["io.kubernetes.cri.image-name"])
+requested_digests = {image.rsplit("@", 1)[1] for image in requested_images}
+captured_digests = {image.rsplit("@", 1)[1] for image in captured_images}
+assert captured_digests == requested_digests
 PY
 
 KATA_AGENT="${kata_agent}" AGENT_CTL="${agent_ctl}" \
-    "${script_dir}/policy-runtime-e2e.sh" "${temporary}/output"
+    "${appliance_dir}/scripts/analyze_capture.sh" \
+    --policy "${temporary}/output/policy.rego" \
+    "${temporary}/output/capture" "${temporary}/policy-test"
+
+python3 - "${temporary}/policy-test/policy-test-result.json" \
+    "${CAPTURE_BACKEND:-runtime-rs}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+capture_backend = sys.argv[2]
+assert result["result"] == "pass"
+assert result["exit_code"] == 0
+assert result["checked_requests"] == (5 if capture_backend == "runtime-rs" else 3)
+assert result["phase"] == "complete"
+assert result["failed_request"] is None
+PY
+test -s "${temporary}/policy-test/policy-runtime-inputs.jsonl"
+test ! -e "${temporary}/policy-test/policy.rego"
+test ! -e "${temporary}/policy-test/policy-annotation.txt"
+test ! -e "${temporary}/policy-test/tagged-requests"
 
 echo "appliance end-to-end validation passed"

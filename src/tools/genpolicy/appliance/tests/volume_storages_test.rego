@@ -147,6 +147,16 @@ test_mixed_volume_storages_allowed if {
 	)
 }
 
+# Count equality must not let two runtime storages reuse one policy entry while
+# another declared storage class disappears.
+test_duplicate_storage_cannot_replace_declared_class if {
+	not allow_storages(
+		[ephemeral_policy("cache-volume"), local_policy("data-volume")],
+		[ephemeral_runtime("cache-volume"), ephemeral_runtime("cache-volume")],
+		"bid", sandbox_id,
+	)
+}
+
 # A watchable configMap/secret bind is admitted; the random hash is wildcarded
 # and the name pinned via $(cpath) substitution.
 test_watchable_bind_storage_allowed if {
@@ -225,32 +235,55 @@ guest_pull_marker(images) := {
 	"mount_point": "", "options": images,
 }
 
-# The container's own image is admitted against its marker, union empty.
+# The container's own manifest digest is admitted across repository aliases.
 test_guest_pull_per_container_allowed if {
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	allow_storages(
+		[guest_pull_marker([concat("", ["docker.io/library/nginx@", digest])])],
+		[guest_pull_runtime(concat("", ["mirror.example/nginx@", digest]))], "cid", sandbox_id,
+	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+}
+
+test_guest_pull_digest_only_marker_allowed if {
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	allow_storages(
+		[guest_pull_marker([digest])],
+		[guest_pull_runtime(concat("", ["mirror.example/nginx@", digest]))], "cid", sandbox_id,
+	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+}
+
+test_guest_pull_mutable_tag_denied if {
+	not allow_storages(
 		[guest_pull_marker(["docker.io/library/nginx:1.27"])],
 		[guest_pull_runtime("docker.io/library/nginx:1.27")], "cid", sandbox_id,
 	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
 }
 
+test_guest_pull_different_digest_denied if {
+	not allow_storages(
+		[guest_pull_marker(["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])],
+		[guest_pull_runtime("mirror.example/nginx@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")], "cid", sandbox_id,
+	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+}
+
 test_guest_pull_wrong_mount_point_denied if {
 	storage := json.patch(
-		guest_pull_runtime("docker.io/library/nginx:1.27"),
+		guest_pull_runtime("docker.io/library/nginx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
 		[{"op": "replace", "path": "/mount_point", "value": "/run/kata-containers/other/rootfs"}],
 	)
 	not allow_storages(
-		[guest_pull_marker(["docker.io/library/nginx:1.27"])],
+		[guest_pull_marker(["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])],
 		[storage], "cid", sandbox_id,
 	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
 }
 
 test_guest_pull_missing_driver_metadata_denied if {
 	storage := json.patch(
-		guest_pull_runtime("docker.io/library/nginx:1.27"),
+		guest_pull_runtime("docker.io/library/nginx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
 		[{"op": "replace", "path": "/driver_options", "value": []}],
 	)
 	not allow_storages(
-		[guest_pull_marker(["docker.io/library/nginx:1.27"])],
+		[guest_pull_marker(["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])],
 		[storage], "cid", sandbox_id,
 	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
 }
@@ -261,8 +294,8 @@ test_guest_pull_missing_driver_metadata_denied if {
 # back to allow-by-shape while a marker is present.
 test_guest_pull_per_container_isolation if {
 	not allow_storages(
-		[guest_pull_marker(["docker.io/library/nginx:1.27"])],
-		[guest_pull_runtime("ghcr.io/app/api:2")], "cid", sandbox_id,
+		[guest_pull_marker(["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])],
+		[guest_pull_runtime("ghcr.io/app/api@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")], "cid", sandbox_id,
 	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
 }
 
@@ -350,6 +383,35 @@ block_plain_scsi_policy := {
 
 test_block_plain_emptydir_scsi_allowed if {
 	allow_storages([block_plain_scsi_policy], [block_plain_scsi_runtime], "bid", sandbox_id)
+}
+
+block_runtime(driver, source) := json.patch(
+	block_encrypted_runtime(source, base64url.encode(source)),
+	[{"op": "replace", "path": "/driver", "value": driver}],
+)
+
+test_block_emptydir_platform_transports_allowed if {
+	every driver, source in {
+		"blk": "01",
+		"scsi": "0:0",
+		"mmioblk": "/dev/vda",
+		"blk-ccw": "0.0.0001",
+		"nvdimm": "/dev/pmem0",
+	} {
+		allow_storages(
+			[block_encrypted_policy],
+			[block_runtime(driver, source)],
+			"bid", sandbox_id,
+		)
+	}
+}
+
+test_block_emptydir_invalid_platform_source_denied if {
+	not allow_storages(
+		[block_encrypted_policy],
+		[block_runtime("mmioblk", "/dev/shm")],
+		"bid", sandbox_id,
+	)
 }
 
 # --- ConfigMap/Secret OCI mount (watchable-bind) enforcement ---

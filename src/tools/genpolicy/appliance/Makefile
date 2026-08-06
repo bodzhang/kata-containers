@@ -11,8 +11,11 @@ ANALYSIS_IMAGE ?= genpolicy-analysis:latest
 REFERENCE_IMAGE ?= $(IMAGE)-legacy-reference
 REPO_ROOT := $(abspath ../../../..)
 RUST_HOST := $(shell rustc -vV | awk '/^host:/ { print $$2 }')
+POLICY_MATRIX_OUTPUT ?= $(REPO_ROOT)/target/genpolicy-policy-matrix
+POLICY_MATRIX_YAMLS ?=
+POLICY_MATRIX_CONFIGURATION ?= $(CURDIR)/tests/fixtures/configuration.toml
 
-.PHONY: validate image analysis-image reference-image policy-tools e2e
+.PHONY: validate image analysis-image reference-image policy-tools e2e storage-e2e policy-matrix
 
 validate:
 	./tests/validate.sh
@@ -67,3 +70,18 @@ e2e: image analysis-image reference-image policy-tools
 		AGENT_CTL="$(REPO_ROOT)/target/debug/kata-agent-ctl" \
 		KATA_AGENT="$(REPO_ROOT)/target/$(RUST_HOST)/release/kata-agent" \
 		./tests/e2e.sh
+
+storage-e2e: image analysis-image
+	@test "$(CAPTURE_BACKEND)" = "runtime-rs" || { echo "storage-e2e requires a runtime-rs profile"; exit 1; }
+	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" IMAGE="$(IMAGE)" \
+		ANALYSIS_IMAGE="$(ANALYSIS_IMAGE)" \
+		./tests/storage-capture-e2e.sh
+
+policy-matrix: reference-image policy-tools
+	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" \
+		REFERENCE_IMAGE="$(REFERENCE_IMAGE)" \
+		AGENT_CTL="$(REPO_ROOT)/target/debug/kata-agent-ctl" \
+		KATA_AGENT="$(REPO_ROOT)/target/$(RUST_HOST)/release/kata-agent" \
+		POLICY_MATRIX_OUTPUT="$(POLICY_MATRIX_OUTPUT)" \
+		POLICY_MATRIX_CONFIGURATION="$(POLICY_MATRIX_CONFIGURATION)" \
+		./tests/policy-matrix-e2e.sh $(POLICY_MATRIX_YAMLS)

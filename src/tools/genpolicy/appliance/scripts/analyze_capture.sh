@@ -9,9 +9,10 @@ capture_dir=
 output_dir=
 agent_replay=0
 baseline_dir=
+policy_file=
 
 usage() {
-	echo "usage: $0 [--agent-replay] [--baseline CAPTURE_DIR] CAPTURE_DIR OUTPUT_DIR" >&2
+	echo "usage: $0 [--agent-replay | --policy POLICY_FILE] [--baseline CAPTURE_DIR] CAPTURE_DIR OUTPUT_DIR" >&2
 	exit 2
 }
 
@@ -24,6 +25,11 @@ while (($#)); do
 	--baseline)
 		(($# >= 2)) || usage
 		baseline_dir=$2
+		shift 2
+		;;
+	--policy)
+		(($# >= 2)) || usage
+		policy_file=$2
 		shift 2
 		;;
 	--*) usage ;;
@@ -40,16 +46,38 @@ while (($#)); do
 	esac
 done
 [[ -n "${capture_dir}" && -n "${output_dir}" ]] || usage
+[[ -z "${policy_file}" || "${agent_replay}" == "0" ]] || usage
 
 python3 "${appliance_root}/scripts/capture_bundle.py" validate \
 	--bundle "${capture_dir}" \
 	--require-complete
+
+if [[ -n "${policy_file}" ]]; then
+	[[ -f "${policy_file}" ]] || {
+		echo "policy file not found: ${policy_file}" >&2
+		exit 2
+	}
+	: "${KATA_AGENT:?KATA_AGENT is required with --policy}"
+	: "${AGENT_CTL:?AGENT_CTL is required with --policy}"
+	mkdir -p "${output_dir}"
+	ln -sfn "${capture_dir}/createcontainer-requests" \
+		"${output_dir}/createcontainer-requests"
+	ln -sfn "${capture_dir}/execprocess-requests" \
+		"${output_dir}/execprocess-requests"
+	KATA_AGENT="${KATA_AGENT}" AGENT_CTL="${AGENT_CTL}" \
+		"${appliance_root}/tests/policy-runtime-e2e.sh" \
+		--policy "${policy_file}" "${output_dir}"
+	exit
+fi
 
 mkdir -p "${output_dir}/tagged-requests"
 python3 "${appliance_root}/scripts/analyze_request_provenance.py" \
 	--capture "${capture_dir}" \
 	--transformations "${output_dir}/request-transformations.json" \
 	--provenance "${output_dir}/request-field-provenance.json"
+python3 "${appliance_root}/scripts/analyze_storage_mounts.py" \
+	--capture "${capture_dir}" \
+	--output "${output_dir}/storage-mount-analysis.json"
 
 if [[ -n "${baseline_dir}" ]]; then
 	python3 "${appliance_root}/scripts/capture_bundle.py" validate \
@@ -65,8 +93,7 @@ python3 "${appliance_root}/scripts/tag_oci.py" \
 	--raw-requests-dir "${capture_dir}/createcontainer-requests" \
 	--dynamic-values "${capture_dir}/dynamic-values.json" \
 	--output-dir "${output_dir}/tagged-requests" \
-	--manifest "${output_dir}/dynamic-tags.json" \
-	--regex-policy-mode balanced
+	--manifest "${output_dir}/dynamic-tags.json"
 
 coverage_arg=()
 [[ "${STRICT_STORAGE_COVERAGE:-0}" == "1" ]] &&
@@ -83,7 +110,6 @@ coverage_arg=()
 	--diff-output "${output_dir}/policy-oci-diff.json" \
 	--annotation-output "${output_dir}/policy-annotation.txt" \
 	--annotated-yaml-output "${output_dir}/workload-policy.yaml" \
-	--regex-policy-mode balanced \
 	"${coverage_arg[@]}"
 
 if [[ "${agent_replay}" == "1" ]]; then
@@ -97,4 +123,4 @@ if [[ "${agent_replay}" == "1" ]]; then
 		"${appliance_root}/tests/policy-runtime-e2e.sh" "${output_dir}"
 fi
 
-echo "Analyzed capture bundle into ${output_dir} using balanced-policy mode"
+echo "Analyzed capture bundle into ${output_dir}"

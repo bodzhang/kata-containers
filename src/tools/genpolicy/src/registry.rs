@@ -570,11 +570,7 @@ async fn get_image_layers(
     let mut layers = Vec::new();
 
     for layer in &manifest.layers {
-        if layer
-            .media_type
-            .eq(manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE)
-            || layer.media_type.eq(manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE)
-        {
+        if let Some(compressed) = layer_compression(&layer.media_type) {
             if layer_index < config_layer.rootfs.diff_ids.len() {
                 let mut imageLayer = get_users_from_layer(
                     layers_cache,
@@ -582,12 +578,13 @@ async fn get_image_layers(
                     reference,
                     &layer.digest,
                     &config_layer.rootfs.diff_ids[layer_index].clone(),
+                    compressed,
                 )
                 .await?;
                 imageLayer.diff_id = config_layer.rootfs.diff_ids[layer_index].clone();
                 layers.push(imageLayer);
             } else {
-                return Err(anyhow!("Too many Docker gzip layers"));
+                return Err(anyhow!("Too many image layers"));
             }
 
             layer_index += 1;
@@ -603,6 +600,7 @@ async fn get_users_from_layer(
     reference: &Reference,
     layer_digest: &str,
     diff_id: &str,
+    compressed: bool,
 ) -> Result<ImageLayer> {
     if let Some(layer) = layers_cache.get_layer(diff_id) {
         info!("get_users_from_layer: using cache file");
@@ -625,6 +623,7 @@ async fn get_users_from_layer(
         layer_digest,
         &decompressed_path,
         &compressed_path,
+        compressed,
     )
     .await
     {
@@ -654,12 +653,18 @@ async fn create_decompressed_layer_file(
     layer_digest: &str,
     decompressed_path: &Path,
     compressed_path: &Path,
+    compressed: bool,
 ) -> Result<()> {
     info!(
         "create_decompressed_layer_file: pulling layer {:?}",
         layer_digest
     );
-    let mut file = tokio::fs::File::create(&compressed_path)
+    let download_path = if compressed {
+        compressed_path
+    } else {
+        decompressed_path
+    };
+    let mut file = tokio::fs::File::create(download_path)
         .await
         .map_err(|e| anyhow!(e))?;
     client
@@ -667,6 +672,10 @@ async fn create_decompressed_layer_file(
         .await
         .map_err(|e| anyhow!(e))?;
     file.flush().await.map_err(|e| anyhow!(e))?;
+
+    if !compressed {
+        return Ok(());
+    }
 
     info!("create_decompressed_layer_file: decompressing layer");
     let compressed_file = std::fs::File::open(compressed_path).map_err(|e| anyhow!(e))?;
@@ -681,6 +690,17 @@ async fn create_decompressed_layer_file(
 
     decompressed_file.flush().map_err(|e| anyhow!(e))?;
     Ok(())
+}
+
+pub(crate) fn layer_compression(media_type: &str) -> Option<bool> {
+    match media_type {
+        manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE | manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE => {
+            Some(true)
+        }
+        "application/vnd.docker.image.rootfs.diff.tar"
+        | "application/vnd.oci.image.layer.v1.tar" => Some(false),
+        _ => None,
+    }
 }
 
 pub fn get_users_from_decompressed_layer(path: &Path) -> Result<(String, String)> {
@@ -969,6 +989,19 @@ mod tests {
             get_users_from_decompressed_layer(&layer_path).unwrap(),
             (passwd.to_string(), group.to_string())
         );
+    }
+
+    #[test]
+    fn classifies_supported_layer_compression() {
+        assert_eq!(
+            layer_compression("application/vnd.oci.image.layer.v1.tar+gzip"),
+            Some(true)
+        );
+        assert_eq!(
+            layer_compression("application/vnd.oci.image.layer.v1.tar"),
+            Some(false)
+        );
+        assert_eq!(layer_compression("application/example"), None);
     }
 
     #[test]

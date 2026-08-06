@@ -443,7 +443,9 @@ impl Agent for RecordingAgent {
                     format!("parse raw OCI config {}", raw_config_path.display())
                 })?;
                 std::fs::write(
-                    output_dir.join("raw").join(format!("{basename}.config.json")),
+                    output_dir
+                        .join("raw")
+                        .join(format!("{basename}.config.json")),
                     raw_config,
                 )?;
                 std::fs::write(
@@ -583,7 +585,10 @@ impl Agent for RecordingAgent {
         Ok(Empty::default())
     }
 
-    async fn get_guest_details(&self, _req: GetGuestDetailsRequest) -> Result<GuestDetailsResponse> {
+    async fn get_guest_details(
+        &self,
+        _req: GetGuestDetailsRequest,
+    ) -> Result<GuestDetailsResponse> {
         Ok(GuestDetailsResponse::default())
     }
 
@@ -660,14 +665,12 @@ mod tests {
         let create = output.join("createcontainer-requests/0001-container_one.json");
         let raw = output.join("raw/0001-container_one.config.json");
         let metadata = output.join("raw/0001-container_one.meta.json");
-        let exec = output
-            .join("execprocess-requests/0002-exec-container_one-probe_ready.json");
+        let exec = output.join("execprocess-requests/0002-exec-container_one-probe_ready.json");
         assert!(create.exists());
         assert!(raw.exists());
         assert!(exec.exists());
 
-        let raw: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(raw).unwrap()).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(raw).unwrap()).unwrap();
         let final_request: serde_json::Value =
             serde_json::from_slice(&std::fs::read(create).unwrap()).unwrap();
         assert_eq!(raw["process"]["cwd"], "/raw");

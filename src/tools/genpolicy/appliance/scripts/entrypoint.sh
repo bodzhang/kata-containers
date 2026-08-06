@@ -20,6 +20,16 @@ profile_path="${appliance_root}/profiles/${profile_name}.env"
 source "${profile_path}"
 export GENPOLICY_ROOTFS_MODE="${ROOTFS_MODE}"
 
+settings_dir=/run/genpolicy-settings
+mkdir -p "${settings_dir}/genpolicy-settings.d"
+cp /opt/genpolicy/policy/settings/genpolicy-settings.json "${settings_dir}/"
+cp /opt/genpolicy/policy/settings/genpolicy-settings.d/*.json \
+	"${settings_dir}/genpolicy-settings.d/"
+profile_settings="${profile_path%.env}.settings.json"
+if [[ -f "${profile_settings}" ]]; then
+	cp "${profile_settings}" "${settings_dir}/genpolicy-settings.d/20-profile.json"
+fi
+
 mkdir -p "${output_dir}/raw" "${output_dir}/logs"
 
 pids=()
@@ -65,6 +75,9 @@ runc) ;;
 runtime-rs) containerd_config="${appliance_root}/config/containerd-runtime-rs.toml" ;;
 *) fail "unsupported capture backend: ${GENPOLICY_CAPTURE_BACKEND}" ;;
 esac
+if [[ -n "${CONTAINERD_CONFIG:-}" ]]; then
+	containerd_config="${appliance_root}/config/${CONTAINERD_CONFIG}"
+fi
 if [[ "${ROOTFS_MODE}" == "erofs-dmverity" ]]; then
 	[[ "${GENPOLICY_CAPTURE_BACKEND:-runtime-rs}" == "runtime-rs" ]] ||
 		fail "EROFS dm-verity requires the runtime-rs capture backend"
@@ -172,34 +185,29 @@ wait_for containerd ctr --address /run/containerd/containerd.sock version
 
 ctr --address /run/containerd/containerd.sock --namespace k8s.io images import \
 	--digests /opt/genpolicy/images/pause.tar >/dev/null
-ctr --address /run/containerd/containerd.sock --namespace k8s.io images import \
-	--digests /opt/genpolicy/images/busybox.tar >/dev/null
+image_archives=(/opt/genpolicy/images/busybox.tar)
 if [[ -d "${input_dir}/images" ]]; then
 	while IFS= read -r -d '' image; do
-		ctr --address /run/containerd/containerd.sock --namespace k8s.io images import \
-			--digests "${image}" >/dev/null
+		image_archives+=("${image}")
 	done < <(find "${input_dir}/images" -type f -name '*.tar' -print0)
 fi
+referenced_image_dir=/run/genpolicy-requested-images
+mkdir -p "${referenced_image_dir}"
+image_number=0
 while IFS= read -r image_ref; do
-	digest=${image_ref##*@}
-	if ctr --address /run/containerd/containerd.sock --namespace k8s.io \
-		images list -q | grep -Fxq "${image_ref}"; then
-		continue
-	fi
-	source_ref=$(
-		ctr --address /run/containerd/containerd.sock --namespace k8s.io \
-			images list |
-			awk -v digest="${digest}" 'NR > 1 && $3 == digest { print $1; exit }'
-	)
-	if [[ -n "${source_ref}" ]]; then
-		ctr --address /run/containerd/containerd.sock --namespace k8s.io images tag \
-			"${source_ref}" "${image_ref}" >/dev/null
+	referenced_archive="${referenced_image_dir}/requested-image-${image_number}.tar"
+	if python3 "${appliance_root}/scripts/reference_oci_image.py" \
+		--reference "${image_ref}" --output "${referenced_archive}" \
+		"${image_archives[@]}"; then
+		ctr --address /run/containerd/containerd.sock --namespace k8s.io images import \
+			"${referenced_archive}" >/dev/null
 	else
 		[[ "${image_ref}" != "${LOCAL_REGISTRY}/"* ]] ||
-			fail "no imported image has requested manifest digest ${digest}"
+			fail "no imported image has requested manifest digest ${image_ref##*@}"
 		ctr --address /run/containerd/containerd.sock --namespace k8s.io \
 			images pull --hosts-dir /etc/containerd/certs.d "${image_ref}" >/dev/null
 	fi
+	image_number=$((image_number + 1))
 done <"${output_dir}/requested-images.txt"
 
 case "$(uname -m)" in
@@ -442,36 +450,13 @@ genpolicy-oci-compiler \
 	--tagged-requests-dir "${output_dir}/tagged-requests" \
 	--tag-manifest "${output_dir}/dynamic-tags.json" \
 	--rules /opt/genpolicy/policy/rules.rego \
-	--settings /opt/genpolicy/policy/settings \
+	--settings "${settings_dir}" \
 	--workload "${workload}" \
 	--output "${output_dir}/policy.rego" \
 	--diff-output "${output_dir}/policy-oci-diff.json" \
 	--annotation-output "${output_dir}/policy-annotation.txt" \
 	--annotated-yaml-output "${output_dir}/workload-policy.yaml" \
 	"${coverage_arg[@]}"
-
-if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
-	python3 "${appliance_root}/scripts/tag_oci.py" \
-		--raw-requests-dir "${output_dir}/createcontainer-requests" \
-		--dynamic-values "${output_dir}/dynamic-values.json" \
-		--output-dir "${output_dir}/tagged-requests-balanced" \
-		--manifest "${output_dir}/dynamic-tags-balanced.json" \
-		--regex-policy-mode balanced
-
-	genpolicy-oci-compiler \
-		--raw-requests-dir "${output_dir}/createcontainer-requests" \
-		--tagged-requests-dir "${output_dir}/tagged-requests-balanced" \
-		--tag-manifest "${output_dir}/dynamic-tags-balanced.json" \
-		--rules /opt/genpolicy/policy/rules.rego \
-		--settings /opt/genpolicy/policy/settings \
-		--workload "${workload}" \
-		--output "${output_dir}/policy-balanced.rego" \
-		--diff-output "${output_dir}/policy-oci-diff-balanced.json" \
-		--annotation-output "${output_dir}/policy-annotation-balanced.txt" \
-		--annotated-yaml-output "${output_dir}/workload-policy-balanced.yaml" \
-		--regex-policy-mode balanced \
-		"${coverage_arg[@]}"
-fi
 
 if [[ "${GENPOLICY_LEGACY_REFERENCE:-0}" == "1" ]]; then
 	policy_work_dir=/var/lib/genpolicy-appliance
@@ -480,19 +465,13 @@ if [[ "${GENPOLICY_LEGACY_REFERENCE:-0}" == "1" ]]; then
 	genpolicy \
 		--yaml-file "${policy_work_dir}/workload.yaml" \
 		--rego-rules-path /opt/genpolicy/policy/rules.rego \
-		--json-settings-path /opt/genpolicy/policy/settings \
+		--json-settings-path "${settings_dir}" \
 		--containerd-socket-path=/run/containerd/containerd.sock \
 		--insecure-registry "${LOCAL_REGISTRY}" \
 		--silent-unsupported-fields \
 		--raw-out \
 		>"${output_dir}/legacy-reference-policy.rego" \
 		2>"${output_dir}/logs/genpolicy-reference.log"
-fi
-
-if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
-	python3 "${appliance_root}/scripts/compare_policy_modes.py" \
-		--output-dir "${output_dir}" \
-		--output "${output_dir}/policy-mode-report.json"
 fi
 
 provenance_artifacts=(
@@ -502,9 +481,6 @@ provenance_artifacts=(
 	--artifact "etcd=/usr/local/bin/etcd"
 	--artifact "containerd=/usr/local/bin/containerd"
 	--artifact "runc=/usr/local/bin/runc.real"
-	--artifact "genpolicy-oci-compiler=/usr/local/bin/genpolicy-oci-compiler"
-	--artifact "storage-predictor=/usr/local/bin/storage-predictor"
-	--artifact "createreq-capture=/usr/local/bin/createreq-capture"
 	--artifact "containerd-config=/etc/containerd/config.toml"
 	--artifact "kubelet-config=/etc/kubernetes/kubelet.yaml"
 	--artifact "cni-config=/etc/cni/net.d/10-genpolicy.conflist"
@@ -513,6 +489,13 @@ provenance_artifacts=(
 	--artifact "pause-image=/opt/genpolicy/images/pause.tar"
 	--artifact "busybox-image=/opt/genpolicy/images/busybox.tar"
 )
+for optional_artifact in \
+	"genpolicy-oci-compiler=/usr/local/bin/genpolicy-oci-compiler" \
+	"storage-predictor=/usr/local/bin/storage-predictor" \
+	"createreq-capture=/usr/local/bin/createreq-capture"; do
+	[[ -x "${optional_artifact#*=}" ]] &&
+		provenance_artifacts+=(--artifact "${optional_artifact}")
+done
 if [[ -d "${input_dir}/images" ]]; then
 	while IFS= read -r -d '' image; do
 		provenance_artifacts+=(--artifact "input-image-$(basename "${image}")=${image}")
@@ -531,17 +514,6 @@ if [[ -f "${output_dir}/storages-devices-predicted.json" ]]; then
 		--generated "storages-devices-predicted.json=${output_dir}/storages-devices-predicted.json"
 	)
 fi
-if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
-	provenance_generated+=(
-		--generated "dynamic-tags-balanced.json=${output_dir}/dynamic-tags-balanced.json"
-		--generated "policy-balanced.rego=${output_dir}/policy-balanced.rego"
-		--generated "policy-oci-diff-balanced.json=${output_dir}/policy-oci-diff-balanced.json"
-		--generated "policy-annotation-balanced.txt=${output_dir}/policy-annotation-balanced.txt"
-		--generated "workload-policy-balanced.yaml=${output_dir}/workload-policy-balanced.yaml"
-		--generated "policy-mode-report.json=${output_dir}/policy-mode-report.json"
-	)
-fi
-
 python3 "${appliance_root}/scripts/write_provenance.py" \
 	--profile "${profile_path}" \
 	--input "${workload}" \

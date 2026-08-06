@@ -7,7 +7,8 @@
 #![allow(non_snake_case)]
 use crate::layers_cache::ImageLayersCache;
 use crate::registry::{
-    get_users_from_decompressed_layer, Container, DockerConfigLayer, ImageLayer, WHITEOUT_MARKER,
+    get_users_from_decompressed_layer, layer_compression, Container, DockerConfigLayer, ImageLayer,
+    WHITEOUT_MARKER,
 };
 use crate::utils::Config;
 
@@ -296,21 +297,20 @@ pub async fn get_image_layers(
 
     for layer in layers {
         let layer_media_type = layer["mediaType"].as_str().unwrap();
-        if layer_media_type.eq("application/vnd.docker.image.rootfs.diff.tar.gzip")
-            || layer_media_type.eq("application/vnd.oci.image.layer.v1.tar+gzip")
-        {
+        if let Some(compressed) = layer_compression(layer_media_type) {
             if layer_index < config_layer.rootfs.diff_ids.len() {
                 let mut imageLayer = get_users_from_layer(
                     layers_cache,
                     layer["digest"].as_str().unwrap(),
                     client,
                     &config_layer.rootfs.diff_ids[layer_index].clone(),
+                    compressed,
                 )
                 .await?;
                 imageLayer.diff_id = config_layer.rootfs.diff_ids[layer_index].clone();
                 layersVec.push(imageLayer);
             } else {
-                return Err(anyhow!("Too many Docker gzip layers"));
+                return Err(anyhow!("Too many image layers"));
             }
             layer_index += 1;
         }
@@ -324,6 +324,7 @@ async fn get_users_from_layer(
     layer_digest: &str,
     client: &containerd_client::Client,
     diff_id: &str,
+    compressed: bool,
 ) -> Result<ImageLayer> {
     if let Some(layer) = layers_cache.get_layer(diff_id) {
         info!("Using cache file");
@@ -341,9 +342,14 @@ async fn get_users_from_layer(
     compressed_path.set_extension("gz");
 
     // go find verity hash if not found in cache
-    if let Err(e) =
-        create_decompressed_layer_file(client, layer_digest, &decompressed_path, &compressed_path)
-            .await
+    if let Err(e) = create_decompressed_layer_file(
+        client,
+        layer_digest,
+        &decompressed_path,
+        &compressed_path,
+        compressed,
+    )
+    .await
     {
         temp_dir.close()?;
         bail!(format!(
@@ -373,9 +379,15 @@ async fn create_decompressed_layer_file(
     layer_digest: &str,
     decompressed_path: &Path,
     compressed_path: &Path,
+    compressed: bool,
 ) -> Result<()> {
     info!("Pulling layer {layer_digest}");
-    let mut file = tokio::fs::File::create(&compressed_path)
+    let download_path = if compressed {
+        compressed_path
+    } else {
+        decompressed_path
+    };
+    let mut file = tokio::fs::File::create(download_path)
         .await
         .map_err(|e| anyhow!(e))?;
 
@@ -403,6 +415,11 @@ async fn create_decompressed_layer_file(
         .await
         .map_err(|e| anyhow!(e))
         .expect("Failed to flush file");
+
+    if !compressed {
+        return Ok(());
+    }
+
     let compressed_file = std::fs::File::open(compressed_path).map_err(|e| anyhow!(e))?;
     let mut decompressed_file = std::fs::OpenOptions::new()
         .read(true)

@@ -29,7 +29,6 @@ struct Args {
     diff_output: PathBuf,
     annotation_output: PathBuf,
     annotated_yaml_output: PathBuf,
-    regex_policy_mode: String,
     strict_storage_coverage: bool,
 }
 
@@ -283,10 +282,6 @@ fn parse_args() -> Result<Args> {
         diff_output: required("--diff-output")?,
         annotation_output: required("--annotation-output")?,
         annotated_yaml_output: required("--annotated-yaml-output")?,
-        regex_policy_mode: values
-            .get("--regex-policy-mode")
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "legacy".to_string()),
         strict_storage_coverage: values
             .get("--strict-storage-coverage")
             .is_some_and(|value| value.to_string_lossy() == "true"),
@@ -380,7 +375,10 @@ fn load_create_requests(
         }
     }
     if requests.is_empty() {
-        bail!("no CreateContainerRequest captures found in {}", directory.display());
+        bail!(
+            "no CreateContainerRequest captures found in {}",
+            directory.display()
+        );
     }
     Ok(requests)
 }
@@ -408,9 +406,7 @@ fn validate_create_request_pair(
         || tagged.stdout_port != raw.stdout_port
         || tagged.stderr_port != raw.stderr_port
     {
-        bail!(
-            "tagged create request {basename} changed request-level fields outside nested OCI"
-        );
+        bail!("tagged create request {basename} changed request-level fields outside nested OCI");
     }
     let tagged_oci = tagged
         .oci
@@ -473,72 +469,6 @@ fn validate_supported_create_request_fields(
         }
     }
     Ok(())
-}
-
-fn expand_env_regex(pattern: &str, common: &policy::CommonData) -> String {
-    pattern
-        .replace("$(ipv4_a)", &common.ipv4_a)
-        .replace("$(ip_p)", &common.ip_p)
-        .replace(
-            "$(svc_name_downward_env)",
-            &common.svc_name_downward_env,
-        )
-        .replace("$(dns_label)", &common.dns_label)
-}
-
-fn validate_legacy_service_env_coverage(
-    tagged: &CapturedSpec,
-    raw: &CapturedSpec,
-    request_defaults: &Value,
-    common: &policy::CommonData,
-) -> Result<usize> {
-    let patterns = request_defaults
-        .get("CreateContainerRequest")
-        .and_then(|value| value.get("allow_env_regex"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            anyhow!("settings have no CreateContainerRequest.allow_env_regex")
-        })?;
-    let regexes = patterns
-        .iter()
-        .map(|value| {
-            let pattern = value
-                .as_str()
-                .ok_or_else(|| anyhow!("allow_env_regex entry is not a string"))?;
-            regex::Regex::new(&expand_env_regex(pattern, common))
-                .with_context(|| format!("compile allow_env_regex {pattern}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut checked = 0;
-    for tagged_env in &tagged.process.env {
-        if !tagged_env.contains("{{GENPOLICY_DYNAMIC:service-env.") {
-            continue;
-        }
-        let (name, _) = tagged_env
-            .split_once('=')
-            .ok_or_else(|| anyhow!("tagged service environment has no name"))?;
-        let prefix = format!("{name}=");
-        let actual: Vec<_> = raw
-            .process
-            .env
-            .iter()
-            .filter(|value| value.starts_with(&prefix))
-            .collect();
-        if actual.len() != 1 {
-            bail!(
-                "container environment has {} values for service variable {name}",
-                actual.len()
-            );
-        }
-        if !regexes.iter().any(|regex| regex.is_match(actual[0])) {
-            bail!(
-                "legacy environment regexes do not cover captured variable {name}"
-            );
-        }
-        checked += 1;
-    }
-    Ok(checked)
 }
 
 fn collect_workload_policy(
@@ -667,8 +597,7 @@ fn sandbox_log_directory_pattern(
         .annotations
         .get("io.kubernetes.cri.sandbox-name")
         .ok_or_else(|| anyhow!("sandbox log directory has no sandbox name"))?;
-    let expected =
-        format!("/var/log/pods/{namespace}_{sandbox_name}_{POD_UID_MARKER}");
+    let expected = format!("/var/log/pods/{namespace}_{sandbox_name}_{POD_UID_MARKER}");
     if value != expected {
         bail!("unexpected sandbox log directory shape: {value}");
     }
@@ -683,7 +612,6 @@ fn sandbox_log_directory_pattern(
 fn compile_env(
     values: &[String],
     regexes: &BTreeMap<String, String>,
-    regex_policy_mode: &str,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let mut env = Vec::new();
     let mut allow_regex = Vec::new();
@@ -699,9 +627,6 @@ fn compile_env(
             .strip_prefix(DYNAMIC_PREFIX)
             .and_then(|value| value.strip_suffix("}}"))
             .ok_or_else(|| anyhow!("unsupported partial environment marker: {value}"))?;
-        if regex_policy_mode == "legacy" && tag.starts_with("service-env.") {
-            continue;
-        }
         let replacement = match tag {
             "node.name" => Some("$(node-name)"),
             "pod.uid" => Some("$(pod-uid)"),
@@ -720,10 +645,8 @@ fn compile_env(
 fn captured_process(
     process: &CapturedProcess,
     regexes: &BTreeMap<String, String>,
-    regex_policy_mode: &str,
 ) -> Result<(KataProcess, Vec<String>)> {
-    let (env, allow_regex) =
-        compile_env(&process.env, regexes, regex_policy_mode)?;
+    let (env, allow_regex) = compile_env(&process.env, regexes)?;
     Ok((
         KataProcess {
             Terminal: process.terminal,
@@ -800,7 +723,10 @@ fn normalize_mounts(
             if matches!(
                 mount.destination.as_str(),
                 "/etc/hostname" | "/etc/resolv.conf"
-            ) && !mount.options.iter().any(|value| value == "ro" || value == "rw")
+            ) && !mount
+                .options
+                .iter()
+                .any(|value| value == "ro" || value == "rw")
             {
                 if let Some(access) = captured
                     .options
@@ -819,7 +745,9 @@ fn normalize_mounts(
             // templated regex mount the predictor drove (random UUID segment
             // wildcarded, name pinned) — this is what the runtime
             // CreateContainerRequest carries and what rules.rego allow_mount matches.
-            validate_guest_mount_source(predicted)?;
+            if !predicted.source.is_empty() {
+                validate_guest_mount_source(predicted)?;
+            }
             mounts.push(predicted.clone());
         } else if captured.type_ != "bind" {
             mounts.push(KataMount {
@@ -884,10 +812,7 @@ fn compile_annotations(
             annotations.insert(key.to_string(), value.clone());
         }
     }
-    for key in [
-        "io.kubernetes.cri.sandbox-id",
-        "nerdctl/network-namespace",
-    ] {
+    for key in ["io.kubernetes.cri.sandbox-id", "nerdctl/network-namespace"] {
         if let Some(value) = capture.annotations.get(key) {
             annotations.insert(key.to_string(), marker_pattern(value, regexes)?);
         }
@@ -901,17 +826,11 @@ fn compile_annotations(
             sandbox_log_directory_pattern(capture, value, regexes)?,
         );
     }
-    if let Some(value) = capture
-        .annotations
-        .get("io.kubernetes.cri.sandbox-name")
-    {
+    if let Some(value) = capture.annotations.get("io.kubernetes.cri.sandbox-name") {
         let pattern = sandbox_name_pattern
             .map(|pattern| format!("^{pattern}$"))
             .unwrap_or(marker_pattern(value, regexes)?);
-        annotations.insert(
-            "io.kubernetes.cri.sandbox-name".to_string(),
-            pattern,
-        );
+        annotations.insert("io.kubernetes.cri.sandbox-name".to_string(), pattern);
     }
     Ok(annotations)
 }
@@ -922,7 +841,6 @@ fn compile_container(
     settings: &Settings,
     regexes: &BTreeMap<String, String>,
     allow_env_regex: &mut Vec<String>,
-    regex_policy_mode: &str,
     exec_commands: Vec<Vec<String>>,
     sandbox_name_pattern: Option<&str>,
     volume_device_paths: &[String],
@@ -942,8 +860,7 @@ fn compile_container(
             "settings-kata-sandbox-normalization",
         )
     } else {
-        let (process, dynamic_regex) =
-            captured_process(&capture.process, regexes, regex_policy_mode)?;
+        let (process, dynamic_regex) = captured_process(&capture.process, regexes)?;
         for value in dynamic_regex {
             if !allow_env_regex.contains(&value) {
                 allow_env_regex.push(value);
@@ -952,12 +869,7 @@ fn compile_container(
         (process, "captured-oci")
     };
 
-    let annotations = compile_annotations(
-        capture,
-        template,
-        regexes,
-        sandbox_name_pattern,
-    )?;
+    let annotations = compile_annotations(capture, template, regexes, sandbox_name_pattern)?;
     // Block-device volumes (parity with legacy genpolicy): pin the container_path
     // where each declared device appears. This bounds the device SET the host may
     // present; the device content is untrusted by the guest under the CC model,
@@ -1001,8 +913,8 @@ fn compile_container(
         Sysctl: template.Linux.Sysctl.clone(),
         Seccomp: capture.linux.seccomp.clone().map(Into::into),
     };
-    let root_path = erofs_root_path_template(&capture.root.path)
-        .unwrap_or_else(|| template.Root.Path.clone());
+    let root_path =
+        erofs_root_path_template(&capture.root.path).unwrap_or_else(|| template.Root.Path.clone());
     let oci = KataSpec {
         Version: capture.version.clone(),
         Process: process,
@@ -1017,11 +929,7 @@ fn compile_container(
     };
     let mut runtime_anno_patterns = BTreeMap::new();
     if !sandbox {
-        let termination_path = if regex_policy_mode == "legacy" {
-            "^/.*$".to_string()
-        } else {
-            safe_termination_message_path(capture, regex_policy_mode)?
-        };
+        let termination_path = safe_termination_message_path(capture)?;
         runtime_anno_patterns.insert(
             "^io\\.kubernetes\\.container\\.terminationMessagePath$".to_string(),
             termination_path,
@@ -1090,27 +998,26 @@ fn erofs_root_path_template(path: &str) -> Option<String> {
     if !concrete_id && !tagged_id {
         return None;
     }
-    Some(
-        "/run/kata-containers/shared/containers/passthrough/$(bundle-id)/rootfs".to_string(),
-    )
+    Some("/run/kata-containers/shared/containers/passthrough/$(bundle-id)/rootfs".to_string())
 }
 
-fn safe_termination_message_path(
-    capture: &CapturedSpec,
-    regex_policy_mode: &str,
-) -> Result<String> {
+fn safe_termination_message_path(capture: &CapturedSpec) -> Result<String> {
     let mount = capture
         .mounts
         .iter()
         .find(|mount| mount.destination == "/dev/termination-log")
         .ok_or_else(|| {
-            anyhow!(
-                "{regex_policy_mode} mode requires the external /dev/termination-log mount"
-            )
+            anyhow!("request-derived policy requires the external /dev/termination-log mount")
         })?;
-    let components: Vec<_> = mount.source.split('/').filter(|value| !value.is_empty()).collect();
+    let components: Vec<_> = mount
+        .source
+        .split('/')
+        .filter(|value| !value.is_empty())
+        .collect();
     let external_kubelet_source = mount.source.starts_with('/')
-        && !components.iter().any(|value| *value == "." || *value == "..")
+        && !components
+            .iter()
+            .any(|value| *value == "." || *value == "..")
         && components.len() >= 5
         && components[components.len() - 5] == "pods"
         && !components[components.len() - 4].is_empty()
@@ -1129,10 +1036,9 @@ fn safe_termination_message_path(
                 .or(Some(path))
         });
     let copied_source = container_id.is_some_and(|container_id| {
-        let prefix = format!(
-            "/run/kata-containers/shared/containers/{container_id}-"
-        );
-        mount.source
+        let prefix = format!("/run/kata-containers/shared/containers/{container_id}-");
+        mount
+            .source
             .strip_prefix(&prefix)
             .and_then(|suffix| suffix.strip_suffix("-termination-log"))
             .is_some_and(|random| {
@@ -1150,7 +1056,7 @@ fn safe_termination_message_path(
             .all(|required| mount.options.iter().any(|option| option == required))
     {
         bail!(
-            "{regex_policy_mode} mode requires termination messages to use the dedicated external kubelet bind mount"
+            "request-derived policy requires termination messages to use the dedicated external kubelet bind mount"
         );
     }
     Ok("^/dev/termination\\-log$".to_string())
@@ -1163,19 +1069,17 @@ fn append_allow_env_regex(request_defaults: &mut Value, values: &[String]) -> Re
         .and_then(Value::as_array_mut)
         .ok_or_else(|| anyhow!("settings have no CreateContainerRequest.allow_env_regex"))?;
     for value in values {
-        if !target.iter().any(|existing| existing.as_str() == Some(value)) {
+        if !target
+            .iter()
+            .any(|existing| existing.as_str() == Some(value))
+        {
             target.push(Value::String(value.clone()));
         }
     }
     Ok(())
 }
 
-fn apply_regex_policy_mode(request_defaults: &mut Value, mode: &str) -> Result<()> {
-    match mode {
-        "legacy" => return Ok(()),
-        "balanced" => {}
-        _ => bail!("unknown regex policy mode: {mode}"),
-    }
+fn clear_inherited_env_regexes(request_defaults: &mut Value) -> Result<()> {
     let target = request_defaults
         .get_mut("CreateContainerRequest")
         .and_then(|value| value.get_mut("allow_env_regex"))
@@ -1193,7 +1097,11 @@ fn annotate_document(document: &mut serde_yaml::Value, annotation: &str) -> Resu
     let path = match kind {
         "Pod" => Some(""),
         "PodTemplate" => Some("template"),
-        "Deployment" | "DaemonSet" | "ReplicaSet" | "StatefulSet" | "Job"
+        "Deployment"
+        | "DaemonSet"
+        | "ReplicaSet"
+        | "StatefulSet"
+        | "Job"
         | "ReplicationController" => Some("spec.template"),
         "CronJob" => Some("spec.jobTemplate.spec.template"),
         _ => None,
@@ -1245,13 +1153,10 @@ fn run(args: Args) -> Result<()> {
         &args.workload,
         &settings.devices.vfio.nvidia.pgpu_resource_keys,
     )?;
-    let sandbox_name_pattern = match workload_policy.sandbox_name_patterns.len()
-    {
+    let sandbox_name_pattern = match workload_policy.sandbox_name_patterns.len() {
         0 => None,
         1 => workload_policy.sandbox_name_patterns.iter().next(),
-        count => bail!(
-            "captured sandbox cannot be mapped to {count} workload name patterns"
-        ),
+        count => bail!("captured sandbox cannot be mapped to {count} workload name patterns"),
     };
     let mut request_defaults = serde_json::to_value(&settings.request_defaults)?;
     let mut allow_env_regex = Vec::new();
@@ -1267,10 +1172,6 @@ fn run(args: Args) -> Result<()> {
             .oci
             .as_ref()
             .ok_or_else(|| anyhow!("tagged create request {basename} has no OCI spec"))?;
-        let raw_capture = raw_request
-            .oci
-            .as_ref()
-            .ok_or_else(|| anyhow!("raw create request {basename} has no OCI spec"))?;
         let request_data = create_request_policy_data(raw_request, args.strict_storage_coverage)?;
         let identity = identity(capture)?;
         if let Some(previous) = seen_identities.insert(identity.clone(), tagged_request.clone()) {
@@ -1296,20 +1197,18 @@ fn run(args: Args) -> Result<()> {
             .map(|policy| policy.nvidia_pgpu_count)
             .unwrap_or(0);
         let request_mounts = request_data.volume_mounts.clone();
-        let (container, mut report) =
-            compile_container(
-                &basename,
-                capture,
-                &settings,
-                &regexes,
-                &mut allow_env_regex,
-                &args.regex_policy_mode,
-                exec_commands,
-                container_sandbox_name_pattern,
-                &volume_device_paths,
-                nvidia_pgpu_count,
-                &request_mounts,
-            )?;
+        let (container, mut report) = compile_container(
+            &basename,
+            capture,
+            &settings,
+            &regexes,
+            &mut allow_env_regex,
+            exec_commands,
+            container_sandbox_name_pattern,
+            &volume_device_paths,
+            nvidia_pgpu_count,
+            &request_mounts,
+        )?;
         let mut container = container;
         // The captured request is authoritative for final Agent storages,
         // non-VFIO devices, mounts, sandbox_pidns, and rootfs identity. VFIO
@@ -1329,7 +1228,9 @@ fn run(args: Args) -> Result<()> {
         // storages. A pod-wide union would let one container present another
         // same-pod container's rootfs identity, so no union mode exists.
         if !roothashes.is_empty() {
-            container.storages.push(dmverity_marker_storage(&roothashes));
+            container
+                .storages
+                .push(dmverity_marker_storage(&roothashes));
         }
         if !images.is_empty() {
             container.storages.push(guest_pull_marker_storage(&images));
@@ -1339,22 +1240,10 @@ fn run(args: Args) -> Result<()> {
             "authoritative": true
         });
         report["injected_storages"] = json!(container.storages.len());
-        if args.regex_policy_mode == "legacy" {
-            let checked = validate_legacy_service_env_coverage(
-                capture,
-                raw_capture,
-                &request_defaults,
-                &settings.common,
-            )?;
-            report["legacy_service_env_regex_coverage"] = json!({
-                "checked": checked,
-                "uncovered": 0
-            });
-        }
         containers.push(container);
         reports.push(report);
     }
-    apply_regex_policy_mode(&mut request_defaults, &args.regex_policy_mode)?;
+    clear_inherited_env_regexes(&mut request_defaults)?;
     append_allow_env_regex(&mut request_defaults, &allow_env_regex)?;
     // Rootfs identities live only in each container's marker storage. The
     // legacy global fields remain empty and are not authorization inputs.
@@ -1378,12 +1267,16 @@ fn run(args: Args) -> Result<()> {
     );
     fs::write(&args.output, &policy)?;
     let mut diff = json!({
-        "schema_version": 2,
-        "containers": reports
+        "schema_version": 3,
+        "containers": reports,
+        "sandbox_storage_contract": {
+            "authority": "versioned-settings",
+            "capture_status": "not-captured",
+            "reason": "CreateSandboxRequest is sent after VM startup and is outside no-VM capture",
+            "storages": data.sandbox.storages
+        }
     });
-    if args.regex_policy_mode != "legacy" {
-        diff["regex_policy_mode"] = Value::String(args.regex_policy_mode.clone());
-    }
+    diff["policy_mode"] = Value::String("request-derived".to_string());
     fs::write(
         &args.diff_output,
         serde_json::to_string_pretty(&diff)? + "\n",
@@ -1406,9 +1299,7 @@ fn run(args: Args) -> Result<()> {
 /// Returns each container's own rootfs dm-verity hashes, keyed by CRI container
 /// name, so no container can use another pod member's rootfs identity.
 /// Same coverage gate: a verity rootfs without a root hash fails generation.
-fn collect_dmverity_roothashes_per_container(
-    path: &Path,
-) -> Result<BTreeMap<String, Vec<String>>> {
+fn collect_dmverity_roothashes_per_container(path: &Path) -> Result<BTreeMap<String, Vec<String>>> {
     let report: Value = serde_json::from_str(&fs::read_to_string(path)?)
         .with_context(|| format!("parse predicted storages {}", path.display()))?;
     let mut by_container: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1473,9 +1364,7 @@ fn dmverity_marker_storage(roothashes: &[String]) -> agent::Storage {
 
 /// Returns each container's own guest-pull image references, keyed by CRI
 /// container name. A missing reference fails generation.
-fn collect_guest_pull_images_per_container(
-    path: &Path,
-) -> Result<BTreeMap<String, Vec<String>>> {
+fn collect_guest_pull_images_per_container(path: &Path) -> Result<BTreeMap<String, Vec<String>>> {
     let report: Value = serde_json::from_str(&fs::read_to_string(path)?)
         .with_context(|| format!("parse predicted storages {}", path.display()))?;
     let mut by_container: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1548,6 +1437,34 @@ fn is_rootfs_storage(storage: &Value, root_path: &str) -> bool {
         })
 }
 
+fn valid_rootfs_block_source(driver: &str, source: &str) -> bool {
+    match driver {
+        "blk" => {
+            let parts: Vec<_> = source.split('/').collect();
+            (parts.len() == 1 || parts.len() == 2)
+                && parts.iter().all(|part| {
+                    part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        }
+        "scsi" => source.split_once(':').is_some_and(|(id, lun)| {
+            !id.is_empty()
+                && !lun.is_empty()
+                && id.bytes().all(|byte| byte.is_ascii_digit())
+                && lun.bytes().all(|byte| byte.is_ascii_digit())
+        }),
+        "mmioblk" => source.strip_prefix("/dev/vd").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_lowercase())
+        }),
+        "blk-ccw" => source.strip_prefix("0.0.").is_some_and(|suffix| {
+            suffix.len() == 4 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }),
+        "nvdimm" => source.strip_prefix("/dev/pmem").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        }),
+        _ => false,
+    }
+}
+
 fn create_request_policy_data(
     request: &CapturedCreateRequest,
     strict: bool,
@@ -1559,45 +1476,124 @@ fn create_request_policy_data(
     let mut data = CreateRequestPolicyData::default();
     let mut roothashes = BTreeSet::new();
     let mut images = BTreeSet::new();
+    let mut volume_mount_points = BTreeSet::new();
 
     for storage in &request.storages {
         if is_rootfs_storage(storage, &oci.root.path) {
+            let driver = storage.get("driver").and_then(Value::as_str).unwrap_or("?");
+            let fs_type = storage
+                .get("fs_type")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
             let options: Vec<&str> = storage
                 .get("options")
                 .and_then(Value::as_array)
                 .map(|values| values.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
-            if let Some(hash) = options
+            let roothash = options
                 .iter()
-                .find_map(|option| option.strip_prefix("X-kata.dmverity.roothash="))
-            {
-                roothashes.insert(hash.to_string());
-            } else if options.iter().any(|option| {
-                *option == "X-kata.dmverity-enabled=true" || *option == "X-kata.overlay-lower"
-            }) {
-                bail!(
-                    "create request {} has a dm-verity rootfs without a root hash",
-                    request.container_id
-                );
-            }
-            if storage.get("driver").and_then(Value::as_str) == Some("image_guest_pull") {
-                let source = storage
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .filter(|source| !source.is_empty())
+                .find_map(|option| option.strip_prefix("X-kata.dmverity.roothash="));
+            let overlay_lower = options.contains(&"X-kata.overlay-lower");
+            let overlay_upper = options.contains(&"X-kata.overlay-upper");
+            let dmverity_enabled = options.contains(&"X-kata.dmverity-enabled=true");
+            let read_only = options.contains(&"ro");
+            let read_write = options.contains(&"rw");
+            let source = storage
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            if driver == "image_guest_pull" {
+                if fs_type != "overlay"
+                    || !options.is_empty()
+                    || storage
+                        .get("driver_options")
+                        .and_then(Value::as_array)
+                        .is_none_or(|values| {
+                            values.len() != 1
+                                || values[0]
+                                    .as_str()
+                                    .is_none_or(|value| !value.starts_with("image_guest_pull="))
+                        })
+                {
+                    bail!(
+                        "create request {} has an invalid guest-pull rootfs storage envelope",
+                        request.container_id
+                    );
+                }
+                if source.is_empty() {
+                    bail!(
+                        "create request {} has a guest-pull rootfs without an image reference",
+                        request.container_id
+                    );
+                }
+                images.insert(source.to_string());
+            } else if overlay_lower {
+                if fs_type != "erofs"
+                    || !options.contains(&"X-kata.multi-layer=true")
+                    || !valid_rootfs_block_source(driver, source)
+                {
+                    bail!(
+                        "create request {} has an invalid EROFS lower rootfs storage envelope",
+                        request.container_id
+                    );
+                }
+                let hash = roothash
+                    .filter(|_| dmverity_enabled && read_only)
                     .ok_or_else(|| {
                         anyhow!(
-                            "create request {} has a guest-pull rootfs without an image reference",
+                            "create request {} has an EROFS lower rootfs without read-only enabled dm-verity and a root hash",
                             request.container_id
                         )
                     })?;
-                images.insert(source.to_string());
+                roothashes.insert(hash.to_string());
+            } else if overlay_upper {
+                if fs_type != "ext4"
+                    || !read_write
+                    || !options.contains(&"X-kata.multi-layer=true")
+                    || !valid_rootfs_block_source(driver, source)
+                {
+                    bail!(
+                        "create request {} has an invalid EROFS overlay upper rootfs",
+                        request.container_id
+                    );
+                }
+            } else if dmverity_enabled || roothash.is_some() {
+                if options.contains(&"X-kata.multi-layer=true")
+                    || !valid_rootfs_block_source(driver, source)
+                {
+                    bail!(
+                        "create request {} has an invalid single-layer block rootfs storage envelope",
+                        request.container_id
+                    );
+                }
+                let hash = roothash
+                    .filter(|_| dmverity_enabled && read_only)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "create request {} has a block rootfs without read-only enabled dm-verity and a root hash",
+                            request.container_id
+                        )
+                    })?;
+                roothashes.insert(hash.to_string());
+            } else {
+                bail!(
+                    "create request {} has an unsupported rootfs storage class (driver={}, fs_type={})",
+                    request.container_id,
+                    driver,
+                    fs_type
+                );
             }
             continue;
         }
 
         match template_volume_storage(storage)? {
-            Some(storage) => data.volume_storages.push(storage),
+            Some(templated) => {
+                if let Some(mount_point) = storage.get("mount_point").and_then(Value::as_str) {
+                    volume_mount_points.insert(mount_point.to_string());
+                }
+                data.volume_storages.push(templated);
+            }
             None if strict => bail!(
                 "create request {} has an unsupported volume storage class (driver={}, fs_type={})",
                 request.container_id,
@@ -1611,7 +1607,17 @@ fn create_request_policy_data(
         }
     }
     for mount in &oci.mounts {
-        if let Some(mount) = template_volume_mount(&serde_json::to_value(mount)?)? {
+        if volume_mount_points.contains(&mount.source) {
+            data.volume_mounts.insert(
+                mount.destination.clone(),
+                KataMount {
+                    destination: mount.destination.clone(),
+                    source: String::new(),
+                    type_: mount.type_.clone(),
+                    options: mount.options.clone(),
+                },
+            );
+        } else if let Some(mount) = template_volume_mount(&serde_json::to_value(mount)?)? {
             data.volume_mounts.insert(mount.destination.clone(), mount);
         }
     }
@@ -1628,12 +1634,22 @@ fn create_request_policy_data(
 /// so those containers keep failing closed, exactly as they do without a
 /// predicted report).
 fn template_volume_storage(storage: &Value) -> Result<Option<agent::Storage>> {
-    let field = |name: &str| storage.get(name).and_then(Value::as_str).unwrap_or_default();
+    let field = |name: &str| {
+        storage
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
     let string_list = |name: &str| -> Vec<String> {
         storage
             .get(name)
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let driver = field("driver");
@@ -1724,7 +1740,10 @@ fn template_volume_storage(storage: &Value) -> Result<Option<agent::Storage>> {
         // pod's securityContext.fsGroup), matching what the shim writes onto the
         // block emptyDir Storage; absent for the shared-fs classes.
         fs_group: build_fs_group(storage)?,
-        shared: storage.get("shared").and_then(Value::as_bool).unwrap_or(false),
+        shared: storage
+            .get("shared")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         ..Default::default()
     }))
 }
@@ -1801,7 +1820,12 @@ fn template_volume_mount(mount: &Value) -> Result<Option<KataMount>> {
     let options: Vec<String> = mount
         .get("options")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default();
     let make = |templated_source: String| KataMount {
         destination: destination.to_string(),
@@ -1920,8 +1944,10 @@ fn collect_volume_storages(
                 match template_volume_storage(storage)? {
                     Some(s) => templated.push(s),
                     None => {
-                        let fs_type =
-                            storage.get("fs_type").and_then(Value::as_str).unwrap_or("?");
+                        let fs_type = storage
+                            .get("fs_type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?");
                         if strict {
                             bail!(
                                 "container {name} has an unsupported volume storage class \
@@ -1969,11 +1995,12 @@ mod tests {
             },
             "storages": [
                 {
-                    "driver": "blk", "fs_type": "erofs", "mount_point": "/run/kata/lower/0",
-                    "options": ["X-kata.multi-layer=true", "X-kata.overlay-lower", "X-kata.dmverity.roothash=abc"]
+                    "driver": "blk", "source": "01", "fs_type": "erofs", "mount_point": "/run/kata/lower/0",
+                    "options": ["ro", "X-kata.multi-layer=true", "X-kata.overlay-lower", "X-kata.dmverity-enabled=true", "X-kata.dmverity.roothash=abc"]
                 },
                 {
                     "driver": "image_guest_pull", "source": "registry.example/app@sha256:123",
+                    "driver_options": ["image_guest_pull={}"], "fs_type": "overlay",
                     "mount_point": "/run/kata/rootfs", "options": []
                 },
                 {
@@ -1987,13 +2014,66 @@ mod tests {
 
         let data = create_request_policy_data(&request, true).unwrap();
         assert_eq!(data.dmverity_roothashes, vec!["abc"]);
-        assert_eq!(data.guest_pull_images, vec!["registry.example/app@sha256:123"]);
+        assert_eq!(
+            data.guest_pull_images,
+            vec!["registry.example/app@sha256:123"]
+        );
         assert_eq!(data.volume_storages.len(), 1);
         assert_eq!(data.volume_storages[0].fstype, "tmpfs");
         assert_eq!(
             data.volume_storages[0].mount_point,
             "^/run/kata\\-containers/sandbox/ephemeral/cache$"
         );
+    }
+
+    #[test]
+    fn unsupported_block_rootfs_fails_even_without_strict_volume_coverage() {
+        let request: CapturedCreateRequest = serde_json::from_value(json!({
+            "container_id": "cid",
+            "oci": {
+                "root": {"path": "/run/kata/rootfs"},
+                "mounts": []
+            },
+            "storages": [{
+                "driver": "scsi",
+                "fs_type": "ext4",
+                "mount_point": "/run/kata/rootfs",
+                "options": ["ro"]
+            }]
+        }))
+        .unwrap();
+
+        let error = create_request_policy_data(&request, false)
+            .expect_err("unprotected block rootfs must fail generation");
+        assert!(error
+            .to_string()
+            .contains("unsupported rootfs storage class"));
+    }
+
+    #[test]
+    fn malformed_single_layer_dmverity_rootfs_fails() {
+        let request: CapturedCreateRequest = serde_json::from_value(json!({
+            "container_id": "cid",
+            "oci": {
+                "root": {"path": "/run/kata/rootfs"},
+                "mounts": []
+            },
+            "storages": [{
+                "driver": "blk",
+                "source": "01",
+                "fs_type": "ext4",
+                "mount_point": "/run/kata/rootfs",
+                "options": [
+                    "X-kata.dmverity-enabled=true",
+                    "X-kata.dmverity.roothash=abc"
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let error = create_request_policy_data(&request, true)
+            .expect_err("writable dm-verity rootfs must fail generation");
+        assert!(error.to_string().contains("read-only enabled dm-verity"));
     }
 
     #[test]
@@ -2166,15 +2246,9 @@ mod tests {
 
     #[test]
     fn create_request_sets_require_exact_basename_match() {
-        let tagged = BTreeMap::from([(
-            "container".to_string(),
-            CapturedCreateRequest::default(),
-        )]);
+        let tagged = BTreeMap::from([("container".to_string(), CapturedCreateRequest::default())]);
         let raw = BTreeMap::from([
-            (
-                "container".to_string(),
-                CapturedCreateRequest::default(),
-            ),
+            ("container".to_string(), CapturedCreateRequest::default()),
             ("extra".to_string(), CapturedCreateRequest::default()),
         ]);
 
@@ -2322,7 +2396,10 @@ mod tests {
         );
         let marker = guest_pull_marker_storage(by_container.get("web").unwrap());
         assert_eq!(marker.driver, "guest-pull-images");
-        assert_eq!(marker.options, vec!["docker.io/library/nginx@sha256:aaaa".to_string()]);
+        assert_eq!(
+            marker.options,
+            vec!["docker.io/library/nginx@sha256:aaaa".to_string()]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2413,7 +2490,10 @@ mod tests {
         assert_eq!(templated.source, "");
         assert_eq!(templated.mount_point, "$(spath)/$(b64_device_id)");
         assert_eq!(templated.fstype, "ext4");
-        assert_eq!(templated.driver_options, vec!["create_filesystem".to_string()]);
+        assert_eq!(
+            templated.driver_options,
+            vec!["create_filesystem".to_string()]
+        );
         assert_eq!(templated.options, vec!["discard".to_string()]);
         assert!(templated.shared);
         assert!(templated.fs_group.is_none());
@@ -2450,7 +2530,11 @@ mod tests {
         );
         assert_eq!(
             templated.options,
-            vec!["rbind".to_string(), "rprivate".to_string(), "ro".to_string()]
+            vec![
+                "rbind".to_string(),
+                "rprivate".to_string(),
+                "ro".to_string()
+            ]
         );
     }
 
@@ -2487,7 +2571,11 @@ mod tests {
         assert_eq!(templated.type_, "bind");
         assert_eq!(
             templated.options,
-            vec!["rbind".to_string(), "rprivate".to_string(), "ro".to_string()]
+            vec![
+                "rbind".to_string(),
+                "rprivate".to_string(),
+                "ro".to_string()
+            ]
         );
     }
 
@@ -2551,7 +2639,10 @@ mod tests {
             templated.mount_point,
             "^/run/kata\\-containers/sandbox/ephemeral/hugepage\\-vol$"
         );
-        assert_eq!(templated.options, vec!["pagesize=2097152,size=524288000".to_string()]);
+        assert_eq!(
+            templated.options,
+            vec!["pagesize=2097152,size=524288000".to_string()]
+        );
     }
 
     #[test]
@@ -2566,10 +2657,7 @@ mod tests {
         let templated = template_volume_storage(&storage).unwrap().unwrap();
         assert_eq!(templated.driver, "watchable-bind");
         // The 8-hex hash becomes a wildcard; the escaped name is pinned.
-        assert_eq!(
-            templated.source,
-            "^$(cpath)/sandbox-[0-9a-f]{8}-my\\-cm$"
-        );
+        assert_eq!(templated.source, "^$(cpath)/sandbox-[0-9a-f]{8}-my\\-cm$");
         assert_eq!(
             templated.mount_point,
             "^$(cpath)/watchable/sandbox-[0-9a-f]{8}-my\\-cm$"
@@ -2617,6 +2705,41 @@ mod tests {
     }
 
     #[test]
+    fn captured_tmpfs_storage_normalizes_its_oci_bind_mount() {
+        let mount_point = "/run/kata-containers/sandbox/ephemeral/scratch-memory";
+        let request: CapturedCreateRequest = serde_json::from_value(json!({
+            "container_id": "container-id",
+            "oci": {
+                "root": {"path": "/run/kata-containers/container-id/rootfs"},
+                "mounts": [{
+                    "destination": "/scratch-memory",
+                    "type": "bind",
+                    "source": mount_point,
+                    "options": ["rbind", "rprivate", "rw"]
+                }]
+            },
+            "storages": [{
+                "driver": "ephemeral",
+                "driver_options": [],
+                "source": "tmpfs",
+                "fs_type": "tmpfs",
+                "options": [],
+                "mount_point": mount_point,
+                "shared": false
+            }]
+        }))
+        .unwrap();
+
+        let data = create_request_policy_data(&request, true).unwrap();
+        assert_eq!(data.volume_storages.len(), 1);
+        assert_eq!(data.volume_mounts["/scratch-memory"].source, "");
+        assert_eq!(
+            data.volume_mounts["/scratch-memory"].options,
+            vec!["rbind", "rprivate", "rw"]
+        );
+    }
+
+    #[test]
     fn strict_storage_coverage_rejects_unsupported_class() {
         let dir = std::env::temp_dir().join(format!("gp-vol-strict-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -2655,8 +2778,7 @@ mod tests {
             "TEST_SERVICE_HOST={{GENPOLICY_DYNAMIC:service-env.TEST_SERVICE_HOST}}".to_string(),
         ];
 
-        let (env, allow_regex) =
-            compile_env(&values, &regexes, "balanced").unwrap();
+        let (env, allow_regex) = compile_env(&values, &regexes).unwrap();
 
         assert_eq!(env, vec!["STATIC=value", "NODE=$(node-name)"]);
         assert_eq!(
@@ -2666,70 +2788,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_environment_uses_inherited_service_regexes() {
-        let values = vec![
-            "STATIC=value".to_string(),
-            "TEST_SERVICE_HOST={{GENPOLICY_DYNAMIC:service-env.TEST_SERVICE_HOST}}"
-                .to_string(),
-        ];
-        let regexes = BTreeMap::from([(
-            "{{GENPOLICY_DYNAMIC:service-env.TEST_SERVICE_HOST}}".to_string(),
-            "(?:[0-9]{1,3}\\.){3}[0-9]{1,3}".to_string(),
-        )]);
+    fn service_marker_requires_a_manifest_regex() {
+        let marker = "{{GENPOLICY_DYNAMIC:service-env.UNKNOWN_SERVICE_HOST}}";
+        let values = vec![format!("UNKNOWN_SERVICE_HOST={marker}")];
+        let error = compile_env(&values, &BTreeMap::new())
+            .unwrap_err()
+            .to_string();
 
-        let (env, allow_regex) =
-            compile_env(&values, &regexes, "legacy").unwrap();
-
-        assert_eq!(env, vec!["STATIC=value"]);
-        assert!(allow_regex.is_empty());
-    }
-
-    #[test]
-    fn legacy_service_regex_coverage_rejects_unknown_variable() {
-        let marker =
-            "{{GENPOLICY_DYNAMIC:service-env.UNKNOWN_SERVICE_HOST}}";
-        let tagged = CapturedSpec {
-            process: CapturedProcess {
-                env: vec![format!("UNKNOWN_SERVICE_HOST={marker}")],
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let raw = CapturedSpec {
-            process: CapturedProcess {
-                env: vec!["UNKNOWN_SERVICE_HOST=10.0.0.1".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let defaults = json!({
-            "CreateContainerRequest": {
-                "allow_env_regex": ["^KNOWN_SERVICE_HOST=$(ipv4_a)$"]
-            }
-        });
-        let common: policy::CommonData = serde_json::from_value(json!({
-            "cpath": "",
-            "root_path": "",
-            "sfprefix": "",
-            "spath": "",
-            "ipv4_a": "(?:[0-9]{1,3}\\.){3}[0-9]{1,3}",
-            "ip_p": "[0-9]{1,5}",
-            "svc_name_downward_env": "[A-Z][A-Z0-9_]*",
-            "dns_label": "[a-z0-9-]+",
-            "default_caps": [],
-            "privileged_caps": []
-        }))
-        .unwrap();
-
-        let error = validate_legacy_service_env_coverage(
-            &tagged, &raw, &defaults, &common,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains(
-            "legacy environment regexes do not cover captured variable UNKNOWN_SERVICE_HOST"
-        ));
+        assert!(error.contains("no regex for dynamic marker"));
     }
 
     #[test]
@@ -2739,11 +2805,8 @@ mod tests {
             "[0-9a-f-]+".to_string(),
         )]);
 
-        let pattern = marker_pattern(
-            "/var/log/pods/{{GENPOLICY_DYNAMIC:pod.uid}}",
-            &regexes,
-        )
-        .unwrap();
+        let pattern =
+            marker_pattern("/var/log/pods/{{GENPOLICY_DYNAMIC:pod.uid}}", &regexes).unwrap();
 
         assert_eq!(pattern, "^/var/log/pods/[0-9a-f-]+$");
     }
@@ -2759,16 +2822,10 @@ mod tests {
             "io.kubernetes.cri.sandbox-name".to_string(),
             POD_NAME_MARKER.to_string(),
         );
-        let regexes = BTreeMap::from([(
-            POD_UID_MARKER.to_string(),
-            "[0-9a-f-]+".to_string(),
-        )]);
-        let value = format!(
-            "/var/log/pods/default_{POD_NAME_MARKER}_{POD_UID_MARKER}"
-        );
+        let regexes = BTreeMap::from([(POD_UID_MARKER.to_string(), "[0-9a-f-]+".to_string())]);
+        let value = format!("/var/log/pods/default_{POD_NAME_MARKER}_{POD_UID_MARKER}");
 
-        let pattern =
-            sandbox_log_directory_pattern(&capture, &value, &regexes).unwrap();
+        let pattern = sandbox_log_directory_pattern(&capture, &value, &regexes).unwrap();
 
         assert_eq!(
             pattern,
@@ -2787,10 +2844,7 @@ mod tests {
             "io.kubernetes.cri.sandbox-name".to_string(),
             "exact-pod".to_string(),
         );
-        let regexes = BTreeMap::from([(
-            POD_UID_MARKER.to_string(),
-            "[0-9a-f-]+".to_string(),
-        )]);
+        let regexes = BTreeMap::from([(POD_UID_MARKER.to_string(), "[0-9a-f-]+".to_string())]);
 
         let pattern = sandbox_log_directory_pattern(
             &capture,
@@ -2835,22 +2889,20 @@ mod tests {
             ..Default::default()
         };
 
-        let (compiled, _) =
-            captured_process(&process, &BTreeMap::new(), "legacy").unwrap();
+        let (compiled, _) = captured_process(&process, &BTreeMap::new()).unwrap();
 
         assert_eq!(compiled.Cwd, "/captured");
     }
 
     #[test]
     fn captured_oci_version_and_seccomp_are_authoritative() {
-        let settings_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../genpolicy-settings.json");
+        let settings_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../genpolicy-settings.json");
         let settings = Settings::new(settings_path.to_str().unwrap());
         let capture: CapturedSpec = serde_json::from_value(json!({
             "ociVersion": "1.3.0",
             "annotations": {
-                "io.kubernetes.cri.container-type": "container",
-                "io.kubernetes.cri.container-name": "workload"
+                "io.kubernetes.cri.container-type": "sandbox"
             },
             "linux": {
                 "seccomp": {
@@ -2871,7 +2923,6 @@ mod tests {
             &settings,
             &BTreeMap::new(),
             &mut Vec::new(),
-            "legacy",
             Vec::new(),
             None,
             &[],
@@ -2890,8 +2941,8 @@ mod tests {
 
     #[test]
     fn absent_sandbox_network_namespace_annotation_stays_absent() {
-        let settings_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../genpolicy-settings.json");
+        let settings_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../genpolicy-settings.json");
         let settings = Settings::new(settings_path.to_str().unwrap());
         let capture = CapturedSpec {
             annotations: BTreeMap::from([(
@@ -2901,21 +2952,17 @@ mod tests {
             ..Default::default()
         };
 
-        let annotations = compile_annotations(
-            &capture,
-            &settings.pause_container,
-            &BTreeMap::new(),
-            None,
-        )
-        .unwrap();
+        let annotations =
+            compile_annotations(&capture, &settings.pause_container, &BTreeMap::new(), None)
+                .unwrap();
 
         assert!(!annotations.contains_key("nerdctl/network-namespace"));
     }
 
     #[test]
     fn sandbox_user_is_capture_authoritative() {
-        let settings_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../genpolicy-settings.json");
+        let settings_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../genpolicy-settings.json");
         let settings = Settings::new(settings_path.to_str().unwrap());
         let capture = CapturedSpec {
             process: CapturedProcess {
@@ -3086,7 +3133,7 @@ items:
     }
 
     #[test]
-    fn balanced_mode_clears_inherited_environment_regexes() {
+    fn request_derived_policy_clears_inherited_environment_regexes() {
         let mut defaults = json!({
             "CreateContainerRequest": {
                 "allow_env_regex": [
@@ -3096,7 +3143,7 @@ items:
             }
         });
 
-        apply_regex_policy_mode(&mut defaults, "balanced").unwrap();
+        clear_inherited_env_regexes(&mut defaults).unwrap();
 
         assert_eq!(
             defaults["CreateContainerRequest"]["allow_env_regex"],
@@ -3105,56 +3152,39 @@ items:
     }
 
     #[test]
-    fn legacy_mode_preserves_environment_regexes() {
-        let mut defaults = json!({
-            "CreateContainerRequest": {
-                "allow_env_regex": ["^HOSTNAME=.*$"]
-            }
-        });
+    fn pod_template_is_annotated() {
+        let mut document: serde_yaml::Value = serde_yaml::from_str(
+            &serde_json::to_string(&json!({
+                "apiVersion": "v1",
+                "kind": "PodTemplate",
+                "metadata": {"name": "worker"},
+                "template": {
+                    "spec": {
+                        "containers": [{
+                            "name": "worker",
+                            "image": "example.invalid/worker"
+                        }]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
 
-        apply_regex_policy_mode(&mut defaults, "legacy").unwrap();
-
+        assert!(annotate_document(&mut document, "encoded-policy").unwrap());
         assert_eq!(
-            defaults["CreateContainerRequest"]["allow_env_regex"],
-            json!(["^HOSTNAME=.*$"])
+            document["template"]["metadata"]["annotations"]
+                ["io.katacontainers.config.hypervisor.cc_init_data"],
+            serde_yaml::Value::String("encoded-policy".to_string())
         );
     }
-
-        #[test]
-        fn pod_template_is_annotated() {
-            let mut document: serde_yaml::Value = serde_yaml::from_str(
-                &serde_json::to_string(&json!({
-                    "apiVersion": "v1",
-                    "kind": "PodTemplate",
-                    "metadata": {"name": "worker"},
-                    "template": {
-                        "spec": {
-                            "containers": [{
-                                "name": "worker",
-                                "image": "example.invalid/worker"
-                            }]
-                        }
-                    }
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-
-                assert!(annotate_document(&mut document, "encoded-policy").unwrap());
-                assert_eq!(
-                        document["template"]["metadata"]["annotations"]
-                                ["io.katacontainers.config.hypervisor.cc_init_data"],
-                        serde_yaml::Value::String("encoded-policy".to_string())
-                );
-        }
 
     #[test]
     fn termination_message_path_requires_external_default_mount() {
         let capture = CapturedSpec {
             mounts: vec![CapturedMount {
                 destination: "/dev/termination-log".to_string(),
-                source: "/custom/kubelet-root/pods/pod/containers/workload/12ab34cd"
-                    .to_string(),
+                source: "/custom/kubelet-root/pods/pod/containers/workload/12ab34cd".to_string(),
                 type_: "bind".to_string(),
                 options: vec![
                     "rbind".to_string(),
@@ -3166,7 +3196,7 @@ items:
         };
 
         assert_eq!(
-            safe_termination_message_path(&capture, "balanced").unwrap(),
+            safe_termination_message_path(&capture).unwrap(),
             "^/dev/termination\\-log$"
         );
     }
@@ -3194,7 +3224,7 @@ items:
             ..Default::default()
         };
 
-        assert!(safe_termination_message_path(&capture, "balanced").is_ok());
+        assert!(safe_termination_message_path(&capture).is_ok());
     }
 
     #[test]
@@ -3222,7 +3252,7 @@ items:
             ..Default::default()
         };
 
-        assert!(safe_termination_message_path(&capture, "balanced").is_ok());
+        assert!(safe_termination_message_path(&capture).is_ok());
     }
 
     #[test]
@@ -3277,7 +3307,7 @@ items:
             ..Default::default()
         };
 
-        assert!(safe_termination_message_path(&capture, "balanced").is_err());
+        assert!(safe_termination_message_path(&capture).is_err());
     }
 
     #[test]
@@ -3292,7 +3322,7 @@ items:
             ..Default::default()
         };
 
-        assert!(safe_termination_message_path(&capture, "balanced").is_err());
+        assert!(safe_termination_message_path(&capture).is_err());
     }
 
     #[test]

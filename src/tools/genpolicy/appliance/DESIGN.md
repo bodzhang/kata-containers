@@ -243,8 +243,8 @@ known dynamic values with identifiers visible at the request boundary:
   where it occurs inside OCI.
 
 It also recognizes context-specific OCI values: Kubernetes service environment
-variables, the kubelet termination-log ID in a mount source, and the generated
-CNI network-namespace path. Each recognized string or substring is replaced by
+variables and the generated CNI network-namespace path. Each recognized string
+or substring is replaced by
 `{{GENPOLICY_DYNAMIC:<tag>}}`. Every replacement records the semantic tag,
 source, suggested bounded grammar, tagged request filename, request-rooted JSON
 pointer, and SHA-256 digest of the original value. Definitions and input files
@@ -253,8 +253,7 @@ are processed in sorted order, so repeated generation is deterministic.
 The tagger then writes the complete request to `tagged-requests/`, replacing
 only `request.oci`. It leaves `container_id`, `storages`, `devices`, request
 flags, and other request-level fields unchanged. Finally, it sorts definitions
-by tag and writes them as `dynamic-tags.json`; balanced mode additionally
-records `"regex_policy_mode": "balanced"`.
+by tag and writes them as `dynamic-tags.json`.
 
 This boundary is deliberate. The captured request decides which Agent fields
 exist and remains authoritative for request-level data. Tagging only makes
@@ -513,7 +512,7 @@ The final stage compiles paired raw/tagged `CreateContainerRequest` captures and
 `dynamic-tags.json` into
 deployable Kata Agent policy. Its contract — reused GenPolicy components,
 appliance-local implementation, non-OCI policy fields, the external
-storage/device trust boundary, the legacy and balanced policy modes, the
+storage/device trust boundary, the single compiler policy action, the
 regex/value-generalization design, and the compiler validation contract — is
 documented in [policy-compiler/DESIGN.md](policy-compiler/DESIGN.md).
 

@@ -4,7 +4,9 @@ This document is the source of truth for the appliance's final stage, the
 standalone policy compiler. It owns the regex and value-generalization contract
 for turning captured `CreateContainerRequest` artifacts into deployable Kata
 Agent policy. The dry-run capture flow that produces the compiler's inputs is
-described in [../DESIGN.md](../DESIGN.md).
+described in [../DESIGN.md](../DESIGN.md). Capture-backed analysis of Kata-CC
+storage and mount behavior is maintained in
+[STORAGE_MOUNT_EVIDENCE.md](STORAGE_MOUNT_EVIDENCE.md).
 
 ## Role
 
@@ -99,10 +101,10 @@ grammar that admits every legitimate production value and nothing else.
   external domain; UVM-local sources must never satisfy an external rule.
 - Unknown or unclassified dynamic-marker contexts fail closed; they are never
   reduced to `.*`, prefix matching, or a user-provided raw regex.
-- Treat inherited legacy expressions separately from marker-generated
-  expressions. Legacy mode deliberately retains broad service-variable-name
-  patterns and `^/.*$` termination-message compatibility; balanced mode removes
-  those two broad surfaces.
+- Clear inherited environment expressions before adding marker-generated
+  expressions. Native Legacy GenPolicy remains a separate reference tool; the
+  request-derived compiler does not reproduce its broad service-variable-name
+  patterns or `^/.*$` termination-message compatibility.
 
 ## Dynamic OCI field treatment
 
@@ -111,67 +113,53 @@ environment entries, the matched value is the complete `NAME=value` string and
 every input entry must match an exact policy environment entry or an approved
 anchored regex.
 
-| OCI-derived value | Legacy mode | Balanced mode |
-| --- | --- | --- |
-| Explicit image/YAML environment values | Exact `NAME=value` | Exact `NAME=value` |
-| Kubernetes service-link environment values | Omitted from exact `Env` when covered by an inherited, anchored service-variable regex; generation fails if any captured variable lacks coverage | Per-variable anchored regex keyed to the exact captured variable name, with a typed value grammar (bounded IPv4/IPv6 for `_HOST`/`_ADDR`, numeric port, protocol enum). Portable across ClusterIP and port reassignment; tighter than legacy because the accepted variable-name set is exactly the captured services rather than any service-shaped name |
-| Pod name, Pod UID, and node-derived environment values | Structured substitutions such as `$(sandbox-name)`, `$(pod-uid)`, and `$(node-name)` | Same structured substitutions; these are correlations to request/runtime state rather than arbitrary wildcard regexes |
-| Sandbox and bundle/container IDs | Sandbox annotation values use bounded patterns; Rego reuses the runtime sandbox ID and extracts the bundle/container ID from the runtime root path for path correlation | Same structured correlation where deployment-time generation prevents an exact value |
-| Kata `nerdctl/network-namespace` | Generalized with the configured dynamic-value grammar when present in the captured Agent request; otherwise omitted | The policy and request must either both omit the annotation or both contain a matching value |
-| Sandbox log directory | Namespace and sandbox name are correlated to the request; only the Pod UID component uses a typed UUID grammar | Same relational pattern |
-| Termination-message request path | Legacy-compatible `^/.*$` | Exact `/dev/termination-log`, accepted only when capture proves the dedicated external kubelet bind mount |
-| Guest-visible source of an externally backed mount | Trusted-profile regex anchored within the Kata shared-filesystem domain | Same trust-domain-confined regex; exact matching would not make mutable host content trustworthy |
-| Process argv, working directory, UID/GID, capabilities, root read-only state, mount destinations/types/options, masked paths, and read-only paths | Exact captured values, with documented Kata normalization where required | Exact captured values, with the same documented Kata normalization |
-| Unknown dynamic strings or unsupported marker contexts | Left exact or generation fails; never converted to `.*` | Left exact or generation fails; never converted to `.*` |
+| OCI-derived value | Policy treatment |
+| --- | --- |
+| Explicit image/YAML environment values | Exact `NAME=value` |
+| Kubernetes service-link environment values | Per-variable anchored regex keyed to the exact captured variable name, with a typed value grammar (bounded IPv4/IPv6 for `_HOST`/`_ADDR`, numeric port, protocol enum). Portable across ClusterIP and port reassignment without accepting undeclared service variables |
+| Pod name, Pod UID, and node-derived environment values | Structured substitutions such as `$(sandbox-name)`, `$(pod-uid)`, and `$(node-name)` |
+| Sandbox and bundle/container IDs | Bounded patterns correlated through Rego where deployment-time generation prevents an exact value |
+| Kata `nerdctl/network-namespace` | The policy and request must either both omit the annotation or both contain a matching bounded value |
+| Sandbox log directory | Namespace and sandbox name are correlated to the request; only the Pod UID component uses a typed UUID grammar |
+| Termination-message request path | Exact `/dev/termination-log`, accepted only when capture proves the dedicated external kubelet bind mount |
+| Guest-visible source of an externally backed mount | Trusted-profile regex anchored within the Kata shared-filesystem domain; exact matching would not make mutable host content trustworthy |
+| Process argv, working directory, UID/GID, capabilities, root read-only state, mount destinations/types/options, masked paths, and read-only paths | Exact captured values, with documented Kata normalization where required |
+| Unknown dynamic strings or unsupported marker contexts | Left exact or generation fails; never converted to `.*` |
 
 `dynamic-tags.json` records marker provenance and grammars with request-rooted
 JSON pointers. `createcontainer-requests/` remains the exact request reference,
 while `policy-oci-diff.json` records whether each compiled field came from the
 captured request, trusted workload YAML, or explicit policy normalization.
 
-## Legacy and balanced policy modes
+## Policy action
 
-The appliance supports two deployable policy modes from the same request captures:
+The compiler emits one request-derived policy as `policy.rego`. It clears
+inherited environment regexes, replaces each captured service endpoint with a
+per-variable anchored typed regex, restricts termination messages to the proven
+external `/dev/termination-log` mount, and generalizes the generated CNI path
+with a bounded regex. Existing regex-backed relation markers remain explicit
+residual risks.
 
-- **legacy** is the default compatibility mode. It preserves inherited
-  `allow_env_regex` entries and the legacy service-variable grammars, permits
-  any termination-message path, and generalizes generated CNI and kubelet path
-  components. A generation-time coverage gate verifies that every captured
-  service variable omitted from exact `Env` entries is covered by an inherited
-  regex. The inherited service grammar accepts any service-shaped variable name,
-  so this mode carries the broadest authorization surface;
-- **balanced** is enabled with `GENPOLICY_BALANCED=1`. It clears the inherited
-  environment regexes and replaces each captured service endpoint with a
-  per-variable anchored, typed regex keyed to the exact captured variable name
-  (bounded IPv4/IPv6 for `_HOST`/`_ADDR`, numeric port, protocol enum) rather
-  than an exact IP or port, because both the ClusterIP and the cluster-assigned
-  ports differ between the dry-run and production clusters. It restricts
-  termination messages to the dedicated externally backed `/dev/termination-log`
-  mount unless those strings already contain an existing generated name/UID
-  marker. It emulates the Kata shim by copying the sandbox OCI network namespace
-  path into `nerdctl/network-namespace`, then generalizes that generated CNI
-  path with a bounded regex. Existing regex-backed relation markers remain
-  explicit residual risks.
+ClusterIP or assigned-port reassignment within the typed grammar does not
+require regeneration. A service topology change does, because the compiler
+pins the captured variable-name set. Raw requests under
+`createcontainer-requests/` remain the exact reference for generated values
+that cannot be predicted safely at deployment time.
 
-`policy.rego` contains legacy mode and `policy-balanced.rego` contains balanced
-mode. `policy-mode-report.json` records their differences. Neither mode requires
-regeneration when a service ClusterIP or port is reassigned; both admit any
-value inside the bounded grammar. Regeneration is required when the service
-**topology** changes — a service added, removed, or renamed, or its protocol
-changed — because balanced pins the captured variable-name set. Both modes
-retain bounded generated-identity relationships required for deployable
-controller workloads. Raw requests under `createcontainer-requests/` remain the exact reference
-for generated values that cannot be predicted safely at deployment time.
+Native Legacy GenPolicy is a separate optional reference runner. The compiler
+does not expose a Legacy-compatible mode. Testing a supplied policy is also a
+separate action: policy-only Agent replay returns pass or failure without
+invoking either generator.
 
 A future external-domain mode may wildcard endpoints or storage sources only
 inside a structured external-untrusted trust domain. It requires runtime
 knowledge to exclude UVM-local, loopback, link-local, agent/control endpoints,
 and TCB-internal filesystem paths; the current generic IP/path regexes cannot
-provide that guarantee. Balanced mode also does not yet distinguish image/YAML
+provide that guarantee. The compiler also does not yet distinguish image/YAML
 environment provenance from unknown runtime injection or enforce
 required-exactly-once environment keys.
 
-Balanced mode must reject a termination-message path that is not the dedicated
+The compiler must reject a termination-message path that is not the dedicated
 external kubelet bind mount. Exact capture is insufficient: pinning a malicious
 path under image code or UVM-internal state would preserve an overwrite
 primitive. Detection of the external kubelet mount uses its normalized
@@ -189,14 +177,9 @@ distinguish literal values, structured substitutions, and intentional regexes.
 - Exact captured `NAME=value` entries remain exact.
 - `$(node-name)`, `$(pod-uid)`, and `$(sandbox-name)` preserve the captured
   environment variable name and correlate only the value.
-- In balanced mode, each captured service variable gets one fully anchored
+- Each captured service variable gets one fully anchored
   expression. The variable name and `=` are regex-escaped literals; only the
   value uses its typed IP, port, protocol, or composite grammar.
-- In legacy mode, inherited expressions use
-  `$(svc_name_downward_env)`, currently
-  `[A-Z](?:[A-Z0-9_]{0,61}[A-Z0-9])?`. Consequently any service-shaped variable
-  name may match. The generation-time coverage check proves that captured
-  service variables are accepted, but it does not narrow the accepted name set.
 - Rego checks every runtime environment entry, but the policy does not yet
   enforce image/YAML provenance, duplicate-key rejection, or required-exactly-
   once semantics.
@@ -281,11 +264,8 @@ The compiler must implement:
   masked paths, and read-only paths into the policy OCI model;
 - replacement of dynamic markers with constrained environment, annotation, or
   mount regexes from `dynamic-tags.json`;
-- reuse of inherited GenPolicy service-link regexes in legacy mode rather than
-  generating redundant service-specific regexes from captured values;
-- fail-fast validation that every captured service-link environment variable
-  removed from the explicit policy environment is covered by an inherited
-  legacy regex, with coverage counts recorded in `policy-oci-diff.json`;
+- generation of one anchored typed regex for each captured service-link
+  environment variable, after inherited environment regexes are cleared;
 - explicit Kata normalization for guest root paths, shared-filesystem mount
   sources, guest namespaces, bundle annotations, and container-type
   annotations;
@@ -317,7 +297,7 @@ denied.
 | Captured field | Compiler treatment |
 | --- | --- |
 | `oci` | Tagged request is compiled; raw OCI is retained for legacy environment coverage checks. |
-| `storages` | Raw request is authoritative. Supported volume classes are converted to bounded policy forms; rootfs identities become per-container marker storages. Unsupported classes are omitted to fail closed, or fail generation under strict coverage. |
+| `storages` | Raw request is authoritative. Supported volume classes are converted to bounded policy forms; rootfs identities become per-container marker storages. Unsupported non-rootfs classes are omitted to fail closed, or fail generation under strict coverage. A storage-bearing rootfs must be guest-pull, a valid EROFS lower/upper component, or read-only single-layer dm-verity; unsupported or malformed rootfs storage always fails generation. |
 | `devices` | Raw non-VFIO request devices are copied into policy and matched with exact cardinality, unique paths, and any non-empty captured stable fields. Empty legacy placeholder fields remain path-only. Workload YAML supplies additional OCI checks for declared `volumeDevices` paths. For each declared NVIDIA pGPU, the compiler preserves an unsuffixed VFIO requirement instead of pinning runtime-assigned device numbers or PCI paths. This is request-shape enforcement, not physical-device identity. |
 | `sandbox_pidns` | Copied exactly from the raw request. |
 | `container_id` | Used to pair captures and report errors; runtime bundle/container identity is correlated through OCI annotations and root paths rather than pinned to the dry-run ID. |
@@ -567,7 +547,8 @@ one-shot binding contract applies to passfd ports on `ExecProcessRequest`.
 The captured request supplies fields outside OCI as well as its final nested
 OCI. For the initial compatibility profile:
 
-- sandbox storages come from the versioned settings profile;
+- sandbox storages come from the versioned settings profile and are recorded in
+  `policy-oci-diff.json` as a non-captured configuration contract;
 - workload storages, devices, and `sandbox_pidns` come from the raw captured
   request;
 - exec command allowlists contain exact commands from workload probe and
@@ -746,6 +727,27 @@ The current appliance admits only storage classes with explicit compiler and
 Rego handling and rejects or omits unsupported classes so they fail closed.
 Captured final storages and devices are authoritative for request shape, while
 their backing-object trust remains bounded by the class-specific checks above.
+
+Shared `rules.rego` treats policy-backed storages as a cardinality-preserving
+mapping, not merely as two equally sized lists with existential matches. Every
+non-marker policy storage index must match an input storage, and duplicate
+policy-backed input storage objects are rejected. Without both checks, two
+input storages could reuse one policy template while a different declared
+storage disappeared. Block-volume policies intentionally leave runtime device
+addresses dynamic, but admit only the source grammar for Kata's `blk`, `scsi`,
+`mmioblk`, `blk-ccw`, and `nvdimm` transports and require the storage mount
+point to be the base64url encoding of that validated source. This keeps the
+rules portable across supported hypervisors without accepting an arbitrary
+device path.
+
+The indexed `allow_storage` result is internal to shared `rules.rego`;
+generated policies, including Legacy GenPolicy output, continue to call the
+boolean `allow_storages` entrypoint. Legacy block `emptyDir` settings already
+emit the same hardened policy template: empty dynamic `driver` and `source`,
+exact filesystem and driver options, and
+`$(spath)/$(b64_device_id)` as the mount point. The canonical E2E regenerates
+the native legacy reference policy and verifies that its shared rules match the
+current rules before policy-only Agent replay.
 
 `tests/fixtures/storage-boundary-workload.yaml` exercises `emptyDir`,
 ConfigMap, host-directory, and host-character-device volume transformations.

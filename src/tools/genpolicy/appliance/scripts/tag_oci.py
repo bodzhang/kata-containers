@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 SERVICE_ENV = re.compile(
-    r"^(?P<name>[A-Z][A-Z0-9_]*(?:_SERVICE_HOST|_SERVICE_PORT"
+    r"^(?P<name>[A-Z][A-Z0-9_]*(?:_SERVICE_HOST|_SERVICE_PORT(?:_[A-Z][A-Z0-9_]*)?"
     r"|_PORT(?:_[0-9]+_[A-Z]+(?:_(?:ADDR|PORT|PROTO))?)?))=(?P<value>.*)$"
 )
 TERMINATION_LOG_SOURCE = re.compile(
@@ -117,7 +117,6 @@ def replace_string(
     exact_values: list[dict],
     occurrences: dict[str, list[dict]],
     definitions: dict[str, dict],
-    regex_policy_mode: str = "legacy",
 ) -> str:
     updated = value
     for item in sorted(exact_values, key=lambda entry: len(entry["value"]), reverse=True):
@@ -141,8 +140,6 @@ def replace_string(
 
     match = SERVICE_ENV.match(updated)
     if match and "GENPOLICY_DYNAMIC" not in match.group("value"):
-        if regex_policy_mode != "legacy":
-            return updated
         variable = match.group("name")
         tag = f"service-env.{variable}"
         service_value = match.group("value")
@@ -181,24 +178,7 @@ def replace_string(
 
     match = TERMINATION_LOG_SOURCE.match(updated)
     if parts[:1] == ["oci"] and parts[-1:] == ["source"] and match:
-        if regex_policy_mode != "legacy":
-            return updated
-        tag = "termination-log.id"
-        original = match.group("id")
-        updated = match.group("prefix") + marker(tag)
-        definitions[tag] = {
-            "marker": marker(tag),
-            "source": "kubelet",
-            "suggested_regex": "[0-9a-f]{8}",
-            "tag": tag,
-        }
-        occurrences[tag].append(
-            {
-                "file": source_file,
-                "json_pointer": pointer(parts),
-                "original_sha256": value_digest(original),
-            }
-        )
+        return updated
 
     if (
         parts == ["oci", "annotations", "nerdctl/network-namespace"]
@@ -233,7 +213,6 @@ def transform(
     exact_values: list[dict],
     occurrences: dict[str, list[dict]],
     definitions: dict[str, dict],
-    regex_policy_mode: str = "legacy",
 ):
     if isinstance(value, dict):
         return {
@@ -244,7 +223,6 @@ def transform(
                 exact_values,
                 occurrences,
                 definitions,
-                regex_policy_mode,
             )
             for key, child in value.items()
         }
@@ -257,7 +235,6 @@ def transform(
                 exact_values,
                 occurrences,
                 definitions,
-                regex_policy_mode,
             )
             for index, child in enumerate(value)
         ]
@@ -269,7 +246,6 @@ def transform(
             exact_values,
             occurrences,
             definitions,
-            regex_policy_mode,
         )
     return value
 
@@ -280,11 +256,6 @@ def main() -> None:
     parser.add_argument("--dynamic-values", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument(
-        "--regex-policy-mode",
-        choices=("legacy", "balanced"),
-        default="legacy",
-    )
     args = parser.parse_args()
 
     base_values = json.loads(args.dynamic_values.read_text(encoding="utf-8"))
@@ -316,7 +287,6 @@ def main() -> None:
             exact_values,
             occurrences,
             definitions,
-            args.regex_policy_mode,
         )
         (args.output_dir / output_name).write_text(
             json.dumps(request, indent=2, sort_keys=True) + "\n",
@@ -329,8 +299,6 @@ def main() -> None:
         definition["occurrences"] = occurrences[tag]
         tags.append(definition)
     manifest = {"schema_version": 1, "tags": tags}
-    if args.regex_policy_mode != "legacy":
-        manifest["regex_policy_mode"] = args.regex_policy_mode
     args.manifest.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

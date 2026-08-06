@@ -4,5 +4,4 @@ block_device_driver = "virtio-blk-pci"
 
 [runtime]
 hypervisor_name = "qemu"
-emptydir_mode = "shared-fs"
-disable_guest_seccomp = true
+emptydir_mode = "block-encrypted"

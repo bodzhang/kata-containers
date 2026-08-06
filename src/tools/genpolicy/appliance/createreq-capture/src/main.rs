@@ -33,10 +33,10 @@ use resource::cpu_mem::initial_size::InitialSizeManager;
 use resource::ResourceManager;
 use virt_container::VirtContainerManager;
 
-use oci_spec::runtime as oci;
 use kata_createreq_capture::{
     serialize_create_request, stage_direct_volume_mounts, DryRunHypervisor, RecordingAgent,
 };
+use oci_spec::runtime as oci;
 
 // ---- CLI ----
 
@@ -65,7 +65,10 @@ fn parse_args() -> Result<Args> {
 
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
-        let mut value = || iter.next().ok_or_else(|| anyhow!("missing value for {flag}"));
+        let mut value = || {
+            iter.next()
+                .ok_or_else(|| anyhow!("missing value for {flag}"))
+        };
         match flag.as_str() {
             "--container-id" => container_id = Some(value()?),
             "--sandbox-id" => sandbox_id = Some(value()?),
@@ -194,11 +197,8 @@ async fn main() -> Result<()> {
     let request = captured
         .first()
         .ok_or_else(|| anyhow!("no CreateContainerRequest captured"))?;
-    std::fs::write(
-        &args.output,
-        serialize_create_request(request)? + "\n",
-    )
-    .with_context(|| format!("write {}", args.output.display()))?;
+    std::fs::write(&args.output, serialize_create_request(request)? + "\n")
+        .with_context(|| format!("write {}", args.output.display()))?;
 
     eprintln!(
         "captured CreateContainerRequest -> {} ({} storages, {} devices)",

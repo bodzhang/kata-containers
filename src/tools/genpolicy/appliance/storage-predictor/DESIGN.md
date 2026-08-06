@@ -1,16 +1,16 @@
 # storage-predictor design
 
 This document holds the design rationale and prediction internals for the
-storage-predictor. Usage, requirements, coverage, the policy-generation
-behaviour it drives, and known gaps are in [README.md](README.md).
+storage-predictor. Usage, current capture coverage, and validation commands are
+in [README.md](README.md).
 
 The predictor's job is to produce the Kata Agent `storages` and `devices` a
-workload would generate **without booting a VM**, so the appliance can pin them
-in policy. It exists because the captured OCI `config.json` records containerd's
-mount view, not the downstream Agent storage the Kata shim synthesizes. The two
-sections below explain *why* that downstream shape is the only enforceable one
-and *how* the predictor reproduces it — including the rootfs, the one storage
-the runc bundle capture cannot provide.
+workload would generate **without booting a VM** for focused diagnostics and
+runtime-drift tests. It is not part of capture-bundle analysis and its output is
+not a policy-compiler input. Final requests recorded by `RecordingAgent` are the
+authority for runtime-rs policy generation. The sections below explain why the
+downstream Agent shape matters and how the predictor exercises selected
+runtime-rs handlers independently.
 
 ## Design
 
@@ -69,14 +69,10 @@ content.
 
 ### Design choices that follow
 
-- **Dry-run the real mutation pipeline; don't reimplement it.** Because only the
-  shim's output is enforceable and rows 2–4 mutate the YAML, the predictor
-  captures the OCI bundle **after** containerd's CRI→OCI lowering (from the runc
-  handler, which is CRI-equivalent — see *Known gaps*) and runs the shim's own
-  `VolumeResource::handler_volumes` / `handler_rootfs`. Legacy `genpolicy`
-  instead *reimplements* row 4 in a separate model, which drifts (it omits
-  hugepage, block, direct-volume, and all device synthesis); linking the real
-  `runtime-rs` `resource` crate removes that drift by construction.
+- **Dry-run the real mutation handlers.** The predictor runs runtime-rs
+  `VolumeResource::handler_volumes` and `RootFsResource::handler_rootfs` over
+  explicit diagnostic inputs. Linking the `resource` crate keeps those handler
+  encodings aligned without making prediction authoritative.
 - **Skip the VM at the `Hypervisor` seam.** Storage synthesis is separable from
   VM lifecycle, so the predictor supplies a no-op *dry-run* `Hypervisor` and a
   stub `Agent`; guest device paths come from the device manager's deterministic
@@ -87,11 +83,10 @@ content.
   config, not YAML), the predictor sources the *same* `configuration.toml`
   (`--kata-config`) so its prediction matches the CC shim the workload will
   actually run under.
-- **Keep the YAML as the authority for intent.** What a no-VM run cannot (or
-  should not) derive is pinned from the YAML by the compiler instead: image
-  **digests** are enforced at YAML validation (`submit_workload.py`), and the
-  volume/device **set** (`volumeDevices`, `nvidia.com/pgpu`) is pinned from the
-  manifest.
+- **Keep prediction separate from declarations and evidence.** Workload YAML
+  describes intent, while the final captured request describes the actual Agent
+  input. Predictor output can explain differences between them but replaces
+  neither source.
 - **Reproduce only the unavoidable host-side rewriting.** The shim's
   `kata_sys_util::k8s::update_ephemeral_storage_type` rewrites containerd
   `bind`/`tmpfs` mounts into Kata `ephemeral`/`local` types and today inspects
@@ -101,25 +96,57 @@ content.
   assumptions*. The one path that cannot be reused as-is (`VirtiofsShareMount`,
   entangled with virtiofsd) is *mirrored*, with the drift surface documented (see
   *Drift risk*).
-- **Predict without gating; gate in the compiler.** The predictor records
-  per-container failures and never blocks generation; gating (the dm-verity
-  coverage gate, the opt-in `--strict-storage-coverage` gate) happens downstream
-  where the policy is assembled (see *Driving policy generation*).
+- **Record failures without gating.** The wrapper records per-container errors,
+  and rootfs errors remain attached to otherwise successful volume output. The
+  capture validator and compiler apply their own independent fail-closed checks.
 - **Serialization mirror.** `agent::types::Storage`/`Device` are not `Serialize`,
   so the tool maps them to local serializable structs for the JSON output.
 
-Guided by this framing, **Known gaps** are narrowed to two kinds: (a) one missing
-enforcement *capability* (dm-verity pinning of read-only data block volumes,
-blocked upstream); and (b) *fidelity assumptions* where the no-VM prediction
-could diverge from a real CC run. Tooling/config prerequisites live in
-*Requirements*; out-of-scope paths (nydus rootfs, raw block *content*, host DoS,
-side channels) live in *Coverage* / *Threat model*.
+The remaining distinctions are fidelity questions: which handler code runs
+directly, which inputs depend on live host state, and which virtio-fs behavior
+must be mirrored because production initialization is VM-bound.
+
+### Diagnostic fidelity and drift
+
+Most volume and rootfs transforms call runtime-rs handlers directly. Two input
+dependencies and one reproduced path can still diverge from production:
+
+- `update_ephemeral_storage_type` reads live host mount state and filesystem
+  metadata. Running later against stale or absent kubelet paths can misclassify
+  memory and disk emptyDir mounts.
+- Block and EROFS handlers stat their source files or devices and may create
+  host-side directories. A serialized mount array without the referenced
+  artifacts is insufficient.
+- Real `VirtiofsShareMount` initialization requires virtiofsd, host mounts, and
+  VM lifecycle. `StubShareFsMount` therefore mirrors its side-effect-free
+  `share_volume` result. It reuses `do_get_guest_path`,
+  `is_watchable_mount`, `kata_guest_share_dir`, and `PASSTHROUGH_FS_DIR`, but
+  mirrors the private `watchable` and `watchable-bind` constants plus the small
+  storage-construction branch. Upstream changes to that branch can drift until
+  an alignment test or public side-effect-free helper replaces the mirror.
+
+Watchability itself depends on live source contents. `is_watchable_mount`
+accepts only ConfigMap or Secret paths with between one and eight files; an
+empty directory, traversal/count error, or more than eight files takes the
+non-watchable path. Predictor virtio-fs results therefore depend on the file set
+present at execution time and remain diagnostic until compared with a final
+request.
+
+### Output and failure contract
+
+The binary emits schema version 1 with container identity, resolved
+`emptydir_mode`, predicted volumes, and optional rootfs output. Each volume
+contains storages, rewritten OCI mounts, and an optional device ID. Rootfs
+transform failures are serialized in `rootfs.error`; they do not discard volume
+results. The directory wrapper similarly records binary failures per container
+and continues, preserving partial diagnostic coverage.
 
 
 ## Rootfs prediction (design)
 
-The rootfs is the one storage the appliance cannot capture from the runc bundle:
-runc uses overlayfs, while kata produces the container rootfs through
+The predictor can exercise rootfs handlers from explicit diagnostic mounts even
+when those mounts are unavailable in an OCI-only input. Runtime-rs produces the
+container rootfs through
 `RootFsResource::handler_rootfs` (`resource/src/rootfs/mod.rs`), which dispatches
 by the shape of `rootfs_mounts`:
 
@@ -148,17 +175,17 @@ entirely from data the appliance already captures:
 - `driver_options` = the serialized `ImagePull` metadata (the pod annotations)
 
 Because the guest pulls and verifies the image by digest inside the TEE, this
-storage is **deterministic from the captured spec** — the predictor synthesizes
-the guest-pull `KataVirtualVolume` option (via the shim's own
+storage is **deterministic from the diagnostic OCI spec** — the predictor
+synthesizes the guest-pull `KataVirtualVolume` option (via the shim's own
 `adjust_rootfs_mounts`), calls `handler_rootfs`, and emits the real Agent
 `Storage` with no snapshotter, VM, or device. **Implemented** via
-`--guest-pull-rootfs`; the compiler pins `source` in that container's
-`guest-pull-images` marker storage (see *Driving policy generation*). Proven by
-the `predicts_guest_pull_rootfs` integration test.
+`--guest-pull-rootfs` and proven by the `predicts_guest_pull_rootfs` integration
+test. Authoritative guest-pull identity comes from the final request's
+`image_guest_pull` source.
 
 ### Multi-layer erofs rootfs — implemented (`--rootfs-mounts`)
 
-The predictor consumes a snapshotter-captured `rootfs_mounts` artifact via
+The predictor consumes a diagnostic `rootfs_mounts` artifact via
 `--rootfs-mounts <file>` (a JSON array of `kata_types::mount::Mount`). A
 multi-layer erofs artifact (an `ext4` `rw` upper layer, an `erofs` lower layer,
 and an `overlay` mount)
@@ -178,8 +205,8 @@ deterministic `pci_path` / `scsi_addr` / `ccw_addr` synthesized by the dry-run
 `add_device`. Proven by the `predicts_erofs_multi_layer_rootfs_pci` integration
 test and the `erofs_pci_driver_synthesizes_pci_path` unit test. Confidential
 guests use `virtio-scsi` (QEMU) or `virtio-blk-pci` (CLH/dragonball); the
-enforced policy wildcards the address via the base64url device id, so the
-synthetic value only needs a valid shape.
+synthetic predictor address only needs the shape expected by the handler and
+storage grammar.
 
 For focused diagnostics, callers may supply a rootfs mount artifact directly to
 `--rootfs-mounts`. This exercises the same handler without a VM, but it is not a
@@ -259,9 +286,10 @@ deterministically from the device index, for `DeviceType::BlockModern` devices:
 
 Because `add_device` receives the `Arc<Mutex<BlockDeviceModern>>` the handler
 holds, the mutation flows back into the handler's `storage.source`. The value
-need only be *shape-valid*, not runtime-exact: the generated policy wildcards the
-source via the base64url device id (`$(spath)/$(b64_device_id)`), and a `PciPath`
-renders as `"xx"` which matches the `rules.rego` `blk`/`scsi` device-id clauses.
+need only be *shape-valid*, not runtime-exact: a final capture receives the
+production-assigned address, while the predictor needs an address that lets the
+same handler path complete. A `PciPath` renders as `"xx"`, matching the storage
+grammar exercised by the policy tests.
 This is a predictor-only change — no core Kata behavior is altered — and it lets
 the block/erofs paths run under the drivers CC confidential guests actually use
 (QEMU `virtio-scsi`, CLH/dragonball `virtio-blk-pci`, s390 `virtio-blk-ccw`),
@@ -271,13 +299,12 @@ which forbid `virtio-blk-mmio`.
 
 - `ErofsMultiLayerRootfs::new` stats each erofs source file (`get_erofs_layer_size`
   in GPT mode, `generate_merged_erofs_vmdk` in fsmerge mode) and creates a host
-  rootfs directory (side effect), so the captured artifact's `source` paths must
+  rootfs directory (side effect), so the diagnostic artifact's `source` paths must
   exist when the predictor runs.
 - The snapshotter needs kernel support (erofs / dm-verity) and the plugin present
   in the appliance image.
 
-Trust rationale: preparing the rootfs in the clean room is legitimate for
-confidential guests because content is verified by **digest** (the guest's
-trust anchor) — trust shifts from "host is honest" to "digest matches +
-conversion is deterministic", and the recorded verity root hash lets the policy
-pin it.
+Diagnostic rootfs preparation does not establish trust by itself. Deployable
+policy identity comes from a digest-pinned guest-pull source or a dm-verity root
+hash in an authoritative final request. A hand-built rootfs mount artifact can
+exercise transformation code but cannot prove that containerd produced it.

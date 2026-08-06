@@ -4,6 +4,7 @@ import re
 import sys
 import tempfile
 import unittest
+from collections import defaultdict
 from pathlib import Path
 
 
@@ -16,8 +17,6 @@ SPEC.loader.exec_module(MODULE)
 class TagOciTests(unittest.TestCase):
     def test_exact_and_service_values_are_tagged(self):
         occurrences = {}
-        from collections import defaultdict
-
         occurrences = defaultdict(list)
         definitions = {}
         value = (
@@ -90,6 +89,53 @@ class TagOciTests(unittest.TestCase):
             definitions["service-env.KUBERNETES_PORT"]["suggested_regex"],
         )
 
+    def test_service_environment_is_name_bound_and_portable(self):
+        occurrences = defaultdict(list)
+        definitions = {}
+        transformed = MODULE.replace_string(
+            "BACKEND_SERVICE_HOST=10.96.0.42",
+            ["oci", "process", "env", "0"],
+            "tagged/test.json",
+            [],
+            occurrences,
+            definitions,
+        )
+
+        tag = "service-env.BACKEND_SERVICE_HOST"
+        self.assertEqual(
+            transformed,
+            f"BACKEND_SERVICE_HOST={MODULE.marker(tag)}",
+        )
+        policy_regex = (
+            "^BACKEND_SERVICE_HOST="
+            + definitions[tag]["suggested_regex"]
+            + "$"
+        )
+        self.assertIsNotNone(
+            re.search(policy_regex, "BACKEND_SERVICE_HOST=10.244.7.19")
+        )
+        self.assertIsNone(
+            re.search(policy_regex, "OTHER_SERVICE_HOST=10.244.7.19")
+        )
+        self.assertIsNone(
+            re.search(policy_regex, "BACKEND_SERVICE_HOST=not-an-ip")
+        )
+
+        named_port = MODULE.replace_string(
+            "BACKEND_SERVICE_PORT_HTTPS=8443",
+            ["oci", "process", "env", "1"],
+            "tagged/test.json",
+            [],
+            occurrences,
+            definitions,
+        )
+        port_tag = "service-env.BACKEND_SERVICE_PORT_HTTPS"
+        self.assertEqual(
+            named_port,
+            f"BACKEND_SERVICE_PORT_HTTPS={MODULE.marker(port_tag)}",
+        )
+        self.assertEqual(definitions[port_tag]["suggested_regex"], "[0-9]{1,5}")
+
     def test_main_writes_tagged_request_and_request_rooted_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -158,7 +204,7 @@ class TagOciTests(unittest.TestCase):
                 "/oci/process/env/0",
             )
 
-    def test_termination_log_id_is_tagged(self):
+    def test_termination_log_id_is_left_for_compiler_validation(self):
         from collections import defaultdict
 
         occurrences = defaultdict(list)
@@ -174,10 +220,9 @@ class TagOciTests(unittest.TestCase):
 
         self.assertEqual(
             transformed,
-            "/var/lib/kubelet/pods/uid/containers/workload/"
-            "{{GENPOLICY_DYNAMIC:termination-log.id}}",
+            "/var/lib/kubelet/pods/uid/containers/workload/7f627291",
         )
-        self.assertIn("termination-log.id", definitions)
+        self.assertNotIn("termination-log.id", definitions)
 
     def test_network_namespace_is_tagged(self):
         from collections import defaultdict
@@ -198,9 +243,7 @@ class TagOciTests(unittest.TestCase):
         )
         self.assertIn("network.namespace", definitions)
 
-    def test_balanced_mode_pins_service_and_generalizes_cni_path(self):
-        from collections import defaultdict
-
+    def test_service_is_typed_and_cni_path_is_generalized(self):
         occurrences = defaultdict(list)
         definitions = {}
         service = MODULE.replace_string(
@@ -210,7 +253,6 @@ class TagOciTests(unittest.TestCase):
             [],
             occurrences,
             definitions,
-            "balanced",
         )
         network_namespace = MODULE.replace_string(
             "/var/run/netns/cni-11111111-2222-3333-4444-555555555555",
@@ -219,10 +261,14 @@ class TagOciTests(unittest.TestCase):
             [],
             occurrences,
             definitions,
-            "balanced",
         )
 
-        self.assertEqual(service, "BACKEND_SERVICE_HOST=10.96.0.12")
+        self.assertEqual(
+            service,
+            "BACKEND_SERVICE_HOST="
+            "{{GENPOLICY_DYNAMIC:service-env.BACKEND_SERVICE_HOST}}",
+        )
+        self.assertIn("service-env.BACKEND_SERVICE_HOST", definitions)
         self.assertEqual(
             network_namespace,
             "{{GENPOLICY_DYNAMIC:network.namespace}}",

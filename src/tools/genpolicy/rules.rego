@@ -1292,6 +1292,24 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
 
     p_count - marker_count == i_count - img_pull_count - erofs_ml_count - verity_rootfs_count
 
+    # A count plus existential matching is insufficient: two input storages
+    # could otherwise reuse one policy storage while another policy storage is
+    # omitted. Require every non-marker policy index to participate and reject
+    # duplicate policy-backed input objects.
+    p_matches := { p_index |
+        some i_storage in i_storages
+        p_index := allow_storage(p_storages, i_storage, bundle_id, sandbox_id)
+        p_index >= 0
+    }
+    count(p_matches) == p_count - marker_count
+
+    policy_backed_inputs := [i_storage |
+        some i_storage in i_storages
+        p_index := allow_storage(p_storages, i_storage, bundle_id, sandbox_id)
+        p_index >= 0
+    ]
+    count({i_storage | some i_storage in policy_backed_inputs}) == count(policy_backed_inputs)
+
     every i_storage in i_storages {
         allow_storage(p_storages, i_storage, bundle_id, sandbox_id)
     }
@@ -1299,8 +1317,8 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
     print("allow_storages: true")
 }
 
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
-    some p_storage in p_storages
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) := p_index if {
+    some p_index, p_storage in p_storages
 
     print("allow_storage: p_storage =", p_storage)
     print("allow_storage: i_storage =", i_storage)
@@ -1312,7 +1330,7 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
 
     print("allow_storage: true")
 }
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) := -1 if {
     i_storage.driver == "image_guest_pull"
     print("allow_storage with image_guest_pull: start")
     i_storage.fstype == "overlay"
@@ -1326,54 +1344,63 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     print("allow_storage with image_guest_pull: true")
 }
 
-# Pin the guest-pulled image reference to this container's marker storage.
+# Pin the guest-pulled workload image by manifest digest. Repository names are
+# transport locations, not content identity. The Kata pause image remains a
+# special UVM-local identity without a registry digest.
 allow_guest_pull_image(p_storages, i_storage) if {
     some p_storage in p_storages
     p_storage.driver == "guest-pull-images"
-    i_storage.source in p_storage.options
-    print("allow_guest_pull_image: pinned image (per-container)")
+    input_identity := guest_pull_image_identity(i_storage.source)
+    some policy_image in p_storage.options
+    input_identity == guest_pull_image_identity(policy_image)
+    print("allow_guest_pull_image: pinned manifest digest (per-container)")
 }
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
-    print("allow_storage with scsi: start")
 
-    i_storage.driver == "scsi"
-    regex.match("^[0-9]+:[0-9]+$", i_storage.source)
-
-    allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id)
-
-    print("allow_storage with scsi: true")
+guest_pull_image_identity(image) := "pause" if {
+    image == "pause"
 }
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
-    print("allow_storage with blk: start")
 
-    i_storage.driver == "blk"
-    regex.match("^[0-9a-f]{2}(/[0-9a-f]{2})?$", i_storage.source)
+guest_pull_image_identity(image) := image if {
+    regex.match("^sha256:[0-9a-f]{64}$", image)
+}
 
-    allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id)
+guest_pull_image_identity(image) := digest if {
+    parts := split(image, "@")
+    count(parts) == 2
+    digest := parts[1]
+    regex.match("^sha256:[0-9a-f]{64}$", digest)
+}
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) := p_index if {
+    print("allow_storage with block transport: start")
 
-    print("allow_storage with blk: true")
+    allow_block_source(i_storage)
+    p_index := allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id)
+
+    print("allow_storage with block transport: true")
 }
 # EROFS multi-layer rootfs: writable upper (scratch ext4). Its content is
 # guest-writable, so it is allowed by shape, not pinned.
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) := -1 if {
     print("allow_storage erofs multi-layer upper: start")
 
     "X-kata.multi-layer=true" in i_storage.options
     "X-kata.overlay-upper" in i_storage.options
     i_storage.fstype == "ext4"
+    allow_block_source(i_storage)
     allow_rootfs_storage_base(i_storage, bundle_id)
 
     print("allow_storage erofs multi-layer upper: true")
 }
 # EROFS multi-layer lower: pin the root hash against this container's own
 # `dmverity-roothashes` marker storage.
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) := -1 if {
     print("allow_storage erofs multi-layer lower (per-container): start")
 
     "X-kata.multi-layer=true" in i_storage.options
     "X-kata.overlay-lower" in i_storage.options
     i_storage.fstype == "erofs"
     "X-kata.dmverity-enabled=true" in i_storage.options
+    allow_block_source(i_storage)
     allow_rootfs_storage_base(i_storage, bundle_id)
 
     some p_storage in p_storages
@@ -1386,11 +1413,12 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
 # Single-layer dm-verity block rootfs: pin the root hash against this
 # container's own marker storage. Distinguished from an EROFS lower by the
 # absence of the multi-layer marker.
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) := -1 if {
     print("allow_storage single-layer dm-verity (per-container): start")
 
     "X-kata.dmverity-enabled=true" in i_storage.options
     not "X-kata.multi-layer=true" in i_storage.options
+    allow_block_source(i_storage)
     allow_rootfs_storage_base(i_storage, bundle_id)
 
     some p_storage in p_storages
@@ -1399,6 +1427,27 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     concat("", ["X-kata.dmverity.roothash=", roothash]) in i_storage.options
 
     print("allow_storage single-layer dm-verity (per-container): true")
+}
+
+allow_block_source(i_storage) if {
+    i_storage.driver == "blk"
+    regex.match("^[0-9a-f]{2}(/[0-9a-f]{2})?$", i_storage.source)
+}
+allow_block_source(i_storage) if {
+    i_storage.driver == "scsi"
+    regex.match("^[0-9]+:[0-9]+$", i_storage.source)
+}
+allow_block_source(i_storage) if {
+    i_storage.driver == "mmioblk"
+    regex.match("^/dev/vd[a-z]+$", i_storage.source)
+}
+allow_block_source(i_storage) if {
+    i_storage.driver == "blk-ccw"
+    regex.match("^0\\.0\\.[0-9a-f]{4}$", i_storage.source)
+}
+allow_block_source(i_storage) if {
+    i_storage.driver == "nvdimm"
+    regex.match("^/dev/pmem[0-9]+$", i_storage.source)
 }
 
 allow_rootfs_storage_base(i_storage, bundle_id) if {
@@ -1427,10 +1476,16 @@ allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id) if {
     allow_storage_options(p_storage, i_storage)
 }
 
-allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id) := p_index if {
     print("allow_block_storage: start")
 
-    some p_storage in p_storages
+    some p_index, p_storage in p_storages
+
+    # Compiler-generated block-volume policies deliberately leave the dynamic
+    # transport and address empty. The runtime driver/source are constrained by
+    # allow_block_source and the mount point is derived from that source below.
+    p_storage.driver == ""
+    p_storage.source == ""
 
     allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
 
@@ -1542,20 +1597,12 @@ allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
     print("allow_mount_point hugetlbfs: true")
 }
 allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
-    print("allow_mount_point 4: start")
+    print("allow_mount_point block transport: start")
 
-    i_storage.driver == "blk"
+    allow_block_source(i_storage)
     allow_mount_point_by_device_id(p_storage, i_storage)
 
-    print("allow_mount_point 4: true")
-}
-allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
-    print("allow_mount_point 5: start")
-
-    i_storage.driver == "scsi"
-    allow_mount_point_by_device_id(p_storage, i_storage)
-
-    print("allow_mount_point 5: true")
+    print("allow_mount_point block transport: true")
 }
 
 allow_mount_point_by_device_id(p_storage, i_storage) if {

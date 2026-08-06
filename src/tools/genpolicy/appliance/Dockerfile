@@ -170,6 +170,7 @@ RUN set -eux; \
         --rootfs /opt/genpolicy/rootfs/pause \
         --reference genpolicy.local:5000/pause:3.10 \
         --entrypoint '["/pause"]' \
+        --user 65535:65535 \
         --output /opt/genpolicy/images/pause.tar; \
     python3 /opt/genpolicy/appliance/scripts/make_oci_image.py \
         --rootfs /opt/genpolicy/rootfs/busybox \

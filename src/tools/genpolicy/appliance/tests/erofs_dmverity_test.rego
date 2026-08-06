@@ -53,6 +53,24 @@ test_erofs_dmverity_wrong_mount_point_denied if {
 	) with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }
 
+test_erofs_dmverity_non_block_driver_denied if {
+	storages := [
+		json.patch(storage, [{"op": "replace", "path": "/driver", "value": "ephemeral"}]) |
+		storage := erofs_storages("aa11")[_]
+	]
+	not allow_storages([marker(["aa11"])], storages, "foo", "sid")
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
+}
+
+test_erofs_dmverity_bad_block_source_denied if {
+	storages := [
+		json.patch(storage, [{"op": "replace", "path": "/source", "value": "/dev/shm"}]) |
+		storage := erofs_storages("aa11")[_]
+	]
+	not allow_storages([marker(["aa11"])], storages, "foo", "sid")
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
+}
+
 # A legacy pod-wide allowlist cannot authorize a root hash without a
 # per-container marker.
 test_erofs_dmverity_global_allowlist_denied if {
@@ -103,6 +121,15 @@ test_single_layer_dmverity_wrong_mount_point_denied if {
 		[{"op": "replace", "path": "/mount_point", "value": "/run/kata-containers/other/rootfs"}],
 	)]
 	not allow_storages([marker(["cafe1234"])], storages, "foo", "sid")
+		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
+}
+
+test_single_layer_dmverity_non_block_driver_denied if {
+	storage := json.patch(
+		single_layer_verity("cafe1234")[0],
+		[{"op": "replace", "path": "/driver", "value": "ephemeral"}],
+	)
+	not allow_storages([marker(["cafe1234"])], [storage], "foo", "sid")
 		with data.agent_policy.policy_data as {"dmverity": {"allowed_roothashes": []}}
 }
 

@@ -47,6 +47,7 @@ def main() -> None:
     parser.add_argument("--rootfs", required=True, type=Path)
     parser.add_argument("--reference", required=True)
     parser.add_argument("--entrypoint", required=True)
+    parser.add_argument("--user")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
 
@@ -64,16 +65,20 @@ def main() -> None:
         layer_data = layer_path.read_bytes()
         layer_digest, layer_size = write_blob(temporary_path, layer_data)
 
+        image_config = {
+            "Entrypoint": entrypoint,
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ],
+            "WorkingDir": "/",
+        }
+        if args.user is not None:
+            image_config["User"] = args.user
+
         config = canonical_json(
             {
                 "architecture": architecture,
-                "config": {
-                    "Entrypoint": entrypoint,
-                    "Env": [
-                        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                    ],
-                    "WorkingDir": "/",
-                },
+                "config": image_config,
                 "created": "1970-01-01T00:00:00Z",
                 "history": [{"created": "1970-01-01T00:00:00Z"}],
                 "os": "linux",
