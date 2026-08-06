@@ -198,6 +198,67 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         ):
             composition.compose(self.static_baseline(), fragments)
 
+    def test_environment_entries_compose_by_name(self):
+        baseline = {
+            "policy_data": {},
+            "subjects": [
+                {
+                    "collection_encodings": {"/OCI/Process/Env": "env-map"},
+                    "id": "container/app",
+                    "ordinal": 0,
+                    "policy": {
+                        "OCI": {"Process": {"Env": {"STATIC": "image"}}}
+                    },
+                }
+            ],
+        }
+        fragments = [
+            {
+                "category": "kubelet-resolution",
+                "claims": [
+                    {
+                        "operation": "resolve",
+                        "target": {
+                            "subject": "container/app",
+                            "path": "/OCI/Process/Env/POD_UID",
+                        },
+                        "value": "$(pod-uid)",
+                    }
+                ],
+            }
+        ]
+        expected = {
+            "containers": [
+                {
+                    "OCI": {
+                        "Process": {
+                            "Env": ["POD_UID=$(pod-uid)", "STATIC=image"]
+                        }
+                    }
+                }
+            ]
+        }
+
+        composed = composition.materialize(baseline, fragments, expected)
+
+        self.assertEqual(composed, expected)
+
+    def test_environment_map_rejects_invalid_name(self):
+        baseline = {
+            "policy_data": {},
+            "subjects": [
+                {
+                    "collection_encodings": {"/OCI/Process/Env": "env-map"},
+                    "id": "container/app",
+                    "ordinal": 0,
+                    "policy": {"OCI": {"Process": {"Env": {"BAD=NAME": "value"}}}},
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(composition.CompositionError, "invalid variable name"):
+            composition.materialize(baseline, [])
+
 
 if __name__ == "__main__":
     unittest.main()

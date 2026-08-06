@@ -193,6 +193,21 @@ def verify_expected_policy(actual: dict, expected: dict) -> None:
         raise CompositionError(f"composed policy does not match expected policy at {mismatch}")
 
 
+def materialize_subject(subject: dict) -> dict:
+    policy = copy.deepcopy(subject["policy"])
+    for pointer, encoding in subject.get("collection_encodings", {}).items():
+        value = get_pointer(policy, pointer)
+        if encoding != "env-map":
+            raise CompositionError(f"unsupported collection encoding: {encoding}")
+        if not isinstance(value, dict):
+            raise CompositionError(f"env-map collection is not an object: {pointer}")
+        if any(not isinstance(name, str) or "=" in name for name in value):
+            raise CompositionError(f"env-map contains an invalid variable name: {pointer}")
+        parent, token = pointer_parent(policy, pointer)
+        parent[token] = [f"{name}={value[name]}" for name in sorted(value)]
+    return policy
+
+
 def materialize(
     static_ir: dict, fragments: list[dict], expected_policy: dict | None = None
 ) -> dict:
@@ -202,7 +217,7 @@ def materialize(
     else:
         result = composed["policy_data"]
         result["containers"] = [
-            subject["policy"]
+            materialize_subject(subject)
             for subject in sorted(composed["subjects"], key=lambda item: item["ordinal"])
         ]
     if expected_policy is not None:
