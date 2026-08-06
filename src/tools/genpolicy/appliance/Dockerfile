@@ -1,4 +1,5 @@
 ARG CAPTURE_BACKEND=runtime-rs
+ARG ROOTFS_MODE=guest-pull
 
 FROM registry.k8s.io/pause:3.10 AS pause
 FROM busybox:1.36.1 AS busybox
@@ -95,7 +96,7 @@ RUN --mount=type=cache,id=genpolicy-cargo-registry,target=/usr/local/cargo/regis
 FROM debian:bookworm-slim AS capture-base
 
 ARG CAPTURE_BACKEND=runtime-rs
-ARG PROFILE_NAME=k8s-1.33-containerd-2.3-native
+ARG PROFILE_NAME=k8s-1.33-containerd-2.3-guest-pull
 ARG TARGETARCH=amd64
 ARG KUBERNETES_VERSION=v1.33.13
 ARG CONTAINERD_VERSION=v2.3.3
@@ -184,11 +185,11 @@ ENV GENPOLICY_PROFILE_NAME=${PROFILE_NAME}
 
 ENTRYPOINT ["/opt/genpolicy/appliance/scripts/entrypoint.sh"]
 
-FROM capture-base AS capture-runtime-rs-native
+FROM capture-base AS capture-runtime-rs-base
 COPY --from=capture-runtime-rs-builder \
     /out/containerd-shim-kata-capture-v2 /usr/local/bin/
 
-FROM capture-runtime-rs-native AS capture-runtime-rs-erofs-dmverity
+FROM capture-runtime-rs-base AS capture-runtime-rs-erofs-dmverity
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         cryptsetup-bin liblz4-1 libuuid1 udev zlib1g \
@@ -196,6 +197,8 @@ RUN apt-get update \
 COPY --from=erofs-utils-builder /usr/local/bin/mkfs.erofs /usr/local/bin/mkfs.erofs
 COPY src/tools/genpolicy/appliance/scripts/watch_device_mapper_nodes.py \
     /opt/genpolicy/appliance/scripts/watch_device_mapper_nodes.py
+
+FROM capture-runtime-rs-base AS capture-runtime-rs-guest-pull
 
 FROM capture-base AS capture-runc-native
 COPY --from=capture-runc-builder /out/createreq-capture \
@@ -221,7 +224,7 @@ RUN chmod 0755 /opt/genpolicy/appliance/scripts/*.sh
 ENV GENPOLICY_APPLIANCE_ROOT=/opt/genpolicy/appliance
 ENTRYPOINT ["/opt/genpolicy/appliance/scripts/analyze_capture.sh"]
 
-FROM capture-${CAPTURE_BACKEND}-native AS legacy-reference
+FROM capture-${CAPTURE_BACKEND}-${ROOTFS_MODE} AS legacy-reference
 
 COPY --from=registry /bin/registry /usr/local/bin/registry
 COPY --from=legacy-builder /out/genpolicy /usr/local/bin/genpolicy
@@ -235,4 +238,4 @@ COPY src/tools/genpolicy/appliance /opt/genpolicy/appliance
 
 ENV GENPOLICY_LEGACY_REFERENCE=1
 
-FROM capture-runtime-rs-native
+FROM capture-runtime-rs-guest-pull

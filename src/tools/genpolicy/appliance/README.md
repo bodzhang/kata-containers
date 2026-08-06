@@ -237,6 +237,37 @@ policy-only Agent validation. `make e2e` performs a separate network-disabled
 analysis pass and requires its policy to match the combined run's balanced
 policy byte for byte.
 
+Select an exact capture profile with `PROFILE`. The authoritative runtime-rs
+profiles cover strict EROFS dm-verity and image guest-pull. A separate runc
+profile preserves the native-snapshotter fallback and pre-Kata OCI baseline:
+
+```bash
+make PROFILE=k8s-1.33-containerd-2.3-guest-pull image
+make PROFILE=k8s-1.33-containerd-2.3-erofs-dmverity image
+make PROFILE=k8s-1.33-containerd-2.3-runc-native image
+```
+
+Only the guest-pull profile enables runtime-rs's `force_guest_pull` experiment.
+Capture validation requires `image_guest_pull` storage in every guest-pull
+`CreateContainerRequest`.
+
+The `runc-native` profile is deliberately not a Kata Agent request profile. It
+runs the real Kubernetes, CRI, containerd native snapshotter, and runc path, so
+its raw OCI bundles are authoritative through the runc boundary and provide the
+fallback and pre-Kata comparison baseline. The profile's
+`REQUEST_AUTHORITY=raw-oci` records that boundary in `profile.json`, and the
+bundle promotes it to `manifest.json` as `capture.request_authority`. Any
+`CreateContainerRequest` files produced afterward by `createreq-capture` are
+reconstructions for diagnostics and compiler compatibility; they were not
+emitted by runtime-rs or observed by `RecordingAgent` and must not be compared
+as equivalent evidence to the guest-pull or EROFS profiles.
+
+There is no runtime-rs native profile in the no-VM appliance. An ordinary
+native-snapshotter bind rootfs requires a Kata shared-filesystem transport such
+as virtio-fs. With no VM and `shared_fs = "none"`, runtime-rs correctly rejects
+that mount. Such a profile can be added only with a real or faithfully modeled
+shared-filesystem boundary.
+
 ## Environment sources
 
 The appliance does not reconstruct Kubernetes environment variables from

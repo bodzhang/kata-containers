@@ -10,7 +10,7 @@ readonly input_dir="${GENPOLICY_INPUT_DIR:-/input}"
 readonly output_dir="${GENPOLICY_OUTPUT_DIR:-/output}"
 readonly workload="${input_dir}/workload.yaml"
 
-profile_name="${GENPOLICY_PROFILE_NAME:-k8s-1.33-containerd-2.3-native}"
+profile_name="${GENPOLICY_PROFILE_NAME:-k8s-1.33-containerd-2.3-guest-pull}"
 profile_path="${appliance_root}/profiles/${profile_name}.env"
 [[ -f "${profile_path}" ]] || {
 	echo "ERROR: unknown capture profile: ${profile_name}" >&2
@@ -360,6 +360,25 @@ for path in Path(sys.argv[1]).glob("*.json"):
 	]
 	if not protected:
 		raise SystemExit(f"{path.name}: no strict dm-verity EROFS storage in final Agent request")
+PY
+fi
+
+if [[ "${GENPOLICY_CAPTURE_BACKEND:-runtime-rs}" == "runtime-rs" ]]; then
+	python3 - "${output_dir}/createcontainer-requests" "${ROOTFS_MODE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+requests = Path(sys.argv[1])
+rootfs_mode = sys.argv[2]
+for path in requests.glob("*.json"):
+	request = json.loads(path.read_text(encoding="utf-8"))
+	has_guest_pull = any(
+		storage.get("driver") == "image_guest_pull"
+		for storage in request.get("storages", [])
+	)
+	if rootfs_mode == "guest-pull" and not has_guest_pull:
+		raise SystemExit(f"{path.name}: guest-pull profile has no image_guest_pull storage")
 PY
 fi
 

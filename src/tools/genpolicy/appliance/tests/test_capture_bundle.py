@@ -25,6 +25,7 @@ class CaptureBundleTests(unittest.TestCase):
         self.profile = self.root / "profile.env"
         self.profile.write_text(
             "PROFILE_NAME=test\n"
+            "REQUEST_AUTHORITY=recording-agent\n"
             "KUBERNETES_VERSION=v1.33.13\n"
             "CONTAINERD_VERSION=v2.3.3\n",
             encoding="utf-8",
@@ -141,6 +142,7 @@ class CaptureBundleTests(unittest.TestCase):
             },
         )
         self.assertEqual(manifest["components"]["containerd"], "v2.3.3")
+        self.assertEqual(manifest["capture"]["request_authority"], "recording-agent")
         self.assertIn("raw-oci/0.config.json", manifest["artifacts"])
         self.assertIn("config/containerd.toml", manifest["artifacts"])
         self.assertIn("images/index.json", manifest["artifacts"])
@@ -175,6 +177,18 @@ class CaptureBundleTests(unittest.TestCase):
         self.assertFalse(manifest["capture"]["complete"])
         with self.assertRaisesRegex(capture_bundle.BundleError, "incomplete"):
             capture_bundle.validate_bundle(self.bundle, require_complete=True)
+
+    def test_rejects_authority_inconsistent_with_backend(self):
+        self.profile.write_text(
+            "PROFILE_NAME=test\n"
+            "REQUEST_AUTHORITY=raw-oci\n"
+            "KUBERNETES_VERSION=v1.33.13\n"
+            "CONTAINERD_VERSION=v2.3.3\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(capture_bundle.BundleError, "request authority"):
+            self.build()
 
 
 if __name__ == "__main__":

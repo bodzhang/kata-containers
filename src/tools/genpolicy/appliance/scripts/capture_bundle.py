@@ -248,6 +248,12 @@ def build_bundle(
     }
     artifacts = artifact_index(bundle)
     profile_values = profile["values"]
+    request_authority = profile_values.get("REQUEST_AUTHORITY")
+    expected_authority = "recording-agent" if capture_backend == "runtime-rs" else "raw-oci"
+    if request_authority != expected_authority:
+        raise BundleError(
+            f"profile request authority must be {expected_authority} for {capture_backend}"
+        )
     manifest = {
         "artifacts": artifacts,
         "bundle_type": "genpolicy-request-capture",
@@ -256,6 +262,7 @@ def build_bundle(
             "complete": complete,
             "counts": counts,
             "outbound_sealed": outbound_sealed,
+            "request_authority": request_authority,
             "rootfs_mode": rootfs_mode,
         },
         "capture_binaries": binary_inputs,
@@ -308,6 +315,10 @@ def validate_bundle(bundle: Path, require_complete: bool = False) -> dict:
             raise BundleError(f"capture artifact integrity check failed: {name}")
 
     capture = manifest.get("capture", {})
+    profile = json.loads((bundle / "profile.json").read_text(encoding="utf-8"))
+    request_authority = profile.get("values", {}).get("REQUEST_AUTHORITY")
+    if capture.get("request_authority") != request_authority:
+        raise BundleError("capture request authority does not match profile")
     counts = capture.get("counts", {})
     expected_counts = {
         "createcontainer": count_files(bundle / "createcontainer-requests", "*.json"),

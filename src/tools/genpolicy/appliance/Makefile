@@ -1,11 +1,10 @@
 SHELL := /bin/bash
 
-PROFILE ?= k8s-1.33-containerd-2.3-native
+PROFILE ?= k8s-1.33-containerd-2.3-guest-pull
 PROFILE_FILE := profiles/$(PROFILE).env
 include $(PROFILE_FILE)
 
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
-CAPTURE_BACKEND ?= runtime-rs
 CAPTURE_TARGET := capture-$(CAPTURE_BACKEND)-$(ROOTFS_MODE)
 IMAGE ?= genpolicy-appliance:$(PROFILE_NAME)
 ANALYSIS_IMAGE ?= genpolicy-analysis:latest
@@ -24,6 +23,7 @@ image:
 		--file $(CURDIR)/Dockerfile \
 		--target $(CAPTURE_TARGET) \
 		--build-arg CAPTURE_BACKEND=$(CAPTURE_BACKEND) \
+		--build-arg ROOTFS_MODE=$(ROOTFS_MODE) \
 		--build-arg PROFILE_NAME=$(PROFILE_NAME) \
 		--build-arg KUBERNETES_VERSION=$(KUBERNETES_VERSION) \
 		--build-arg CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
@@ -45,6 +45,7 @@ reference-image:
 		--file $(CURDIR)/Dockerfile \
 		--target legacy-reference \
 		--build-arg CAPTURE_BACKEND=$(CAPTURE_BACKEND) \
+		--build-arg ROOTFS_MODE=$(ROOTFS_MODE) \
 		--build-arg PROFILE_NAME=$(PROFILE_NAME) \
 		--build-arg KUBERNETES_VERSION=$(KUBERNETES_VERSION) \
 		--build-arg CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
@@ -59,6 +60,7 @@ policy-tools:
 
 e2e: image analysis-image reference-image policy-tools
 	CAPTURE_BACKEND="$(CAPTURE_BACKEND)" \
+		ROOTFS_MODE="$(ROOTFS_MODE)" REQUEST_AUTHORITY="$(REQUEST_AUTHORITY)" \
 		CONTAINER_ENGINE="$(CONTAINER_ENGINE)" IMAGE="$(IMAGE)" \
 		ANALYSIS_IMAGE="$(ANALYSIS_IMAGE)" \
 		REFERENCE_IMAGE="$(REFERENCE_IMAGE)" \

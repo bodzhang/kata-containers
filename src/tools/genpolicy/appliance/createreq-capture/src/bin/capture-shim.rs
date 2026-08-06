@@ -134,6 +134,10 @@ fn resolve_hypervisor_config(config: &TomlConfig) -> HypervisorConfig {
         .unwrap_or_default()
 }
 
+fn force_guest_pull(rootfs_mode: &str) -> bool {
+    rootfs_mode == "guest-pull"
+}
+
 fn socket_address(args: &Args, id: &str) -> Result<PathBuf> {
     if id.is_empty() {
         return Err(anyhow!("sandbox id is empty"));
@@ -252,7 +256,7 @@ async fn run_capture_shim(args: Args) -> Result<()> {
         })?;
     }
     let rootfs_mode = std::env::var(ROOTFS_MODE_ENV).unwrap_or_else(|_| "native".to_string());
-    if rootfs_mode != "erofs-dmverity"
+    if force_guest_pull(&rootfs_mode)
         && !config
         .runtime
         .experimental
@@ -369,5 +373,12 @@ mod tests {
     fn parses_runtime_info_action() {
         let arguments = [OsString::from("shim"), OsString::from("-info")];
         assert!(matches!(parse_args(&arguments).unwrap(), Action::Info));
+    }
+
+    #[test]
+    fn guest_pull_experiment_is_profile_specific() {
+        assert!(force_guest_pull("guest-pull"));
+        assert!(!force_guest_pull("native"));
+        assert!(!force_guest_pull("erofs-dmverity"));
     }
 }

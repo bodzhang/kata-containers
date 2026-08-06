@@ -117,15 +117,24 @@ ROOTFS_MODE=erofs-dmverity
 ROOTFS_MODE=guest-pull
 ```
 
+`native` is valid only for the runc fallback in the no-VM appliance. A
+runtime-rs native rootfs requires a shared-filesystem transport and is outside
+the current capture boundary.
+
 Initial profile set:
 
 ```text
-k8s-1.33-containerd-2.3-native
+k8s-1.33-containerd-2.3-guest-pull
 k8s-1.33-containerd-2.3-erofs-dmverity
+k8s-1.33-containerd-2.3-runc-native
 ```
 
-Add older or newer Kubernetes/containerd combinations only after these two
-profiles share the same capture-bundle and analysis interfaces.
+The runtime-rs profiles set `REQUEST_AUTHORITY=recording-agent`; their final
+Agent requests are authoritative. The runc profile sets
+`REQUEST_AUTHORITY=raw-oci`; raw OCI is authoritative, while its subsequently
+reconstructed Agent requests are diagnostic only. Add older or newer
+Kubernetes/containerd combinations only after these profiles
+share the same capture-bundle and analysis interfaces.
 
 Profile identity must include normalized profile content plus hashes of the
 containerd, kubelet, CNI, and Kata configuration files. A human-readable name
@@ -333,10 +342,10 @@ Split image targets by behavior:
 
 ```text
 capture-base
-capture-runtime-rs-native
+capture-runtime-rs-base
 capture-runtime-rs-erofs
 capture-runtime-rs-guest-pull
-capture-runc
+capture-runc-native
 ```
 
 Only `capture-runtime-rs-erofs` includes `mkfs.erofs` and EROFS-specific runtime
@@ -518,9 +527,10 @@ Use three job layers:
 3. Download bundles, analyze them, replay policies, compare profiles, and upload
    analysis reports.
 
-Run one native and one EROFS profile on relevant pull requests. Run the wider
-historical and version compatibility matrix nightly or when profile, capture,
-containerd, runtime-rs, Kubernetes integration, or policy files change.
+Run the authoritative guest-pull and EROFS profiles plus the runc-native
+fallback baseline on relevant pull requests. Run the wider historical and
+version compatibility matrix nightly or when profile, capture, containerd,
+runtime-rs, Kubernetes integration, or policy files change.
 
 Use Docker/BuildKit as the GitHub Actions image frontend and retain Podman as a
 supported local frontend. Do not reuse the Kubernetes CI `CONTAINER_ENGINE`
@@ -539,8 +549,8 @@ image build/run command. Rename the appliance variable to
 - [x] Make existing E2E run capture followed by external analysis.
 - [x] Prove a stored capture can be reanalyzed without rerunning Kubernetes.
 
-Acceptance criteria: the canonical native profile produces the same balanced
-policy and request-derived artifacts as the current combined appliance.
+Acceptance criteria: the canonical guest-pull profile produces the same
+balanced policy and request-derived artifacts as the current combined appliance.
 Enabling policy-only replay validates the same five captured requests.
 
 ### Phase 2: External analysis
@@ -573,7 +583,7 @@ exec requests, and no synthetic mount reconstruction contributes to policy.
 - [x] Move Legacy GenPolicy to an optional runner that consumes its native YAML
    and configuration inputs.
 - [x] Remove local legacy registry from the capture image.
-- [ ] Split native, EROFS, guest-pull, and runc image targets.
+- [x] Split EROFS, guest-pull, and runc-native image targets.
 
 Acceptance criteria: each image target contains only its mode-specific runtime
 dependencies.
@@ -582,7 +592,8 @@ dependencies.
 
 - [x] Add BuildKit caches and version-keyed component stages.
 - [x] Introduce data-driven exact-version profiles.
-- [ ] Add one native and one EROFS pull-request profile.
+- [ ] Add guest-pull and EROFS authoritative pull-request profiles plus the
+   runc-native fallback baseline.
 - [ ] Add scheduled cross-version compatibility profiles.
 - [x] Add intra-profile transformation and baseline-to-candidate request
    mutation reports.

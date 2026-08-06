@@ -90,7 +90,9 @@ assert {entry["source"] for entry in provenance["entries"]} >= {
     "profile-runtime",
 }
 PY
-python3 - "${temporary}/output" "${CAPTURE_BACKEND:-runtime-rs}" <<'PY'
+python3 - "${temporary}/output" "${CAPTURE_BACKEND:-runtime-rs}" \
+    "${ROOTFS_MODE:?ROOTFS_MODE is required}" \
+    "${REQUEST_AUTHORITY:?REQUEST_AUTHORITY is required}" <<'PY'
 import base64
 import gzip
 import json
@@ -100,6 +102,8 @@ from pathlib import Path
 
 output = Path(sys.argv[1])
 capture_backend = sys.argv[2]
+rootfs_mode = sys.argv[3]
+request_authority = sys.argv[4]
 
 def policy_data(name):
     text = (output / name).read_text(encoding="utf-8")
@@ -205,7 +209,8 @@ capture_manifest = json.loads(
 assert capture_manifest["bundle_type"] == "genpolicy-request-capture"
 assert capture_manifest["capture"]["complete"] is True
 assert capture_manifest["capture"]["backend"] == capture_backend
-assert capture_manifest["capture"]["rootfs_mode"] == "native"
+assert capture_manifest["capture"]["rootfs_mode"] == rootfs_mode
+assert capture_manifest["capture"]["request_authority"] == request_authority
 assert capture_manifest["capture"]["counts"] == {
     "createcontainer": 3,
     "execprocess": 2 if capture_backend == "runtime-rs" else 0,
