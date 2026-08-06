@@ -142,6 +142,56 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
                 self.static_ir(), expected, self.source_report()
             )
 
+    def test_runtime_absence_inventory_exposes_uncovered_removal(self):
+        observed = [
+            {
+                "evidence": "sandbox.json",
+                "path": "/OCI/Linux/Resources/Devices",
+                "subject": "sandbox/default/demo",
+            },
+            {
+                "evidence": "sandbox.json",
+                "path": "/OCI/Linux/Seccomp",
+                "subject": "sandbox/default/demo",
+            },
+        ]
+        inventory = {
+            "rules": [
+                {
+                    "category": "runtime-rs",
+                    "evidence": "rules.rego: allow_create_container_input",
+                    "path": "/OCI/Linux/Resources/Devices",
+                }
+            ],
+            "schema_version": 1,
+        }
+
+        result = coverage.request_absence_coverage(observed, inventory)
+
+        self.assertEqual(result["observed"], 2)
+        self.assertEqual(result["covered"], 1)
+        self.assertEqual(result["uncovered"], 1)
+        self.assertEqual(result["entries"][1]["status"], "uncovered")
+
+    def test_runtime_absence_inventory_rejects_duplicate_rules(self):
+        observed = [
+            {
+                "evidence": "sandbox.json",
+                "path": "/OCI/Linux/Seccomp",
+                "subject": "sandbox/default/demo",
+            }
+        ]
+        rule = {
+            "category": "runtime-rs",
+            "evidence": "rules.rego",
+            "path": "/OCI/Linux/Seccomp",
+        }
+
+        with self.assertRaisesRegex(coverage.CoverageError, "multiple runtime absence"):
+            coverage.request_absence_coverage(
+                observed, {"rules": [rule, rule], "schema_version": 1}
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

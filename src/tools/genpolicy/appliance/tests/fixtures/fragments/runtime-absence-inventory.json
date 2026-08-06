@@ -1,0 +1,10 @@
+{
+  "rules": [
+    {
+      "category": "runtime-rs",
+      "evidence": "src/tools/genpolicy/rules.rego: allow_create_container_input",
+      "path": "/OCI/Linux/Resources/Devices"
+    }
+  ],
+  "schema_version": 1
+}

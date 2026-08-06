@@ -144,6 +144,97 @@ def canonical_claim_value(path: str, value):
     return value
 
 
+def request_policy_path(path: str) -> str:
+    names = {
+        "devices": "Devices",
+        "linux": "Linux",
+        "resources": "Resources",
+        "seccomp": "Seccomp",
+    }
+    tokens = composition.pointer_tokens(path)
+    return "/OCI/" + "/".join(names.get(token, token) for token in tokens)
+
+
+def request_subjects(capture: Path, static_ir: dict) -> dict[str, str]:
+    sandboxes = [
+        subject["subject"]
+        for subject in static_ir["subjects"]
+        if subject["subject"].startswith("sandbox/")
+    ]
+    result = {}
+    for path in (capture / "createcontainer-requests").glob("*.json"):
+        request = json.loads(path.read_text(encoding="utf-8"))
+        annotations = (request.get("oci") or {}).get("annotations") or {}
+        if annotations.get("io.kubernetes.cri.container-type") == "container":
+            subject = f"container/{annotations.get('io.kubernetes.cri.container-name', '')}"
+        elif len(sandboxes) == 1:
+            subject = sandboxes[0]
+        else:
+            continue
+        result[path.name] = subject
+    return result
+
+
+def observed_request_absences(capture: Path, static_ir: dict) -> list[dict]:
+    transformations, _ = static_policy.request_provenance.analyze(capture)
+    subjects = request_subjects(capture, static_ir)
+    result = []
+    for request in transformations["requests"]:
+        subject = subjects.get(request["identity"]["file"])
+        if subject is None:
+            continue
+        for change in request["changes"]:
+            if change["change"] == "removed" and change["path"].startswith("/linux/"):
+                result.append(
+                    {
+                        "evidence": request["identity"]["file"],
+                        "path": request_policy_path(change["path"]),
+                        "subject": subject,
+                    }
+                )
+    return result
+
+
+def request_absence_coverage(observed: list[dict], inventory: dict | None) -> dict:
+    if inventory is None:
+        rules = []
+        inventory_status = "missing"
+    else:
+        if inventory.get("schema_version") != 1 or not isinstance(
+            inventory.get("rules"), list
+        ):
+            raise CoverageError("invalid runtime absence inventory")
+        rules = inventory["rules"]
+        inventory_status = "loaded"
+    entries = []
+    for absence in observed:
+        matches = [
+            rule
+            for rule in rules
+            if rule.get("path") == absence["path"]
+            and (
+                rule.get("subject") in (None, absence["subject"])
+                or absence["subject"].startswith(rule.get("subject_prefix", "\0"))
+            )
+        ]
+        if len(matches) > 1:
+            raise CoverageError(
+                f"multiple runtime absence rules cover {absence['subject']} {absence['path']}"
+            )
+        entry = {**absence, "status": "covered" if matches else "uncovered"}
+        if matches:
+            entry["category"] = matches[0]["category"]
+            entry["rule_evidence"] = matches[0]["evidence"]
+        entries.append(entry)
+    return {
+        "covered": sum(entry["status"] == "covered" for entry in entries),
+        "entries": entries,
+        "inventory": inventory_status,
+        "observed": len(entries),
+        "uncovered": sum(entry["status"] == "uncovered" for entry in entries),
+    }
+
+
 def report_sources(source_report: dict, static_ir: dict) -> dict[str, dict[str, str]]:
     static_sandboxes = [
         subject["subject"]
@@ -299,12 +390,21 @@ def main() -> None:
     parser.add_argument("--uvm-baseline", required=True, type=Path)
     parser.add_argument("--compiler-policy", required=True, type=Path)
     parser.add_argument("--source-report", required=True, type=Path)
+    parser.add_argument("--absence-inventory", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     static_ir = static_policy.generate_static_ir(args.capture, args.uvm_baseline)
     expected = static_policy.policy_data(args.compiler_policy)
     source_report = json.loads(args.source_report.read_text(encoding="utf-8"))
     report = derive_candidate_coverage(static_ir, expected, source_report)
+    inventory = (
+        json.loads(args.absence_inventory.read_text(encoding="utf-8"))
+        if args.absence_inventory is not None
+        else None
+    )
+    report["request_absence_coverage"] = request_absence_coverage(
+        observed_request_absences(args.capture, static_ir), inventory
+    )
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
