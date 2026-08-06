@@ -91,18 +91,16 @@ authoritative interception point for final create and live exec requests.
   shim uses a dry-run hypervisor and recording Agent, so no guest VM is booted
   and no hardware virtualization is required.
 
-### EROFS dm-verity rootfs capture (experimental, opt-in)
+### EROFS dm-verity rootfs capture
 
-Set `GENPOLICY_BUILD_EROFS_DMVERITY=1` to have the appliance **generate** the
-erofs / dm-verity rootfs storages in-place from the digest-pinned images in the
-workload YAML. A bundled containerd (≥ 2.2) erofs snapshotter+differ pulls each
-image and produces the real dm-verity root hashes, which feed `--rootfs-mounts`
-to the storage predictor and `createreq-capture` (surfaced as
-`X-kata.dmverity.roothash`). The guest-pull manifest digest is recorded in
-`manifest-digests.json` in both modes (it is the guest-pull analog of the
-dm-verity root hash). The userspace tooling (containerd ≥ 2.2, `mkfs.erofs`
-≥ 1.8.2, `cryptsetup`) is **bundled in the image**; only the **kernel features**
-below must be provided by the host whose kernel the disposable VM shares:
+Select `PROFILE=k8s-1.33-containerd-2.3-erofs-dmverity` to run the main capture
+containerd with its built-in EROFS differ, snapshotter, and mount manager in
+strict `dmverity_mode = "on"`. The runtime-rs capture shim receives those real
+rootfs mounts and `RecordingAgent` records the resulting
+`X-kata.dmverity.*` storage options. No per-image containerd, copied layer blob,
+synthetic mount array, or storage-predictor result contributes to policy input.
+The userspace tooling is bundled in the profile image; only the kernel features
+below must be provided by the host whose kernel the container shares:
 
 The policy compiler requires one captured `CreateContainerRequest` for every
 container. Its final shim-derived OCI, storages, devices, rewritten mounts, and
@@ -126,11 +124,9 @@ The bundled userspace tooling (for reference; no host install needed):
 
 Verified working on kernel `6.18` (WSL2): `erofs` present in
 `/proc/filesystems` and the `dm-verity` device-mapper target reports `v1.13.0`.
-If the kernel lacks `erofs` or `dm-verity`, this capture stage cannot run; the
-rest of the pipeline (guest-pull rootfs, ConfigMap/Secret, block volumes) is
-unaffected. `GENPOLICY_BUILD_EROFS_DMVERITY` is mutually exclusive with a
-guest-pull deployment (`GENPOLICY_GUEST_PULL=1`), which records the manifest
-digest only.
+If the kernel lacks `erofs` or `dm-verity`, this profile cannot run. Use the
+guest-pull profile instead; rootfs modes are separate exact profiles rather than
+runtime feature flags.
 
 Run static and unit validation:
 

@@ -181,42 +181,13 @@ guests use `virtio-scsi` (QEMU) or `virtio-blk-pci` (CLH/dragonball); the
 enforced policy wildcards the address via the base64url device id, so the
 synthetic value only needs a valid shape.
 
-The **capture stage** that produces the artifact is `capture_rootfs_mounts.py`:
+For focused diagnostics, callers may supply a rootfs mount artifact directly to
+`--rootfs-mounts`. This exercises the same handler without a VM, but it is not a
+capture input and never contributes to policy. The authoritative appliance path
+uses containerd's real EROFS snapshotter and mount manager, then records the
+final Agent storages through `RecordingAgent`.
 
-1. **Prepare (out-of-band, prep host)** — pull the workload image by the digest
-   pinned in the YAML with the erofs snapshotter, which converts each layer into
-   an on-disk EROFS blob at `<root>/io.containerd.snapshotter.v1.erofs/snapshots/<N>/layer.erofs`:
-
-   ```
-   ctr images pull --snapshotter erofs <image>@<digest>
-   ```
-
-   Verified against containerd 2.3.3: `ctr snapshots --snapshotter erofs mounts`
-   returns the **host** view — a single `overlay` mount (upperdir = the writable
-   `fs`, lowerdir = the mount-manager-mounted erofs blob) — **not** the block
-   mounts the guest sees. The block-device rootfs (`ext4` rw upper + `erofs` ro
-   lower(s) with `device=`) that `ErofsMultiLayerRootfs` consumes is produced by
-   the containerd erofs **mount-handler** when containerd hands the rootfs to the
-   Kata shim. So the authoritative mounts are captured from a **Kata-runtime run**
-   on the prep host (the mounts the shim receives), written per image as
-   `<digest>.mounts` (mount-command text) or `<digest>.json` (containerd mount
-   dicts). This preparation needs containerd ≥ 2.2, the erofs snapshotter/differ,
-   `erofs-utils`, and the `erofs` kernel module.
-2. **Convert (in-appliance)** — point `GENPOLICY_ROOTFS_MOUNTS_DIR` at that
-   directory. `capture_rootfs_mounts.py` maps each captured container (via its
-   `io.kubernetes.cri.image-name` digest) to its mounts file, converts the block
-   mounts to `kata_types::mount::Mount` (preserving `device=` and
-   `X-containerd.mkdir.path` options, deriving `read_only` from `ro`), and writes
-   `raw/<name>.rootfs-mounts.json`. The conversion is unit-tested in
-   `tests/test_capture_rootfs_mounts.py`.
-3. **Predict** — `predict_storages.py` auto-detects `raw/<name>.rootfs-mounts.json`
-   next to the OCI bundle and passes it to `--rootfs-mounts`; the predicted rootfs
-   lands under the `rootfs` key. A `rootfs-mounts-captured.json` report and the
-   per-container artifacts are recorded in provenance. The predictor was validated
-   against a **real** `layer.erofs` blob produced by the containerd erofs
-   snapshotter: the `erofs` lower resolves to `/dev/vdb` and the `ext4` upper to
-   `/dev/vda`, no VM.
-4. **Integrity (dm-verity)** — this branch tracks upstream `erofs_rootfs.rs` +
+For **integrity diagnostics**, this branch tracks upstream `erofs_rootfs.rs` +
    `kata-types::gpt_disk`, so the predictor emits the erofs **dm-verity root hash**
    through the real handler. When the captured `rootfs_mounts` has **more than one**
    erofs layer (GPT+VMDK mode) and each erofs layer carries an

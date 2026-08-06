@@ -305,10 +305,24 @@ and the required kernel, loop, and device-mapper support.
 Use strict `dmverity_mode = "on"`. Do not use `auto`, because stale layers
 without dm-verity metadata could otherwise be accepted silently.
 
-### Remove after equivalence validation
+### Synthetic-path equivalence validation
 
-Delete the current synthetic preparation path after the real capture path has
-been compared successfully:
+The transition comparison used the same digest-pinned busybox manifest
+`sha256:c0aae9d756395ade52df06b55e160e6e32d2ecfe0181ed2c14c68effc5e3fe45`
+with containerd 2.3.3 and identical deterministic `mkfs.erofs` options. Both
+paths produced one lower layer in base-to-top order with:
+
+```text
+roothash=5cca62ebb3022c076db159f46431755bbd315afc5136b82231a91dae998789a9
+hashoffset=4472832
+```
+
+The old path represented only the protected EROFS lower and its host metadata
+path. The real capture additionally records the ext4 upper block storage,
+runtime device sources, overlay upper/lower markers, multi-layer marker, and
+guest mkdir hints. Thus the integrity pins are equivalent and the real final
+Agent request is semantically more complete. The following synthetic components
+were removed after this validation:
 
 - disposable per-image containerd instances;
 - private snapshot-directory enumeration;
@@ -319,8 +333,7 @@ been compared successfully:
 - storage-predictor-derived policy hashes;
 - obsolete portions of `prepare_erofs_dmverity.py`.
 
-The transition test must compare layer count, base-to-top ordering, root hashes,
-hash offsets, and final Agent storage semantics for the old and new paths.
+The real captured Agent storages remain the sole policy hash source.
 
 ## Capture Image Contents
 
@@ -570,7 +583,7 @@ Agent client, rules, or policy settings.
 - [x] Route the Kata CRI handler through the EROFS snapshotter.
 - [x] Capture real rootfs mounts in the runtime-rs capture shim.
 - [x] Assert final Agent requests contain ordered dm-verity storage options.
-- [ ] Compare old and new hash arrays and storage semantics.
+- [x] Compare old and new hash arrays and storage semantics.
 - [x] Make captured Agent storages the sole policy hash source.
 
 Acceptance criteria: the EROFS profile authorizes its own captured create and
@@ -578,7 +591,7 @@ exec requests, and no synthetic mount reconstruction contributes to policy.
 
 ### Phase 4: Remove redundant components
 
-- [ ] Delete synthetic EROFS discovery and mount assembly.
+- [x] Delete synthetic EROFS discovery and mount assembly.
 - [x] Move storage predictor to diagnostics.
 - [x] Move Legacy GenPolicy to an optional runner that consumes its native YAML
    and configuration inputs.
@@ -613,7 +626,7 @@ The simplification is complete when:
 - containerd supplies real EROFS dm-verity rootfs metadata and mounts;
 - final Agent requests are the only authoritative policy inputs;
 - `balanced-policy` is the default request-derived compilation mode;
-- native and EROFS profiles pass policy-only Agent replay when that optional
+- guest-pull and EROFS profiles pass policy-only Agent replay when that optional
    validation is enabled;
 - Legacy GenPolicy comparison uses its native YAML and configuration inputs;
 - each profile reports section-aware request transformations and profiles can

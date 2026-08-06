@@ -11,7 +11,7 @@ trap 'rm -rf "${pycache_dir}"' EXIT
 export PYTHONPYCACHEPREFIX="${pycache_dir}"
 
 # shellcheck source=/dev/null
-source "${appliance_dir}/profile.env"
+source "${appliance_dir}/profiles/k8s-1.33-containerd-2.3-guest-pull.env"
 
 python3 -m compileall -q "${appliance_dir}/scripts" "${appliance_dir}/tests"
 python3 -m unittest discover -s "${appliance_dir}/tests" -p 'test_*.py'

@@ -60,19 +60,15 @@ The predictor and compiler are pure transforms over the captured OCI bundle and
 the workload YAML, but two paths carry **external tooling / configuration
 dependencies** — deployment prerequisites, *not* policy gaps:
 
-- **erofs / single-layer block rootfs capture.** Producing the `rootfs_mounts`
-  artifact needs an **out-of-band prep-host stage**: containerd ≥ 2.2 with the
-  erofs snapshotter/differ, `erofs-utils`, and the `erofs` (plus, for integrity,
-  `dm-verity`) kernel modules, and a kata-runtime run to obtain the block mounts
-  the shim receives (see [Rootfs prediction](DESIGN.md#rootfs-prediction-design)). The prediction itself then runs
-  no-VM, and `ErofsMultiLayerRootfs::new` stats each erofs source file, so those
-  blob paths must exist when the predictor runs. **Guest-pull rootfs needs none
-  of this.**
+- **erofs / single-layer block rootfs diagnostics.** `--rootfs-mounts` accepts
+  an explicitly supplied Kata mount artifact for focused handler tests and
+  diagnostics. The authoritative appliance EROFS path does not generate or
+  consume this artifact; it records the final request produced from the real
+  containerd snapshotter mounts.
 - **Kata-CC configuration.** `emptydir_mode` and the hypervisor `blockdev_info`
   are sourced from the deployment's `configuration.toml` via `--kata-config`
   (`GENPOLICY_KATA_CONFIG`), loaded raw (no hypervisor-binary validation);
-  otherwise they fall back to `profile.env` / `--block-driver`
-  (`GENPOLICY_BLOCK_DRIVER`). The synthesized guest device address
+  otherwise they fall back to `--block-driver`. The synthesized guest device address
   (`pci_path` / `scsi_addr` / `ccw_addr`) only needs a valid *shape* — the policy
   wildcards it via the base64url device id.
 
@@ -164,8 +160,8 @@ digest-anchored images.
 
 For the mainstream CoCo rootfs (guest pull), the predictor reuses the shim's own
 `adjust_rootfs_mounts` to synthesize the guest-pull `KataVirtualVolume` and runs
-it through the real `handler_rootfs` with no `ShareFs` (`--guest-pull-rootfs`; in
-the appliance `GENPOLICY_GUEST_PULL=1`). The resulting `image_guest_pull`
+it through the real `handler_rootfs` with no `ShareFs` (`--guest-pull-rootfs`;
+the appliance selects this through the guest-pull profile). The resulting `image_guest_pull`
 `Storage` carries `source` = the image reference from
 `io.kubernetes.cri.image-name` (digest-pinned, per above). The compiler collects
 each container's reference into its synthetic `guest-pull-images` marker, and

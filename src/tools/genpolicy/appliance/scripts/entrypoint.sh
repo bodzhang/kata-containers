@@ -319,15 +319,11 @@ if [[ "${GENPOLICY_CAPTURE_BACKEND:-runtime-rs}" == "runc" ]]; then
 		meta="${spec%.config.json}.meta.json"
 		cid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["container_id"])' "${meta}")"
 		bundle="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("bundle",""))' "${meta}")"
-		rootfs_mounts_arg=()
-		[[ -f "${output_dir}/raw/${name}.rootfs-mounts.json" ]] &&
-			rootfs_mounts_arg=(--rootfs-mounts "${output_dir}/raw/${name}.rootfs-mounts.json")
 		/usr/local/bin/createreq-capture \
 			--container-id "${cid}" \
 			--bundle "${bundle:-/tmp/${cid}}" \
 			--spec "${spec}" \
 			--kata-config "${GENPOLICY_KATA_CONFIG}" \
-			"${rootfs_mounts_arg[@]}" \
 			"${direct_vol_arg[@]}" \
 			--output "${output_dir}/createcontainer-requests/${name}.json" \
 			2>>"${output_dir}/logs/createreq-capture.log" ||
@@ -533,11 +529,6 @@ provenance_generated=(
 if [[ -f "${output_dir}/storages-devices-predicted.json" ]]; then
 	provenance_generated+=(
 		--generated "storages-devices-predicted.json=${output_dir}/storages-devices-predicted.json"
-	)
-fi
-if [[ -f "${output_dir}/rootfs-mounts-captured.json" ]]; then
-	provenance_generated+=(
-		--generated "rootfs-mounts-captured.json=${output_dir}/rootfs-mounts-captured.json"
 	)
 fi
 if [[ "${GENPOLICY_BALANCED:-0}" == "1" ]]; then
