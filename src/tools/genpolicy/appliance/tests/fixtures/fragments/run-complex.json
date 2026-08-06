@@ -1,0 +1,62 @@
+[
+  {
+    "category": "containerd-oci",
+    "claims": [
+      {
+        "operation": "default",
+        "target": {
+          "subject": "container/sidecar",
+          "path": "/OCI/Version"
+        },
+        "value": "1.1.0"
+      },
+      {
+        "operation": "default",
+        "target": {
+          "subject": "container/workload",
+          "path": "/OCI/Version"
+        },
+        "value": "1.1.0"
+      },
+      {
+        "operation": "default",
+        "target": {
+          "subject": "sandbox/default/balanced-mode",
+          "path": "/OCI/Version"
+        },
+        "value": "1.1.0"
+      }
+    ],
+    "schema_version": 1
+  },
+  {
+    "category": "runtime-rs",
+    "claims": [
+      {
+        "operation": "rewrite",
+        "target": {
+          "subject": "container/sidecar",
+          "path": "/OCI/Root/Path"
+        },
+        "value": "$(root_path)"
+      },
+      {
+        "operation": "rewrite",
+        "target": {
+          "subject": "container/workload",
+          "path": "/OCI/Root/Path"
+        },
+        "value": "$(root_path)"
+      },
+      {
+        "operation": "rewrite",
+        "target": {
+          "subject": "sandbox/default/balanced-mode",
+          "path": "/OCI/Root/Path"
+        },
+        "value": "$(root_path)"
+      }
+    ],
+    "schema_version": 1
+  }
+]

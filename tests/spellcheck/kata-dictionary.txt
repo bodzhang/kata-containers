@@ -21,6 +21,7 @@ virtcontainers
 # Open source projects
 bootc
 distroless
+hcsshim
 materialx
 ostree
 Regorus
@@ -108,6 +109,7 @@ vmservice
 vsock
 
 # Security & Encryption
+COSE
 LUKS
 ocicrypt
 
@@ -120,6 +122,8 @@ crio
 nerdctl
 crictl
 dockershim
+Rego
+tmpfs
 dentries
 hexdump
 hypercalls

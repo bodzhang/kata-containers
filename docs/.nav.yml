@@ -25,4 +25,5 @@ nav:
       - Documentation: doc-contributing.md
   - Misc:
     - Architecture: design/architecture_4.0/architecture.md
+    - GenPolicy Rego Fragments: design/genpolicy-fragment-rego.md
     - Config Migration (runtime to runtime-rs): migrating-config-go-runtime-to-runtime-rs.md
