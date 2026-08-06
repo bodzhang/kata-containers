@@ -162,6 +162,7 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
         inventory = {
             "rules": [
                 {
+                    "all_subjects": True,
                     "category": "runtime-rs",
                     "evidence": "rules.rego: allow_create_container_input",
                     "path": "/OCI/Linux/Resources/Devices",
@@ -186,6 +187,7 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
             }
         ]
         rule = {
+            "all_subjects": True,
             "category": "runtime-rs",
             "evidence": "rules.rego",
             "path": "/OCI/Linux/Seccomp",
@@ -194,6 +196,32 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
         with self.assertRaisesRegex(coverage.CoverageError, "multiple runtime absence"):
             coverage.request_absence_coverage(
                 observed, {"rules": [rule, rule], "schema_version": 1}
+            )
+
+    def test_runtime_absence_rule_requires_explicit_scope(self):
+        rule = {
+            "category": "runtime-rs",
+            "evidence": "rules.rego",
+            "path": "/OCI/Linux/Seccomp",
+        }
+
+        with self.assertRaisesRegex(coverage.CoverageError, "exactly one subject scope"):
+            coverage.request_absence_coverage(
+                [], {"rules": [rule], "schema_version": 1}
+            )
+
+    def test_runtime_absence_rule_rejects_multiple_scopes(self):
+        rule = {
+            "all_subjects": True,
+            "category": "runtime-rs",
+            "evidence": "rules.rego",
+            "path": "/OCI/Linux/Seccomp",
+            "subject": "sandbox/default/demo",
+        }
+
+        with self.assertRaisesRegex(coverage.CoverageError, "exactly one subject scope"):
+            coverage.request_absence_coverage(
+                [], {"rules": [rule], "schema_version": 1}
             )
 
     def test_final_report_fails_closed_on_coverage_gaps(self):

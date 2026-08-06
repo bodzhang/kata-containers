@@ -207,6 +207,23 @@ def request_absence_coverage(observed: list[dict], inventory: dict | None) -> di
         ):
             raise CoverageError("invalid runtime absence inventory")
         rules = inventory["rules"]
+        for rule in rules:
+            if not isinstance(rule, dict):
+                raise CoverageError("runtime absence rule must be an object")
+            if not all(
+                isinstance(rule.get(field), str) and rule[field]
+                for field in ("category", "evidence", "path")
+            ):
+                raise CoverageError("runtime absence rule requires category, evidence, and path")
+            composition.pointer_tokens(rule["path"])
+            scopes = [
+                rule.get("all_subjects") is True,
+                isinstance(rule.get("subject"), str) and bool(rule["subject"]),
+                isinstance(rule.get("subject_prefix"), str)
+                and bool(rule["subject_prefix"]),
+            ]
+            if sum(scopes) != 1:
+                raise CoverageError("runtime absence rule requires exactly one subject scope")
         inventory_status = "loaded"
     entries = []
     for absence in observed:
@@ -215,7 +232,8 @@ def request_absence_coverage(observed: list[dict], inventory: dict | None) -> di
             for rule in rules
             if rule.get("path") == absence["path"]
             and (
-                rule.get("subject") in (None, absence["subject"])
+                rule.get("all_subjects") is True
+                or rule.get("subject") == absence["subject"]
                 or absence["subject"].startswith(rule.get("subject_prefix", "\0"))
             )
         ]
