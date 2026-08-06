@@ -2,8 +2,10 @@
 
 import argparse
 import copy
+import hashlib
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 
@@ -235,7 +237,40 @@ def request_absence_coverage(observed: list[dict], inventory: dict | None) -> di
     }
 
 
-def finalize_report(report: dict, absence_coverage: dict) -> dict:
+def bind_profile(report: dict, static_ir: dict, profile: dict) -> dict:
+    identity = profile.get("identity")
+    if not isinstance(identity, str) or re.fullmatch(r"[0-9a-f]{64}", identity) is None:
+        raise CoverageError("capture profile requires a sha256 identity")
+    static_base_digest = "sha256:" + hashlib.sha256(
+        json.dumps(static_ir, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    uvm_artifacts = sorted(
+        {
+            subject["static_artifact"]
+            for subject in static_ir["subjects"]
+            if "static_artifact" in subject
+        }
+    )
+    profile_uvm_digest = (profile.get("values") or {}).get("UVM_IMAGE_DIGEST")
+    if profile_uvm_digest and not str(profile_uvm_digest).startswith("sha256:"):
+        profile_uvm_digest = f"sha256:{profile_uvm_digest}"
+    binding = {
+        "profile_identity": identity,
+        "profile_uvm_digest": profile_uvm_digest,
+        "static_base_digest": static_base_digest,
+        "uvm_artifacts": uvm_artifacts,
+        "uvm_bound": bool(uvm_artifacts) and profile_uvm_digest in uvm_artifacts,
+    }
+    report["binding"] = binding
+    for fragment in report["fragments"]:
+        fragment["profile_identity"] = identity
+        fragment["static_base_digest"] = static_base_digest
+    return report
+
+
+def finalize_report(
+    report: dict, absence_coverage: dict, binding: dict | None = None
+) -> dict:
     report["request_absence_coverage"] = absence_coverage
     blockers = []
     ambiguous = report["coverage"]["ambiguous_boundary_claims"]
@@ -247,6 +282,8 @@ def finalize_report(report: dict, absence_coverage: dict) -> dict:
         blockers.append(
             f"{absence_coverage['uncovered']} observed runtime absences are uncovered"
         )
+    if binding is None or not binding.get("uvm_bound"):
+        blockers.append("capture profile does not bind the measured UVM artifact")
     report["blockers"] = blockers
     report["result"] = "pass" if not blockers else "incomplete"
     return report
@@ -415,6 +452,8 @@ def main() -> None:
     expected = static_policy.policy_data(args.compiler_policy)
     source_report = json.loads(args.source_report.read_text(encoding="utf-8"))
     report = derive_candidate_coverage(static_ir, expected, source_report)
+    profile = json.loads((args.capture / "profile.json").read_text(encoding="utf-8"))
+    report = bind_profile(report, static_ir, profile)
     inventory = (
         json.loads(args.absence_inventory.read_text(encoding="utf-8"))
         if args.absence_inventory is not None
@@ -425,6 +464,7 @@ def main() -> None:
         request_absence_coverage(
             observed_request_absences(args.capture, static_ir), inventory
         ),
+        report["binding"],
     )
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if report["result"] != "pass" and not args.allow_incomplete:

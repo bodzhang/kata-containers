@@ -199,10 +199,10 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
             "uncovered": 1,
         }
 
-        result = coverage.finalize_report(report, absences)
+        result = coverage.finalize_report(report, absences, {"uvm_bound": False})
 
         self.assertEqual(result["result"], "incomplete")
-        self.assertEqual(len(result["blockers"]), 2)
+        self.assertEqual(len(result["blockers"]), 3)
 
     def test_final_report_passes_complete_evidence(self):
         report = {"coverage": {"ambiguous_boundary_claims": 0}}
@@ -211,10 +211,38 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
             "uncovered": 0,
         }
 
-        result = coverage.finalize_report(report, absences)
+        result = coverage.finalize_report(report, absences, {"uvm_bound": True})
 
         self.assertEqual(result["result"], "pass")
         self.assertEqual(result["blockers"], [])
+
+    def test_binds_fragments_to_profile_and_static_base(self):
+        static_ir = self.static_ir()
+        static_ir["subjects"][1]["static_artifact"] = f"sha256:{'a' * 64}"
+        report = coverage.derive_candidate_coverage(
+            static_ir, self.expected_policy(), self.source_report()
+        )
+        profile = {
+            "identity": "b" * 64,
+            "values": {"UVM_IMAGE_DIGEST": "a" * 64},
+        }
+
+        result = coverage.bind_profile(report, static_ir, profile)
+
+        self.assertTrue(result["binding"]["uvm_bound"])
+        self.assertRegex(result["binding"]["static_base_digest"], r"^sha256:[0-9a-f]{64}$")
+        for fragment in result["fragments"]:
+            self.assertEqual(fragment["profile_identity"], "b" * 64)
+            self.assertEqual(
+                fragment["static_base_digest"],
+                result["binding"]["static_base_digest"],
+            )
+
+    def test_rejects_invalid_profile_identity(self):
+        report = {"fragments": []}
+
+        with self.assertRaisesRegex(coverage.CoverageError, "sha256 identity"):
+            coverage.bind_profile(report, self.static_ir(), {"identity": "profile-name"})
 
 
 if __name__ == "__main__":
