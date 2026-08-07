@@ -405,6 +405,20 @@ Legacy GenPolicy. The fixtures explicitly declare the synthetic image's
 supplementary group so Legacy guest-pull generation remains fail-closed rather
 than relying on host-side image-layer group discovery at deployment time.
 
+Run the matrix with the Kubernetes `v1.36.3` profile and keep its artifacts
+separate from the Kubernetes `v1.33.13` baseline:
+
+```bash
+make PROFILE=k8s-1.36-containerd-2.3-guest-pull \
+  POLICY_MATRIX_OUTPUT="$PWD/../../../../target/genpolicy-policy-matrix-k8s-1.36" \
+  policy-matrix
+```
+
+This is a one-factor Kubernetes comparison: containerd and all other profile
+dimensions remain fixed. The profile includes the same OCI `1.3.0` Legacy
+settings patch as the 1.33 baseline, matching the OCI version observed in both
+captured request sets.
+
 Run the same matrix with the containerd 1.7 compatibility profile and keep its
 artifacts separate from the default containerd 2.3 run:
 
