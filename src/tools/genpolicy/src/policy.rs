@@ -127,6 +127,10 @@ pub struct KataProcess {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub Env: Vec<String>,
 
+    /// EnvRegex allows captured dynamic environment values for this container only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub EnvRegex: Vec<String>,
+
     /// Cwd is the current working directory for the process and must be
     /// relative to the container's root.
     #[serde(default, skip_serializing_if = "String::is_empty")]

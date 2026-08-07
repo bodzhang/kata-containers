@@ -75,6 +75,12 @@ class TagOciTests(unittest.TestCase):
                 "KUBERNETES_SERVICE_HOST=10.96.0.1-attacker",
             )
         )
+        self.assertIsNone(
+            re.search(
+                host_regex,
+                "KUBERNETES_SERVICE_HOST=999.999.999.999",
+            )
+        )
 
         MODULE.replace_string(
             "KUBERNETES_PORT=tcp://10.96.0.1:443",
@@ -134,7 +140,12 @@ class TagOciTests(unittest.TestCase):
             named_port,
             f"BACKEND_SERVICE_PORT_HTTPS={MODULE.marker(port_tag)}",
         )
-        self.assertEqual(definitions[port_tag]["suggested_regex"], "[0-9]{1,5}")
+        port_regex = "^" + definitions[port_tag]["suggested_regex"] + "$"
+        self.assertIsNotNone(re.search(port_regex, "1"))
+        self.assertIsNotNone(re.search(port_regex, "65535"))
+        self.assertIsNone(re.search(port_regex, "0"))
+        self.assertIsNone(re.search(port_regex, "65536"))
+        self.assertIsNone(re.search(port_regex, "99999"))
 
     def test_main_writes_tagged_request_and_request_rooted_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:

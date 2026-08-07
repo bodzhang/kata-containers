@@ -1039,6 +1039,12 @@ allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
     print("allow_var 1: true")
 }
 
+allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
+    some p_regex in object.get(p_process, "EnvRegex", [])
+    regex.match(p_regex, i_var)
+    print("allow_var container regex: true")
+}
+
 # Match input with one of the policy variables, after substituting $(sandbox-name).
 allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
     some p_var in p_process.Env

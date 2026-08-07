@@ -19,9 +19,14 @@ NETWORK_NAMESPACE = re.compile(
     r"^/var/run/netns/cni-[0-9a-f]{8}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+IPV4_OCTET_REGEX = "(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
 IP_REGEX = (
-    "(?:(?:[0-9]{1,3}\\.){3}[0-9]{1,3}|"
+    f"(?:(?:{IPV4_OCTET_REGEX}\\.){{3}}{IPV4_OCTET_REGEX}|"
     "(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4})"
+)
+PORT_REGEX = (
+    "(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|"
+    "[1-5][0-9]{4}|[1-9][0-9]{0,3})"
 )
 
 
@@ -150,17 +155,17 @@ def replace_string(
             or "_SERVICE_PORT_" in variable
             or re.search(r"_PORT_[0-9]+_[A-Z]+_PORT$", variable)
         ):
-            suggested_regex = "[0-9]{1,5}"
+            suggested_regex = PORT_REGEX
         elif variable.endswith("_PROTO"):
             suggested_regex = "(?:tcp|udp|sctp)"
         elif variable.endswith("_PORT") or re.search(
             r"_PORT_[0-9]+_[A-Z]+$", variable
         ):
             suggested_regex = (
-                f"(?:tcp|udp|sctp)://(?:{IP_REGEX}):[0-9]{{1,5}}"
+                f"(?:tcp|udp|sctp)://(?:{IP_REGEX}):{PORT_REGEX}"
             )
         else:
-            suggested_regex = ".+"
+            raise ValueError(f"unsupported Kubernetes Service environment variable: {variable}")
         updated = f"{variable}={marker(tag)}"
         definitions[tag] = {
             "marker": marker(tag),

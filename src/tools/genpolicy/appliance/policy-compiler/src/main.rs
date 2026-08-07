@@ -573,11 +573,10 @@ fn marker_pattern(value: &str, regexes: &BTreeMap<String, String>) -> Result<Str
             .ok_or_else(|| anyhow!("unterminated dynamic marker in {value}"))?
             + 2;
         let marker = &suffix[..end];
-        result.push_str(
-            regexes
-                .get(marker)
-                .ok_or_else(|| anyhow!("no regex for dynamic marker {marker}"))?,
-        );
+        let pattern = regexes
+            .get(marker)
+            .ok_or_else(|| anyhow!("no regex for dynamic marker {marker}"))?;
+        result.push_str(&format!("(?:{pattern})"));
         remaining = &suffix[end..];
     }
     result.push_str(&escape(remaining));
@@ -605,7 +604,7 @@ fn sandbox_log_directory_pattern(
         .get(POD_UID_MARKER)
         .ok_or_else(|| anyhow!("no regex for dynamic marker {POD_UID_MARKER}"))?;
     Ok(format!(
-        "^/var/log/pods/$(sandbox-namespace)_$(sandbox-name)_{pod_uid_regex}$"
+        "^/var/log/pods/$(sandbox-namespace)_$(sandbox-name)_(?:{pod_uid_regex})$"
     ))
 }
 
@@ -645,31 +644,29 @@ fn compile_env(
 fn captured_process(
     process: &CapturedProcess,
     regexes: &BTreeMap<String, String>,
-) -> Result<(KataProcess, Vec<String>)> {
+) -> Result<KataProcess> {
     let (env, allow_regex) = compile_env(&process.env, regexes)?;
-    Ok((
-        KataProcess {
-            Terminal: process.terminal,
-            User: KataUser {
-                UID: process.user.uid,
-                GID: process.user.gid,
-                AdditionalGids: process.user.additional_gids.clone(),
-                Username: process.user.username.clone(),
-            },
-            Args: process.args.clone(),
-            Env: env,
-            Cwd: process.cwd.clone(),
-            Capabilities: KataLinuxCapabilities {
-                Ambient: process.capabilities.ambient.clone(),
-                Bounding: process.capabilities.bounding.clone(),
-                Effective: process.capabilities.effective.clone(),
-                Inheritable: process.capabilities.inheritable.clone(),
-                Permitted: process.capabilities.permitted.clone(),
-            },
-            NoNewPrivileges: process.no_new_privileges,
+    Ok(KataProcess {
+        Terminal: process.terminal,
+        User: KataUser {
+            UID: process.user.uid,
+            GID: process.user.gid,
+            AdditionalGids: process.user.additional_gids.clone(),
+            Username: process.user.username.clone(),
         },
-        allow_regex,
-    ))
+        Args: process.args.clone(),
+        Env: env,
+        EnvRegex: allow_regex,
+        Cwd: process.cwd.clone(),
+        Capabilities: KataLinuxCapabilities {
+            Ambient: process.capabilities.ambient.clone(),
+            Bounding: process.capabilities.bounding.clone(),
+            Effective: process.capabilities.effective.clone(),
+            Inheritable: process.capabilities.inheritable.clone(),
+            Permitted: process.capabilities.permitted.clone(),
+        },
+        NoNewPrivileges: process.no_new_privileges,
+    })
 }
 
 fn sandbox_process(settings: &Settings, capture: &CapturedSpec) -> KataProcess {
@@ -840,7 +837,6 @@ fn compile_container(
     capture: &CapturedSpec,
     settings: &Settings,
     regexes: &BTreeMap<String, String>,
-    allow_env_regex: &mut Vec<String>,
     exec_commands: Vec<Vec<String>>,
     sandbox_name_pattern: Option<&str>,
     volume_device_paths: &[String],
@@ -860,13 +856,7 @@ fn compile_container(
             "settings-kata-sandbox-normalization",
         )
     } else {
-        let (process, dynamic_regex) = captured_process(&capture.process, regexes)?;
-        for value in dynamic_regex {
-            if !allow_env_regex.contains(&value) {
-                allow_env_regex.push(value);
-            }
-        }
-        (process, "captured-oci")
+        (captured_process(&capture.process, regexes)?, "captured-oci")
     };
 
     let annotations = compile_annotations(capture, template, regexes, sandbox_name_pattern)?;
@@ -1062,23 +1052,6 @@ fn safe_termination_message_path(capture: &CapturedSpec) -> Result<String> {
     Ok("^/dev/termination\\-log$".to_string())
 }
 
-fn append_allow_env_regex(request_defaults: &mut Value, values: &[String]) -> Result<()> {
-    let target = request_defaults
-        .get_mut("CreateContainerRequest")
-        .and_then(|value| value.get_mut("allow_env_regex"))
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| anyhow!("settings have no CreateContainerRequest.allow_env_regex"))?;
-    for value in values {
-        if !target
-            .iter()
-            .any(|existing| existing.as_str() == Some(value))
-        {
-            target.push(Value::String(value.clone()));
-        }
-    }
-    Ok(())
-}
-
 fn clear_inherited_env_regexes(request_defaults: &mut Value) -> Result<()> {
     let target = request_defaults
         .get_mut("CreateContainerRequest")
@@ -1159,7 +1132,6 @@ fn run(args: Args) -> Result<()> {
         count => bail!("captured sandbox cannot be mapped to {count} workload name patterns"),
     };
     let mut request_defaults = serde_json::to_value(&settings.request_defaults)?;
-    let mut allow_env_regex = Vec::new();
     let mut containers = Vec::new();
     let mut reports = Vec::new();
     let mut seen_identities = BTreeMap::new();
@@ -1202,7 +1174,6 @@ fn run(args: Args) -> Result<()> {
             capture,
             &settings,
             &regexes,
-            &mut allow_env_regex,
             exec_commands,
             container_sandbox_name_pattern,
             &volume_device_paths,
@@ -1244,7 +1215,6 @@ fn run(args: Args) -> Result<()> {
         reports.push(report);
     }
     clear_inherited_env_regexes(&mut request_defaults)?;
-    append_allow_env_regex(&mut request_defaults, &allow_env_regex)?;
     // Rootfs identities live only in each container's marker storage. The
     // legacy global fields remain empty and are not authorization inputs.
     let dmverity = DmVerityData::default();
@@ -2783,7 +2753,28 @@ mod tests {
         assert_eq!(env, vec!["STATIC=value", "NODE=$(node-name)"]);
         assert_eq!(
             allow_regex,
-            vec!["^TEST_SERVICE_HOST=(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$"]
+            vec!["^TEST_SERVICE_HOST=(?:(?:[0-9]{1,3}\\.){3}[0-9]{1,3})$"]
+        );
+    }
+
+    #[test]
+    fn service_environment_regex_is_scoped_to_captured_process() {
+        let marker = "{{GENPOLICY_DYNAMIC:service-env.TEST_SERVICE_HOST}}";
+        let regexes = BTreeMap::from([(
+            marker.to_string(),
+            "(?:[0-9]{1,3}\\.){3}[0-9]{1,3}".to_string(),
+        )]);
+        let process = CapturedProcess {
+            env: vec![format!("TEST_SERVICE_HOST={marker}")],
+            ..Default::default()
+        };
+
+        let compiled = captured_process(&process, &regexes).unwrap();
+
+        assert!(compiled.Env.is_empty());
+        assert_eq!(
+            compiled.EnvRegex,
+            ["^TEST_SERVICE_HOST=(?:(?:[0-9]{1,3}\\.){3}[0-9]{1,3})$"]
         );
     }
 
@@ -2808,7 +2799,17 @@ mod tests {
         let pattern =
             marker_pattern("/var/log/pods/{{GENPOLICY_DYNAMIC:pod.uid}}", &regexes).unwrap();
 
-        assert_eq!(pattern, "^/var/log/pods/[0-9a-f-]+$");
+        assert_eq!(pattern, "^/var/log/pods/(?:[0-9a-f-]+)$");
+    }
+
+    #[test]
+    fn marker_pattern_groups_manifest_alternation() {
+        let marker = "{{GENPOLICY_DYNAMIC:test.value}}";
+        let regexes = BTreeMap::from([(marker.to_string(), "allowed|.*".to_string())]);
+
+        let pattern = marker_pattern(&format!("NAME={marker}"), &regexes).unwrap();
+
+        assert_eq!(pattern, "^NAME=(?:allowed|.*)$");
     }
 
     #[test]
@@ -2829,7 +2830,7 @@ mod tests {
 
         assert_eq!(
             pattern,
-            "^/var/log/pods/$(sandbox-namespace)_$(sandbox-name)_[0-9a-f-]+$"
+            "^/var/log/pods/$(sandbox-namespace)_$(sandbox-name)_(?:[0-9a-f-]+)$"
         );
     }
 
@@ -2855,7 +2856,7 @@ mod tests {
 
         assert_eq!(
             pattern,
-            "^/var/log/pods/$(sandbox-namespace)_$(sandbox-name)_[0-9a-f-]+$"
+            "^/var/log/pods/$(sandbox-namespace)_$(sandbox-name)_(?:[0-9a-f-]+)$"
         );
     }
 
@@ -2889,7 +2890,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (compiled, _) = captured_process(&process, &BTreeMap::new()).unwrap();
+        let compiled = captured_process(&process, &BTreeMap::new()).unwrap();
 
         assert_eq!(compiled.Cwd, "/captured");
     }
@@ -2922,7 +2923,6 @@ mod tests {
             &capture,
             &settings,
             &BTreeMap::new(),
-            &mut Vec::new(),
             Vec::new(),
             None,
             &[],
