@@ -722,6 +722,42 @@ intersect its `allowed` result, and concatenate non-conflicting state operations
 into the final metadata response. It does not require a new Agent RPC or a
 change to the Agent's policy-state implementation.
 
+#### Legacy GenPolicy binding experiment
+
+The same state mechanism also tightens Legacy GenPolicy independently of
+fragment loading. Legacy already returned state operations for container IDs,
+sandbox name, namespace, and network namespace, but it evaluated sandbox ID and
+Pod UID patterns independently on each `CreateContainerRequest`. A later
+container could therefore present another syntactically valid Pod identity
+unless some unrelated path happened to correlate it.
+
+The experiment adds one `pod_identity.<sandbox-id>` state entry containing
+`{pod_name, pod_namespace, pod_uid}`. The operation is returned only after the
+complete Legacy container rule succeeds. Later requests carrying the same
+sandbox ID must equal the complete stored tuple. For sandbox requests that
+carry Pod UID, the log directory must also equal
+`/var/log/pods/<namespace>_<name>_<uid>` exactly rather than merely matching an
+independent UUID regex.
+
+Unlike the fragment prototype, the Legacy compatibility path permits the first
+fully authorized container request to establish the tuple. Existing Legacy
+tests include isolated application requests and older request shapes that do
+not model sandbox-first sequencing. Requests without `sandbox-uid` bind
+`pod_uid: null` and still correlate sandbox ID, name, and namespace; the
+existing Legacy log-directory pattern remains their fallback. A future strict
+mode can require sandbox-first binding after callers and fixtures guarantee
+that lifecycle.
+
+Focused OPA tests cover first bind, exact application reuse, denial of a
+different valid UID, generated name, or namespace, exact sandbox log-directory
+derivation, and the UID-absent compatibility branch. The production Rego suites
+pass with the rule enabled. The stateful Regorus `AgentPolicy` test also passes,
+as do the generated-name, network-namespace, ConfigMap-volume, and
+container-image-volume Legacy fixtures that contain allowed UID-absent
+requests. The emptyDir fixture currently fails before request evaluation due to
+an unrelated pre-existing `allow_block_storage` multiple-output error in the
+available test binary.
+
 ### Independently generated static slice
 
 A second prototype in
