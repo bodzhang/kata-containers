@@ -98,6 +98,95 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
 
         self.assertEqual(forward, reverse)
 
+    def test_profile_targets_policy_or_container_role_explicitly(self):
+        baseline = {
+            "policy_data": {},
+            "subjects": [
+                {"id": "container/api", "ordinal": 0, "policy": {}},
+                {"id": "container/worker", "ordinal": 1, "policy": {}},
+                {"id": "sandbox/default/demo", "ordinal": 2, "policy": {}},
+            ],
+        }
+        fragments = [
+            {
+                "category": "policy-framework-settings",
+                "claims": [
+                    {
+                        "operation": "default",
+                        "target": {"scope": "policy", "path": "/common"},
+                        "value": {"cpath": "/run/kata"},
+                    }
+                ],
+                "schema_version": 1,
+                "scope": "profile",
+            },
+            {
+                "category": "containerd",
+                "claims": [
+                    {
+                        "operation": "default",
+                        "target": {
+                            "scope": "container",
+                            "role": "application",
+                            "cardinality": "all",
+                            "path": "/OCI/Version",
+                        },
+                        "value": "1.3.0",
+                    }
+                ],
+                "schema_version": 1,
+                "scope": "profile",
+            },
+        ]
+
+        composed = composition.compose(baseline, fragments)
+
+        self.assertEqual(composed["policy_data"]["common"]["cpath"], "/run/kata")
+        self.assertEqual(
+            [subject["policy"].get("OCI", {}).get("Version") for subject in composed["subjects"]],
+            ["1.3.0", "1.3.0", None],
+        )
+
+    def test_container_role_one_enforces_cardinality(self):
+        baseline = {
+            "policy_data": {},
+            "subjects": [
+                {"id": "container/api", "ordinal": 0, "policy": {}},
+                {"id": "container/worker", "ordinal": 1, "policy": {}},
+            ],
+        }
+        fragment = {
+            "category": "containerd",
+            "claims": [
+                {
+                    "operation": "default",
+                    "target": {
+                        "scope": "container",
+                        "role": "application",
+                        "cardinality": "one",
+                        "path": "/OCI/Version",
+                    },
+                    "value": "1.3.0",
+                }
+            ],
+            "schema_version": 1,
+            "scope": "profile",
+        }
+
+        with self.assertRaisesRegex(
+            composition.CompositionError, "requires one subject but matched 2"
+        ):
+            composition.compose(baseline, [fragment])
+
+    def test_profile_fragment_rejects_exact_workload_subject(self):
+        fragment = copy.deepcopy(self.fragments[0])
+        fragment["scope"] = "profile"
+
+        with self.assertRaisesRegex(
+            composition.CompositionError, "requires explicit policy or container scope"
+        ):
+            composition.compose(self.static_baseline(), [fragment])
+
     def test_composition_does_not_mutate_inputs(self):
         baseline = self.static_baseline()
         fragments = copy.deepcopy(self.fragments)
@@ -471,6 +560,23 @@ class PolicyFragmentCompositionTests(unittest.TestCase):
         composed = composition.materialize(baseline, fragments, self.compiler_policy)
 
         self.assertEqual(composed, self.compiler_policy)
+
+    def test_profile_fragment_does_not_bind_static_base(self):
+        baseline = self.static_baseline()
+        baseline["profile_identity"] = "profile-a"
+        baseline["static_base_digest"] = "sha256:static"
+        fragments = copy.deepcopy(self.fragments)
+        for fragment in fragments:
+            fragment["scope"] = "profile"
+            fragment["profile_identity"] = "profile-a"
+
+        composition.validate_fragment_bindings(baseline, fragments)
+
+        fragments[0]["static_base_digest"] = "sha256:static"
+        with self.assertRaisesRegex(
+            composition.CompositionError, "must not bind static_base_digest"
+        ):
+            composition.validate_fragment_bindings(baseline, fragments)
 
 
 if __name__ == "__main__":

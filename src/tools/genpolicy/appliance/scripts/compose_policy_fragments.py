@@ -16,6 +16,10 @@ SEMANTIC_OPERATIONS = {
     "resolve",
     "rewrite",
 }
+CONTAINER_ROLES = {"all", "application", "sandbox"}
+CARDINALITIES = {"all", "one"}
+
+
 class CompositionError(ValueError):
     pass
 
@@ -73,6 +77,72 @@ def resolve_target(document: dict, target: dict):
     if len(selected) != 1:
         raise CompositionError(f"target subject matched {len(selected)} items: {subject}")
     return selected[0]["policy"], relative_pointer
+
+
+def subject_has_role(subject: dict, role: str) -> bool:
+    if role == "all":
+        return True
+    declared_role = subject.get("role")
+    if declared_role is not None:
+        return declared_role == role
+    subject_id = subject.get("id", "")
+    prefix = "container/" if role == "application" else "sandbox/"
+    return isinstance(subject_id, str) and subject_id.startswith(prefix)
+
+
+def lower_target(static_policy: dict, target: dict) -> list[dict]:
+    path = target.get("path")
+    if "subject" in target:
+        if any(key in target for key in ("scope", "role", "cardinality")):
+            raise CompositionError("exact target cannot also declare scope, role, or cardinality")
+        return [copy.deepcopy(target)]
+
+    scope = target.get("scope")
+    if scope == "policy":
+        if any(key in target for key in ("role", "cardinality")):
+            raise CompositionError("policy target cannot declare role or cardinality")
+        return [{"subject": "policy", "path": path}]
+    if scope != "container":
+        raise CompositionError("target scope must be policy or container")
+
+    role = target.get("role")
+    if role not in CONTAINER_ROLES:
+        raise CompositionError(f"unsupported container role: {role}")
+    cardinality = target.get("cardinality")
+    if cardinality not in CARDINALITIES:
+        raise CompositionError(f"unsupported container cardinality: {cardinality}")
+    selected = [
+        subject
+        for subject in static_policy.get("subjects", [])
+        if subject_has_role(subject, role)
+    ]
+    if not selected:
+        raise CompositionError(f"container role {role} matched 0 subjects")
+    if cardinality == "one" and len(selected) != 1:
+        raise CompositionError(
+            f"container role {role} requires one subject but matched {len(selected)}"
+        )
+    return [{"subject": subject["id"], "path": path} for subject in selected]
+
+
+def lower_fragments(static_policy: dict, fragments: list[dict]) -> list[dict]:
+    lowered = copy.deepcopy(fragments)
+    for source_fragment, lowered_fragment in zip(fragments, lowered):
+        lowered_claims = []
+        for claim in source_fragment.get("claims", []):
+            target = claim.get("target")
+            if not isinstance(target, dict):
+                raise CompositionError("claim target must be an object")
+            if source_fragment.get("scope") == "profile" and "subject" in target:
+                raise CompositionError(
+                    "profile fragment target requires explicit policy or container scope"
+                )
+            for exact_target in lower_target(static_policy, target):
+                lowered_claim = copy.deepcopy(claim)
+                lowered_claim["target"] = exact_target
+                lowered_claims.append(lowered_claim)
+        lowered_fragment["claims"] = lowered_claims
+    return lowered
 
 
 def pointer_parent(document, pointer: str):
@@ -192,9 +262,19 @@ def validate_fragment_bindings(static_policy: dict, fragments: list[dict]) -> No
         raise CompositionError("static policy requires complete fragment bindings")
     for fragment in fragments:
         category = fragment["category"]
-        for key in keys:
-            if fragment.get(key) != static_values[key]:
-                raise CompositionError(f"fragment {category} has mismatched {key}")
+        if fragment.get("profile_identity") != static_values["profile_identity"]:
+            raise CompositionError(
+                f"fragment {category} has mismatched profile_identity"
+            )
+        if fragment.get("scope") == "profile":
+            if fragment.get("static_base_digest") is not None:
+                raise CompositionError(
+                    f"profile fragment {category} must not bind static_base_digest"
+                )
+        elif fragment.get("static_base_digest") != static_values["static_base_digest"]:
+            raise CompositionError(
+                f"fragment {category} has mismatched static_base_digest"
+            )
 
 
 def apply_claim(document: dict, claim: dict) -> None:
@@ -219,8 +299,9 @@ def assert_absence(document: dict, claim: dict) -> None:
 
 
 def compose(static_policy: dict, fragments: list[dict]) -> dict:
-    validate_fragments(fragments)
     validate_fragment_bindings(static_policy, fragments)
+    fragments = lower_fragments(static_policy, fragments)
+    validate_fragments(fragments)
     result = copy.deepcopy(static_policy)
     for fragment in fragments:
         for claim in fragment.get("claims", []):
@@ -277,6 +358,9 @@ def canonical_policy(policy: dict) -> dict:
                     )
                 by_name[name] = value
             process["Env"] = [f"{name}={by_name[name]}" for name in sorted(by_name)]
+        environment_regex = process.get("EnvRegex")
+        if isinstance(environment_regex, list):
+            process["EnvRegex"] = sorted(environment_regex)
         capabilities = process.get("Capabilities", {})
         for name, values in capabilities.items():
             if isinstance(values, list):

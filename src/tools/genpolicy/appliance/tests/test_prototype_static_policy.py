@@ -97,6 +97,10 @@ spec:
             subject = result["subjects"][0]
             constraints = subject["constraints"]
             self.assertEqual(subject["subject"], "container/app")
+            self.assertEqual(
+                constraints["/OCI/Annotations/io.kubernetes.cri.container-name"],
+                "app",
+            )
             self.assertEqual(constraints["/OCI/Process/Args"], ["/bin/yaml", "serve"])
             self.assertEqual(constraints["/OCI/Process/Cwd"], "/work")
             self.assertEqual(

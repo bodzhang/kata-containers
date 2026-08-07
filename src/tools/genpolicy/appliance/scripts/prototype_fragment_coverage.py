@@ -32,6 +32,26 @@ class CoverageError(ValueError):
     pass
 
 
+WORKLOAD_DERIVED_POLICY_PATHS = {
+    "/request_defaults/CreateContainerRequest/allow_env_regex",
+}
+CONTAINER_TYPE_PATH = "/OCI/Annotations/io.kubernetes.cri.container-type"
+PROFILE_CONTAINER_ROLE_CLAIMS = (
+    {"path": "/OCI/Version", "role": "all"},
+    {"path": CONTAINER_TYPE_PATH, "role": "application", "value": "container"},
+    {"path": CONTAINER_TYPE_PATH, "role": "sandbox", "value": "sandbox"},
+)
+WORKLOAD_APPLICATION_ROLE_PATHS = {"/OCI/Process/EnvRegex"}
+
+
+def materialization_scope(subject: str, path: str, value=None) -> str:
+    if subject != "policy" or (
+        path in WORKLOAD_DERIVED_POLICY_PATHS and value != []
+    ):
+        return "static-base-materialization"
+    return "profile"
+
+
 def escaped_token(token: str) -> str:
     return token.replace("~", "~0").replace("/", "~1")
 
@@ -139,9 +159,10 @@ def canonical_claim_value(path: str, value):
     capability_prefix = "/OCI/Process/Capabilities/"
     if path.startswith(capability_prefix) and isinstance(value, list):
         return sorted(value)
-    if path == "/request_defaults/CreateContainerRequest/allow_env_regex" and isinstance(
-        value, list
-    ):
+    if path in {
+        "/OCI/Process/EnvRegex",
+        "/request_defaults/CreateContainerRequest/allow_env_regex",
+    } and isinstance(value, list):
         return sorted(value)
     return value
 
@@ -284,9 +305,13 @@ def bind_profile(report: dict, static_ir: dict, profile: dict) -> dict:
     report["static_policy"]["static_base_digest"] = static_base_digest
     for fragment in report["fragments"]:
         fragment["profile_identity"] = identity
-        fragment["static_base_digest"] = static_base_digest
+        fragment.pop("static_base_digest", None)
+    for candidate in report.get("materialization_sets", []):
+        candidate["profile_identity"] = identity
+        candidate["static_base_digest"] = static_base_digest
+    candidate_sets = report["fragments"] + report.get("materialization_sets", [])
     composition.validate_fragment_bindings(
-        report["static_policy"], report["fragments"]
+        report["static_policy"], candidate_sets
     )
     return report
 
@@ -307,6 +332,11 @@ def finalize_report(
         )
     if binding is None or not binding.get("uvm_bound"):
         blockers.append("capture profile does not bind the measured UVM artifact")
+    workload_bound = report["coverage"].get("workload_bound_materialization_claims", 0)
+    if workload_bound:
+        blockers.append(
+            f"{workload_bound} claims depend on workload subjects or values and are not reusable fragments"
+        )
     report["blockers"] = blockers
     report["result"] = "pass" if not blockers else "incomplete"
     return report
@@ -346,7 +376,17 @@ def claim_classification(
     sources: dict[str, str],
 ) -> tuple[str, str, str]:
     if subject == "policy":
+        if path in WORKLOAD_DERIVED_POLICY_PATHS:
+            return (
+                "policy-framework-settings",
+                "default",
+                "workload-service-objects+cluster-state",
+            )
         return "policy-framework-settings", "default", "compiler-settings"
+    if path == "/OCI/Version":
+        return "containerd-oci", "default", "captured-oci"
+    if path == CONTAINER_TYPE_PATH:
+        return "containerd-oci", "default", "cri-container-role"
     env_prefix = "/OCI/Process/Env/"
     if path.startswith(env_prefix):
         name = composition.pointer_tokens(path)[-1]
@@ -359,6 +399,201 @@ def claim_classification(
     if not path.startswith("/OCI/"):
         return "runtime-rs-envelope", "envelope", source or "agent-request-envelope"
     return "kubelet-or-containerd", "default", source or "missing-kubelet-CRI-boundary"
+
+
+def subject_fanout(fragments: list[dict], static_ir: dict) -> list[dict]:
+    all_subjects = {subject["subject"] for subject in static_ir["subjects"]}
+    application_subjects = {
+        subject for subject in all_subjects if subject.startswith("container/")
+    }
+    sandbox_subjects = all_subjects - application_subjects
+    grouped = {}
+    for fragment in fragments:
+        for claim in fragment["claims"]:
+            subject = claim["target"].get("subject")
+            if subject is None:
+                continue
+            if subject == "policy":
+                continue
+            grouped.setdefault(claim["target"]["path"], []).append(
+                (fragment["category"], subject, claim)
+            )
+
+    analysis = []
+    for path, entries in sorted(grouped.items()):
+        subjects = {entry[1] for entry in entries}
+        if subjects == all_subjects:
+            target_population = "all-subjects"
+        elif subjects == application_subjects:
+            target_population = "all-application-containers"
+        elif subjects == sandbox_subjects:
+            target_population = "all-sandboxes"
+        elif len(subjects) == 1:
+            target_population = "single-subject"
+        else:
+            target_population = "subject-subset"
+        values = {
+            json.dumps(entry[2].get("value"), sort_keys=True, separators=(",", ":"))
+            for entry in entries
+        }
+        analysis.append(
+            {
+                "categories": sorted({entry[0] for entry in entries}),
+                "claim_count": len(entries),
+                "distinct_values": len(values),
+                "evidence": sorted({entry[2]["evidence"] for entry in entries}),
+                "path": path,
+                "subjects": sorted(subjects),
+                "target_population": target_population,
+                "value_shape": "identical" if len(values) == 1 else "subject-specific",
+            }
+        )
+    return analysis
+
+
+def promote_profile_container_roles(
+    claims_by_category: dict[str, list[dict]], ledger: list[dict], static_ir: dict
+) -> None:
+    all_subjects = {subject["subject"] for subject in static_ir["subjects"]}
+    subjects_by_role = {
+        "all": all_subjects,
+        "application": {
+            subject for subject in all_subjects if subject.startswith("container/")
+        },
+        "sandbox": {
+            subject for subject in all_subjects if subject.startswith("sandbox/")
+        },
+    }
+    for category, claims in claims_by_category.items():
+        for role_claim in PROFILE_CONTAINER_ROLE_CLAIMS:
+            path = role_claim["path"]
+            role = role_claim["role"]
+            selected_subjects = subjects_by_role[role]
+            candidates = [
+                claim
+                for claim in claims
+                if claim["scope"] == "static-base-materialization"
+                and claim["target"]["path"] == path
+                and claim["target"]["subject"] in selected_subjects
+            ]
+            subjects = {claim["target"]["subject"] for claim in candidates}
+            values = {
+                json.dumps(claim["value"], sort_keys=True, separators=(",", ":"))
+                for claim in candidates
+            }
+            operations = {claim["operation"] for claim in candidates}
+            evidence = {claim["evidence"] for claim in candidates}
+            if (
+                not selected_subjects
+                or subjects != selected_subjects
+                or len(values) != 1
+                or len(operations) != 1
+                or len(evidence) != 1
+            ):
+                continue
+            if "value" in role_claim and values != {
+                json.dumps(
+                    role_claim["value"], sort_keys=True, separators=(",", ":")
+                )
+            }:
+                continue
+            for claim in candidates:
+                claims.remove(claim)
+            role_claim = copy.deepcopy(candidates[0])
+            role_claim["scope"] = "profile"
+            role_claim["target"] = {
+                "cardinality": "all",
+                "path": path,
+                "role": role,
+                "scope": "container",
+            }
+            claims.append(role_claim)
+            ledger[:] = [
+                entry
+                for entry in ledger
+                if not (
+                    entry["owner"] == "materialization"
+                    and entry["category"] == category
+                    and entry["path"] == path
+                    and entry["subject"] in subjects
+                )
+            ]
+            ledger.append(
+                {
+                    "category": category,
+                    "evidence": role_claim["evidence"],
+                    "operation": role_claim["operation"],
+                    "owner": "fragment",
+                    "path": path,
+                    "scope": "profile",
+                    "subject": f"role:container/{role}",
+                }
+            )
+
+
+def coalesce_workload_application_roles(
+    claims_by_category: dict[str, list[dict]], ledger: list[dict], static_ir: dict
+) -> None:
+    application_subjects = {
+        subject["subject"]
+        for subject in static_ir["subjects"]
+        if subject["subject"].startswith("container/")
+    }
+    for category, claims in claims_by_category.items():
+        for path in WORKLOAD_APPLICATION_ROLE_PATHS:
+            candidates = [
+                claim
+                for claim in claims
+                if claim["scope"] == "static-base-materialization"
+                and claim["target"].get("path") == path
+                and claim["target"].get("subject") in application_subjects
+            ]
+            subjects = {claim["target"]["subject"] for claim in candidates}
+            values = {
+                json.dumps(claim["value"], sort_keys=True, separators=(",", ":"))
+                for claim in candidates
+            }
+            operations = {claim["operation"] for claim in candidates}
+            evidence = {claim["evidence"] for claim in candidates}
+            if (
+                not application_subjects
+                or subjects != application_subjects
+                or len(values) != 1
+                or len(operations) != 1
+                or len(evidence) != 1
+            ):
+                continue
+            for claim in candidates:
+                claims.remove(claim)
+            role_claim = copy.deepcopy(candidates[0])
+            role_claim["target"] = {
+                "cardinality": "all",
+                "path": path,
+                "role": "application",
+                "scope": "container",
+            }
+            claims.append(role_claim)
+            ledger[:] = [
+                entry
+                for entry in ledger
+                if not (
+                    entry["owner"] == "materialization"
+                    and entry["category"] == category
+                    and entry["path"] == path
+                    and entry["subject"] in subjects
+                )
+            ]
+            ledger.append(
+                {
+                    "category": category,
+                    "evidence": role_claim["evidence"],
+                    "operation": role_claim["operation"],
+                    "owner": "materialization",
+                    "path": path,
+                    "scope": "static-base-materialization",
+                    "subject": "role:container/application",
+                }
+            )
 
 
 def derive_candidate_coverage(
@@ -384,7 +619,12 @@ def derive_candidate_coverage(
             ledger.extend(
                 {
                     "category": category,
-                    "evidence": subject.get("static_artifact", subject.get("image")),
+                    "evidence": (
+                        "trusted-workload-yaml"
+                        if owned_path
+                        == "/OCI/Annotations/io.kubernetes.cri.container-name"
+                        else subject.get("static_artifact", subject.get("image"))
+                    ),
                     "operation": "derive",
                     "owner": "static",
                     "path": owned_path,
@@ -413,34 +653,81 @@ def derive_candidate_coverage(
         claim = {
             "evidence": evidence,
             "operation": operation,
-            "target": {"path": path, "subject": subject},
+            "scope": materialization_scope(subject, path, value),
             "value": value,
         }
+        claim["target"] = (
+            {"path": path, "scope": "policy"}
+            if claim["scope"] == "profile"
+            else {"path": path, "subject": subject}
+        )
+        if path in WORKLOAD_DERIVED_POLICY_PATHS and value == []:
+            claim["evidence"] = "compiler-security-default"
+        owner = (
+            "fragment"
+            if claim["scope"] == "profile"
+            else "materialization"
+        )
         claims_by_category.setdefault(category, []).append(claim)
         ledger.append(
             {
                 "category": category,
-                "evidence": evidence,
+                "evidence": claim["evidence"],
                 "operation": operation,
-                "owner": "fragment",
+                "owner": owner,
                 "path": path,
+                "scope": claim["scope"],
                 "subject": subject,
             }
         )
-    fragments = [
-        {"category": category, "claims": claims, "schema_version": 1}
-        for category, claims in sorted(claims_by_category.items())
-    ]
-    composition.materialize(baseline, fragments, expected)
+    promote_profile_container_roles(claims_by_category, ledger, static_ir)
+    coalesce_workload_application_roles(claims_by_category, ledger, static_ir)
+    fragments = []
+    materialization_sets = []
+    for category, claims in sorted(claims_by_category.items()):
+        profile_claims = [claim for claim in claims if claim["scope"] == "profile"]
+        workload_claims = [
+            claim for claim in claims if claim["scope"] == "static-base-materialization"
+        ]
+        if profile_claims:
+            fragments.append(
+                {
+                    "category": category,
+                    "claims": profile_claims,
+                    "schema_version": 1,
+                    "scope": "profile",
+                }
+            )
+        if workload_claims:
+            materialization_sets.append(
+                {
+                    "category": category,
+                    "claims": workload_claims,
+                    "schema_version": 1,
+                    "scope": "static-base-materialization",
+                }
+            )
+    candidate_sets = fragments + materialization_sets
+    composition.materialize(baseline, candidate_sets, expected)
+    candidate_ledger = [entry for entry in ledger if entry["owner"] != "static"]
     fragment_ledger = [entry for entry in ledger if entry["owner"] == "fragment"]
+    materialization_ledger = [
+        entry for entry in ledger if entry["owner"] == "materialization"
+    ]
     static_ledger = [entry for entry in ledger if entry["owner"] == "static"]
+    workload_bound = len(materialization_ledger)
+    workload_derived_globals = sum(
+        entry["subject"] == "policy"
+        for entry in materialization_ledger
+    )
     ambiguous = sum(
-        entry["category"] == "kubelet-or-containerd" for entry in fragment_ledger
+        entry["category"] == "kubelet-or-containerd" for entry in candidate_ledger
     )
     return {
         "coverage": {
             "ambiguous_boundary_claims": ambiguous,
             "candidate_fragment_claims": len(fragment_ledger),
+            "candidate_claims": len(candidate_ledger),
             "categories": {
                 category: len(claims) for category, claims in sorted(claims_by_category.items())
             },
@@ -448,14 +735,21 @@ def derive_candidate_coverage(
                 "required absence inventory is not implemented",
                 "kubelet and containerd ownership is ambiguous without a CRI capture boundary",
                 "the measured UVM digest is not present in current capture profile manifests",
+                "additional role classification and workload-parameter lowering are not implemented",
             ],
             "reconstruction": "pass",
+            "materialization_claims": len(materialization_ledger),
+            "reusable_profile_claims": len(fragment_ledger),
             "required_absence_claims": 0,
             "static_claims": len(static_ledger),
-            "status": "experimental",
+            "status": "materialization-only" if workload_bound else "experimental",
+            "subject_fanout": subject_fanout(materialization_sets, static_ir),
+            "workload_derived_global_claims": workload_derived_globals,
+            "workload_bound_materialization_claims": workload_bound,
         },
         "fragments": fragments,
         "ledger": ledger,
+        "materialization_sets": materialization_sets,
         "schema_version": 1,
         "static_policy": baseline,
     }

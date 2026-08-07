@@ -17,6 +17,7 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
             "subjects": [
                 {
                     "constraints": {
+                        "/OCI/Annotations/io.kubernetes.cri.container-name": "app",
                         "/OCI/Process/Args": ["/bin/app"],
                         "/OCI/Process/Env": {"STATIC": "image"},
                     },
@@ -40,6 +41,9 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
     def expected_policy(self):
         return {
             "common": {"cpath": "/run/kata/"},
+            "request_defaults": {
+                "CreateContainerRequest": {"allow_env_regex": []}
+            },
             "containers": [
                 {
                     "OCI": {
@@ -106,13 +110,44 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
         )
 
         self.assertEqual(report["coverage"]["reconstruction"], "pass")
-        self.assertEqual(report["coverage"]["status"], "experimental")
+        self.assertEqual(report["coverage"]["status"], "materialization-only")
         self.assertGreater(report["coverage"]["static_claims"], 0)
+        self.assertGreater(report["coverage"]["workload_bound_materialization_claims"], 0)
         self.assertEqual(report["coverage"]["required_absence_claims"], 0)
         static_serialized = str(report["static_policy"])
         self.assertIn("STATIC", static_serialized)
         self.assertNotIn("POD_UID", static_serialized)
-        claims = [claim for fragment in report["fragments"] for claim in fragment["claims"]]
+        fragment_claims = [
+            claim for fragment in report["fragments"] for claim in fragment["claims"]
+        ]
+        materialization_claims = [
+            claim
+            for candidate in report["materialization_sets"]
+            for claim in candidate["claims"]
+        ]
+        claims = fragment_claims + materialization_claims
+        self.assertTrue(fragment_claims)
+        self.assertTrue(
+            all(claim["target"]["scope"] in {"policy", "container"} for claim in fragment_claims)
+        )
+        self.assertTrue(
+            all("subject" not in claim["target"] for claim in fragment_claims)
+        )
+        self.assertFalse(
+            any(
+                claim["target"]["path"]
+                == "/OCI/Annotations/io.kubernetes.cri.container-name"
+                for claim in claims
+            )
+        )
+        container_name = next(
+            entry
+            for entry in report["ledger"]
+            if entry["path"]
+            == "/OCI/Annotations/io.kubernetes.cri.container-name"
+        )
+        self.assertEqual(container_name["owner"], "static")
+        self.assertEqual(container_name["evidence"], "trusted-workload-yaml")
         pod_uid = next(
             claim
             for claim in claims
@@ -121,6 +156,104 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
         self.assertEqual(pod_uid["operation"], "resolve")
         self.assertEqual(pod_uid["target"]["subject"], "container/app")
         self.assertEqual(pod_uid["value"], "$(pod-uid)")
+        self.assertEqual(
+            [fragment["category"] for fragment in report["fragments"]],
+            ["containerd-oci", "policy-framework-settings"],
+        )
+        global_env = next(
+            claim
+            for claim in fragment_claims
+            if claim["target"]["path"]
+            == "/request_defaults/CreateContainerRequest/allow_env_regex"
+        )
+        self.assertEqual(global_env["value"], [])
+        self.assertEqual(global_env["evidence"], "compiler-security-default")
+        global_env_ledger = next(
+            entry
+            for entry in report["ledger"]
+            if entry["path"]
+            == "/request_defaults/CreateContainerRequest/allow_env_regex"
+        )
+        self.assertEqual(global_env_ledger["owner"], "fragment")
+        self.assertEqual(
+            global_env_ledger["evidence"], "compiler-security-default"
+        )
+        version = next(
+            claim
+            for claim in fragment_claims
+            if claim["target"]["path"] == "/OCI/Version"
+        )
+        self.assertEqual(
+            version["target"],
+            {
+                "cardinality": "all",
+                "path": "/OCI/Version",
+                "role": "all",
+                "scope": "container",
+            },
+        )
+        container_types = {
+            (claim["target"]["role"], claim["value"])
+            for claim in fragment_claims
+            if claim["target"]["path"] == coverage.CONTAINER_TYPE_PATH
+        }
+        self.assertEqual(
+            container_types,
+            {("application", "container"), ("sandbox", "sandbox")},
+        )
+        materialization_scopes = {
+            candidate["category"]: candidate["scope"]
+            for candidate in report["materialization_sets"]
+        }
+        self.assertEqual(
+            materialization_scopes["kubelet-resolution"],
+            "static-base-materialization",
+        )
+        self.assertFalse(
+            any(
+                entry["path"] == "/OCI/Version"
+                for entry in report["coverage"]["subject_fanout"]
+            )
+        )
+
+    def test_service_environment_regex_is_workload_derived_global_policy(self):
+        path = "/request_defaults/CreateContainerRequest/allow_env_regex"
+
+        self.assertEqual(
+            coverage.materialization_scope("policy", path),
+            "static-base-materialization",
+        )
+        self.assertEqual(coverage.materialization_scope("policy", path, []), "profile")
+        self.assertEqual(
+            coverage.materialization_scope("policy", "/common/cpath"), "profile"
+        )
+        self.assertEqual(
+            coverage.claim_classification("policy", path, set(), {}),
+            (
+                "policy-framework-settings",
+                "default",
+                "workload-service-objects+cluster-state",
+            ),
+        )
+
+    def test_workload_bound_candidates_block_reusable_fragment_result(self):
+        report = {
+            "coverage": {
+                "ambiguous_boundary_claims": 0,
+                "workload_bound_materialization_claims": 2,
+            }
+        }
+        absences = {"inventory": "loaded", "uncovered": 0}
+
+        result = coverage.finalize_report(report, absences, {"uvm_bound": True})
+
+        self.assertEqual(result["result"], "incomplete")
+        self.assertEqual(
+            result["blockers"],
+            [
+                "2 claims depend on workload subjects or values and are not reusable fragments"
+            ],
+        )
 
     def test_static_value_conflict_fails_coverage(self):
         expected = self.expected_policy()
@@ -134,6 +267,175 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
     def test_environment_map_rejects_empty_name(self):
         with self.assertRaisesRegex(coverage.CoverageError, "invalid or duplicate"):
             coverage.environment_map(["=value"])
+
+    def test_container_environment_regex_is_order_insensitive(self):
+        self.assertEqual(
+            coverage.canonical_claim_value(
+                "/OCI/Process/EnvRegex", ["^B=.*$", "^A=.*$"]
+            ),
+            ["^A=.*$", "^B=.*$"],
+        )
+
+    def test_identical_service_regexes_coalesce_to_application_role(self):
+        claims = {
+            "kubelet-or-containerd": [
+                {
+                    "evidence": "captured-oci",
+                    "operation": "default",
+                    "scope": "static-base-materialization",
+                    "target": {"path": "/OCI/Process/EnvRegex", "subject": subject},
+                    "value": ["^BACKEND_SERVICE_HOST=(?:IPv4|IPv6)$"],
+                }
+                for subject in ("container/api", "container/sidecar")
+            ]
+        }
+        ledger = [
+            {
+                "category": "kubelet-or-containerd",
+                "evidence": "captured-oci",
+                "operation": "default",
+                "owner": "materialization",
+                "path": "/OCI/Process/EnvRegex",
+                "scope": "static-base-materialization",
+                "subject": subject,
+            }
+            for subject in ("container/api", "container/sidecar")
+        ]
+        static_ir = {
+            "subjects": [
+                {"subject": "container/api"},
+                {"subject": "container/sidecar"},
+                {"subject": "sandbox/default/demo"},
+            ]
+        }
+
+        coverage.coalesce_workload_application_roles(claims, ledger, static_ir)
+
+        self.assertEqual(len(claims["kubelet-or-containerd"]), 1)
+        self.assertEqual(
+            claims["kubelet-or-containerd"][0]["target"],
+            {
+                "cardinality": "all",
+                "path": "/OCI/Process/EnvRegex",
+                "role": "application",
+                "scope": "container",
+            },
+        )
+        self.assertEqual(ledger[0]["subject"], "role:container/application")
+
+    def test_different_service_regexes_remain_per_container(self):
+        claims = {
+            "kubelet-or-containerd": [
+                {
+                    "evidence": "captured-oci",
+                    "operation": "default",
+                    "scope": "static-base-materialization",
+                    "target": {"path": "/OCI/Process/EnvRegex", "subject": subject},
+                    "value": [value],
+                }
+                for subject, value in (
+                    ("container/api", "^BACKEND_SERVICE_HOST=(?:IPv4|IPv6)$"),
+                    ("container/sidecar", "^METRICS_SERVICE_HOST=(?:IPv4|IPv6)$"),
+                )
+            ]
+        }
+        ledger = []
+        static_ir = {
+            "subjects": [
+                {"subject": "container/api"},
+                {"subject": "container/sidecar"},
+            ]
+        }
+
+        coverage.coalesce_workload_application_roles(claims, ledger, static_ir)
+
+        self.assertEqual(len(claims["kubelet-or-containerd"]), 2)
+        self.assertTrue(
+            all("subject" in claim["target"] for claim in claims["kubelet-or-containerd"])
+        )
+
+    def test_container_type_promotes_only_complete_reviewed_roles(self):
+        claims = {
+            "containerd-oci": [
+                {
+                    "evidence": "cri-container-role",
+                    "operation": "default",
+                    "scope": "static-base-materialization",
+                    "target": {
+                        "path": coverage.CONTAINER_TYPE_PATH,
+                        "subject": subject,
+                    },
+                    "value": value,
+                }
+                for subject, value in (
+                    ("container/api", "container"),
+                    ("container/sidecar", "container"),
+                    ("sandbox/default/demo", "sandbox"),
+                )
+            ]
+        }
+        ledger = [
+            {
+                "category": "containerd-oci",
+                "evidence": "cri-container-role",
+                "operation": "default",
+                "owner": "materialization",
+                "path": coverage.CONTAINER_TYPE_PATH,
+                "scope": "static-base-materialization",
+                "subject": subject,
+            }
+            for subject in (
+                "container/api",
+                "container/sidecar",
+                "sandbox/default/demo",
+            )
+        ]
+        static_ir = {
+            "subjects": [
+                {"subject": "container/api"},
+                {"subject": "container/sidecar"},
+                {"subject": "sandbox/default/demo"},
+            ]
+        }
+
+        coverage.promote_profile_container_roles(claims, ledger, static_ir)
+
+        promoted = {
+            (claim["target"]["role"], claim["value"])
+            for claim in claims["containerd-oci"]
+        }
+        self.assertEqual(
+            promoted,
+            {("application", "container"), ("sandbox", "sandbox")},
+        )
+        self.assertEqual(
+            {entry["subject"] for entry in ledger},
+            {"role:container/application", "role:container/sandbox"},
+        )
+
+    def test_container_type_does_not_promote_partial_application_role(self):
+        claim = {
+            "evidence": "cri-container-role",
+            "operation": "default",
+            "scope": "static-base-materialization",
+            "target": {
+                "path": coverage.CONTAINER_TYPE_PATH,
+                "subject": "container/api",
+            },
+            "value": "container",
+        }
+        claims = {"containerd-oci": [claim]}
+        ledger = []
+        static_ir = {
+            "subjects": [
+                {"subject": "container/api"},
+                {"subject": "container/sidecar"},
+            ]
+        }
+
+        coverage.promote_profile_container_roles(claims, ledger, static_ir)
+
+        self.assertEqual(claims, {"containerd-oci": [claim]})
 
     def test_unmapped_final_subject_fails_coverage(self):
         expected = self.expected_policy()
@@ -263,12 +565,15 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
 
         self.assertTrue(result["binding"]["uvm_bound"])
         self.assertRegex(result["binding"]["static_base_digest"], r"^sha256:[0-9a-f]{64}$")
-        for fragment in result["fragments"]:
-            self.assertEqual(fragment["profile_identity"], "b" * 64)
+        for candidate in result["materialization_sets"]:
+            self.assertEqual(candidate["profile_identity"], "b" * 64)
             self.assertEqual(
-                fragment["static_base_digest"],
+                candidate["static_base_digest"],
                 result["binding"]["static_base_digest"],
             )
+        for fragment in result["fragments"]:
+            self.assertEqual(fragment["profile_identity"], "b" * 64)
+            self.assertNotIn("static_base_digest", fragment)
 
     def test_rejects_invalid_profile_identity(self):
         report = {"fragments": []}

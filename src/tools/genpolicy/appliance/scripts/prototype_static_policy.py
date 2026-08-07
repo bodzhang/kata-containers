@@ -227,6 +227,7 @@ def generate_static_ir(capture: Path, uvm_baseline_path: Path | None = None) -> 
                 container, image, namespace, config_maps, secrets
             )
             constraints = {
+                "/OCI/Annotations/io.kubernetes.cri.container-name": container["name"],
                 "/OCI/Process/Args": process_args(container, image),
                 "/OCI/Process/Env": environment,
                 "/exec_commands": exec_commands(container),
