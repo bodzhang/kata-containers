@@ -35,6 +35,7 @@ if command -v opa >/dev/null 2>&1; then
 	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/volume_storages_test.rego"
 	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/devices_test.rego"
 	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/exec_process_test.rego"
+	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/legacy_bindings_test.rego"
 else
 	echo "opa not found; skipping rego policy tests" >&2
 fi

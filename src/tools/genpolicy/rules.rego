@@ -65,6 +65,9 @@ default AllowRequestsFailingPolicy := false
 # Constants
 S_NAME_KEY = "io.kubernetes.cri.sandbox-name"
 S_NAMESPACE_KEY = "io.kubernetes.cri.sandbox-namespace"
+S_ID_KEY = "io.kubernetes.cri.sandbox-id"
+S_UID_KEY = "io.kubernetes.cri.sandbox-uid"
+S_LOG_DIRECTORY_KEY = "io.kubernetes.cri.sandbox-log-directory"
 CDI_VFIO_ANNOTATION_PREFIX = "cdi.k8s.io/vfio"
 VFIO_PCI_ADDRESS_REGEX = "^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[01][0-9a-fA-F]\\.[0-7]=[0-9a-fA-F]{2}/[0-9a-fA-F]{2}$"
 
@@ -80,10 +83,14 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
     # array of possible state operations
     ops_builder := []
 
+    # Bind Pod identity once per sandbox and correlate every later container.
+    add_pod_identity_to_state := bind_or_match_pod_identity(i_oci)
+    ops_builder1 := concat_op_if_not_null(ops_builder, add_pod_identity_to_state)
+
     # check sandbox name
     sandbox_name = i_oci.Annotations[S_NAME_KEY]
     add_sandbox_name_to_state := state_allows("sandbox_name", sandbox_name)
-    ops_builder1 := concat_op_if_not_null(ops_builder, add_sandbox_name_to_state)
+    ops_builder2 := concat_op_if_not_null(ops_builder1, add_sandbox_name_to_state)
 
     # Check if any element from the policy_data.containers array allows the input request.
     some idx, p_container in policy_data.containers
@@ -101,7 +108,7 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
     i_namespace := i_oci.Annotations[S_NAMESPACE_KEY]
     print("CreateContainerRequest: p_namespace =", p_namespace, "i_namespace =", i_namespace)
     add_namespace_to_state := allow_namespace(p_namespace, i_namespace)
-    ops_builder2 := concat_op_if_not_null(ops_builder1, add_namespace_to_state)
+    ops_builder3 := concat_op_if_not_null(ops_builder2, add_namespace_to_state)
 
     print("CreateContainerRequest: p Version =", p_oci.Version, "i Version =", i_oci.Version)
     p_oci.Version == i_oci.Version
@@ -117,7 +124,7 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
     p_devices := p_container.devices
     allow_devices(p_devices, i_devices, i_oci)
 
-    ret := allow_linux(ops_builder2, p_oci, i_oci)
+    ret := allow_linux(ops_builder3, p_oci, i_oci)
     ret.allowed
 
     # save to policy state
@@ -170,6 +177,43 @@ allow_namespace(p_namespace, i_namespace) = add_namespace if {
     p_namespace == ""
     print("allow_namespace 2: no namespace found on policy data")
     add_namespace := state_allows("namespace", i_namespace)
+}
+
+pod_identity(i_oci) := {
+    "pod_name": annotations[S_NAME_KEY],
+    "pod_namespace": annotations[S_NAMESPACE_KEY],
+    "pod_uid": object.get(annotations, S_UID_KEY, null),
+} if {
+    annotations := i_oci.Annotations
+}
+
+pod_identity_state_key(sandbox_id) := concat("", ["pod_identity.", sandbox_id])
+
+expected_sandbox_log_directory(identity) := sprintf(
+    "/var/log/pods/%s_%s_%s",
+    [identity.pod_namespace, identity.pod_name, identity.pod_uid],
+)
+
+allow_pod_identity_shape(i_oci, identity) if {
+    i_oci.Annotations["io.kubernetes.cri.container-type"] == "sandbox"
+    identity.pod_uid != null
+    i_oci.Annotations[S_LOG_DIRECTORY_KEY] == expected_sandbox_log_directory(identity)
+}
+
+allow_pod_identity_shape(i_oci, identity) if {
+    i_oci.Annotations["io.kubernetes.cri.container-type"] == "sandbox"
+    identity.pod_uid == null
+}
+
+allow_pod_identity_shape(i_oci, identity) if {
+    i_oci.Annotations["io.kubernetes.cri.container-type"] == "container"
+}
+
+bind_or_match_pod_identity(i_oci) = action if {
+    sandbox_id := i_oci.Annotations[S_ID_KEY]
+    identity := pod_identity(i_oci)
+    allow_pod_identity_shape(i_oci, identity)
+    action := state_allows(pod_identity_state_key(sandbox_id), identity)
 }
 
 # key hasn't been seen before, save key, value pair to state
