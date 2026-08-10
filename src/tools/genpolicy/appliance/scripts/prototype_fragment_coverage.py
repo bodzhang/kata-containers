@@ -718,7 +718,10 @@ def derive_candidate_coverage(
     baseline, normalized_expected = sparse_static_policy(static_ir, expected)
     sources = report_sources(source_report, static_ir)
     unresolved = {
-        subject["subject"]: {entry["name"] for entry in subject.get("unresolved", [])}
+        subject["subject"]: {
+            entry["target"]["name"]
+            for entry in subject.get("environment_resolutions", [])
+        }
         for subject in static_ir["subjects"]
     }
     claims_by_category = {}
@@ -872,6 +875,11 @@ def derive_candidate_coverage(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--capture", required=True, type=Path)
+    parser.add_argument(
+        "--rootfs-mode",
+        required=True,
+        choices=("guest-pull", "erofs-dmverity"),
+    )
     parser.add_argument("--uvm-baseline", required=True, type=Path)
     parser.add_argument("--rootfs-artifacts", type=Path)
     parser.add_argument("--compiler-policy", required=True, type=Path)
@@ -882,7 +890,10 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     static_ir = static_policy.generate_static_ir(
-        args.capture, args.uvm_baseline, args.rootfs_artifacts
+        args.capture,
+        rootfs_mode=args.rootfs_mode,
+        uvm_baseline_path=args.uvm_baseline,
+        rootfs_artifacts_path=args.rootfs_artifacts,
     )
     expected = static_policy.policy_data(args.compiler_policy)
     source_report = json.loads(args.source_report.read_text(encoding="utf-8"))

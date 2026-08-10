@@ -592,15 +592,15 @@ ir := {"subjects": [{
     "volumes": [
         {"name": "cache", "role": "empty-dir", "medium": "memory", "destination": "/cache", "read_only": false},
         {"name": "data", "role": "empty-dir", "medium": "node-default", "destination": "/data", "read_only": true},
-        {"name": "config", "role": "config-map", "source": {"name": "app-config", "namespace": "default", "status": "resolved"}, "destination": "/etc/configuration", "destination_basename": "configuration", "read_only": true},
-        {"name": "config-alias", "role": "config-map", "source": {"name": "app-config", "namespace": "default", "status": "resolved"}, "destination": "/opt/configuration", "destination_basename": "configuration", "read_only": true},
-        {"name": "secret", "role": "secret", "source": {"name": "app-secret", "namespace": "default", "status": "resolved"}, "destination": "/etc/credentials", "destination_basename": "credentials", "read_only": true},
+        {"name": "config", "role": "config-map", "source": {"name": "app-config", "namespace": "default", "content_trust": "untrusted-runtime"}, "destination": "/etc/configuration", "destination_basename": "configuration", "read_only": true},
+        {"name": "config-alias", "role": "config-map", "source": {"name": "app-config", "namespace": "default", "content_trust": "untrusted-runtime"}, "destination": "/opt/configuration", "destination_basename": "configuration", "read_only": true},
+        {"name": "secret", "role": "secret", "source": {"name": "app-secret", "namespace": "default", "content_trust": "untrusted-runtime"}, "destination": "/etc/credentials", "destination_basename": "credentials", "read_only": true},
     ],
 }, {
     "id": "container/optional",
     "role": "application",
     "volumes": [
-        {"name": "optional-secret", "role": "secret", "source": {"name": "missing", "namespace": "default", "status": "absent"}, "destination": "/etc/missing", "destination_basename": "missing", "read_only": true},
+        {"name": "optional-secret", "role": "secret", "source": {"name": "missing", "namespace": "default", "content_trust": "untrusted-runtime"}, "destination": "/etc/missing", "destination_basename": "missing", "read_only": true},
     ],
 }]}
 "#;
@@ -615,7 +615,7 @@ ir := {"subjects": [{
         let claims = serde_json::to_value(value).unwrap();
         let storages = claims[0]["addition"]["storages"].as_array().unwrap();
 
-        assert_eq!(claims.as_array().unwrap().len(), 1);
+        assert_eq!(claims.as_array().unwrap().len(), 2);
         assert_eq!(claims[0]["subject"], "container/app");
         assert_eq!(claims[0]["target"]["path"], "/storages");
         assert_eq!(storages[0]["driver"], "ephemeral");
@@ -690,7 +690,8 @@ ir := {"subjects": [{
             claims[0]["addition"]["request_defaults"]["CopyFileRequest"],
             serde_json::json!([
                 "^$(cpath)/$(bundle-id)-[0-9a-f]{16}-configuration",
-                "^$(cpath)/$(bundle-id)-[0-9a-f]{16}-credentials"
+                "^$(cpath)/$(bundle-id)-[0-9a-f]{16}-credentials",
+                "^$(cpath)/$(bundle-id)-[0-9a-f]{16}-missing"
             ])
         );
     }

@@ -65,7 +65,7 @@ volume_supported(volume) if {
 volume_supported(volume) if {
   volume.role in {"config-map", "secret"}
   resource_volume_transport == "copy-to-rootfs"
-  volume.source.status == "resolved"
+  volume.source.content_trust == "untrusted-runtime"
   regex.match("^[A-Za-z0-9_-]+$", volume.destination_basename)
   object.get(volume, "sub_path", "") == ""
   object.get(volume, "mount_propagation", "") == ""

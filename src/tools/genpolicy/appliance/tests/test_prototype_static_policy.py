@@ -17,6 +17,25 @@ SPEC.loader.exec_module(prototype)
 
 
 class StaticPolicyPrototypeTests(unittest.TestCase):
+    def test_rejects_image_content_tampered_after_fetch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            images = Path(temporary)
+            config = json.dumps({"config": {"Env": ["A=B"]}}).encode()
+            config_digest = f"sha256:{hashlib.sha256(config).hexdigest()}"
+            config_path = images / "config.json"
+            config_path.write_bytes(config)
+
+            document = prototype.verified_image_document(
+                images, config_path.name, config_digest
+            )
+            self.assertEqual(document["config"]["Env"], ["A=B"])
+
+            config_path.write_bytes(b"{}")
+            with self.assertRaisesRegex(ValueError, "content digest mismatch"):
+                prototype.verified_image_document(
+                    images, config_path.name, config_digest
+                )
+
     def test_normalizes_kubernetes_capability_intent(self):
         self.assertEqual(
             prototype.normalized_capabilities(
@@ -89,6 +108,7 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
                 "kind": "Pod",
                 "metadata": {"name": "test"},
                 "spec": {
+                    "automountServiceAccountToken": False,
                     "containers": [
                         {
                             "args": ["serve"],
@@ -205,7 +225,19 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
                 {
                     "image_manifest_digest": f"sha256:{'a' * 64}",
                     "mode": "guest-pull",
-                    "profile_identity": profile["identity"],
+                },
+            )
+            self.assertEqual(
+                subject["rootfs_identity_storage"],
+                {
+                    "driver": "guest-pull-images",
+                    "driver_options": [],
+                    "source": "",
+                    "fstype": "",
+                    "options": [f"sha256:{'a' * 64}"],
+                    "mount_point": "",
+                    "fs_group": None,
+                    "shared": False,
                 },
             )
             self.assertEqual(
@@ -255,7 +287,26 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
             self.assertTrue(constraints["/OCI/Process/NoNewPrivileges"])
             self.assertTrue(constraints["/OCI/Root/Readonly"])
             self.assertEqual(constraints["/exec_commands"], [["/bin/check"]])
-            self.assertEqual(subject["unresolved"][0]["name"], "POD_UID")
+            self.assertEqual(
+                subject["environment_resolutions"],
+                [
+                    {
+                        "owner": "kubelet-resolution",
+                        "source": {
+                            "api_version": "v1",
+                            "field_path": "metadata.uid",
+                            "kind": "field-ref",
+                        },
+                        "target": {
+                            "collection": "environment",
+                            "name": "POD_UID",
+                            "path": "/OCI/Process/Env/POD_UID",
+                        },
+                        "value": "$(pod-uid)",
+                        "value_type": "string",
+                    }
+                ],
+            )
             self.assertEqual(
                 subject["volumes"],
                 [
@@ -275,13 +326,9 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
                         "read_only": True,
                         "role": "config-map",
                         "source": {
-                            "content_digest": prototype.content_digest(
-                                {"FROM_CONFIG": "trusted"}
-                            ),
-                            "keys": ["FROM_CONFIG"],
+                            "content_trust": "untrusted-runtime",
                             "name": "config",
                             "namespace": "default",
-                            "status": "resolved",
                         },
                     },
                 ],
@@ -357,6 +404,81 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
             )
             self.assertNotIn("CFG_FROM_CONFIG", subject["constraints"]["/OCI/Process/Env"])
 
+    def test_config_map_key_ref_resolves_to_exact_static_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            documents = self.read_workload(capture)
+            container = self.document(documents, "Pod")["spec"]["containers"][0]
+            container["env"].append(
+                {
+                    "name": "DIRECT_CONFIG",
+                    "valueFrom": {
+                        "configMapKeyRef": {
+                            "key": "FROM_CONFIG",
+                            "name": "config",
+                        }
+                    },
+                }
+            )
+            self.write_workload(capture, documents)
+
+            result = prototype.generate_static_ir(capture)
+
+            subject = result["subjects"][0]
+            self.assertEqual(
+                subject["constraints"]["/OCI/Process/Env"]["DIRECT_CONFIG"],
+                "trusted",
+            )
+            self.assertFalse(
+                any(
+                    resolution["target"]["name"] == "DIRECT_CONFIG"
+                    for resolution in subject["environment_resolutions"]
+                )
+            )
+
+    def test_rejects_unsupported_resource_field_ref(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            documents = self.read_workload(capture)
+            container = self.document(documents, "Pod")["spec"]["containers"][0]
+            container["env"].append(
+                {
+                    "name": "CPU_LIMIT",
+                    "valueFrom": {
+                        "resourceFieldRef": {
+                            "resource": "limits.cpu",
+                        }
+                    },
+                }
+            )
+            self.write_workload(capture, documents)
+
+            with self.assertRaisesRegex(ValueError, "unsupported valueFrom source"):
+                prototype.generate_static_ir(capture)
+
+    def test_rejects_unsupported_field_ref_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            documents = self.read_workload(capture)
+            container = self.document(documents, "Pod")["spec"]["containers"][0]
+            container["env"].append(
+                {
+                    "name": "POD_LABEL",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "fieldPath": "metadata.labels['app']",
+                        }
+                    },
+                }
+            )
+            self.write_workload(capture, documents)
+
+            with self.assertRaisesRegex(ValueError, "unsupported fieldRef path"):
+                prototype.generate_static_ir(capture)
+
     def test_duplicate_trusted_env_from_object_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             capture = Path(temporary)
@@ -418,7 +540,7 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "volumeDevices intent"):
                 prototype.generate_static_ir(capture)
 
-    def test_optional_missing_resource_volume_is_typed_as_absent(self):
+    def test_optional_resource_volume_remains_watchable_when_initially_absent(self):
         with tempfile.TemporaryDirectory() as temporary:
             capture = Path(temporary)
             self.make_capture(capture)
@@ -449,14 +571,14 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
             self.assertEqual(
                 volume["source"],
                 {
+                    "content_trust": "untrusted-runtime",
                     "name": "missing",
                     "namespace": "default",
                     "optional": True,
-                    "status": "absent",
                 },
             )
 
-    def test_generates_secret_downward_api_and_projected_volume_intent(self):
+    def test_generates_secret_and_projected_volume_intent(self):
         with tempfile.TemporaryDirectory() as temporary:
             capture = Path(temporary)
             self.make_capture(capture)
@@ -469,28 +591,11 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
                         "secret": {"optional": False, "secretName": "secret"},
                     },
                     {
-                        "downwardAPI": {
-                            "items": [
-                                {
-                                    "fieldRef": {"fieldPath": "metadata.name"},
-                                    "path": "name",
-                                }
-                            ]
-                        },
-                        "name": "podinfo",
-                    },
-                    {
                         "name": "combined",
                         "projected": {
                             "sources": [
                                 {"configMap": {"name": "config"}},
                                 {"secret": {"name": "secret"}},
-                                {
-                                    "serviceAccountToken": {
-                                        "audience": "api",
-                                        "path": "token",
-                                    }
-                                },
                             ]
                         },
                     },
@@ -499,7 +604,6 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
             pod["spec"]["containers"][0]["volumeMounts"].extend(
                 [
                     {"mountPath": "/credentials", "name": "credentials", "readOnly": True},
-                    {"mountPath": "/podinfo", "name": "podinfo", "readOnly": True},
                     {"mountPath": "/combined", "name": "combined", "readOnly": True},
                 ]
             )
@@ -512,22 +616,175 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
             self.assertEqual(
                 volumes["credentials"]["source"],
                 {
-                    "content_digest": prototype.content_digest(
-                        {"TOKEN": "secret-value"}
-                    ),
-                    "keys": ["TOKEN"],
+                    "content_trust": "untrusted-runtime",
                     "name": "secret",
                     "namespace": "default",
                     "optional": False,
-                    "status": "resolved",
                 },
             )
-            self.assertEqual(volumes["podinfo"]["role"], "downward-api")
             self.assertEqual(volumes["combined"]["role"], "projected")
             self.assertEqual(
                 [source["role"] for source in volumes["combined"]["sources"]],
-                ["config-map", "secret", "service-account-token"],
+                ["config-map", "secret"],
             )
+
+    def test_accepts_yaml_service_account_when_automount_is_disabled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            fixture = Path(__file__).parent / "fixtures" / "service-account-workload.yaml"
+            fixture_pod = yaml.safe_load(fixture.read_text(encoding="utf-8"))
+            documents = self.read_workload(capture)
+            source_pod = self.document(documents, "Pod")
+            fixture_pod["spec"]["containers"][0]["image"] = source_pod["spec"][
+                "containers"
+            ][0]["image"]
+            documents = [
+                fixture_pod if document.get("kind") == "Pod" else document
+                for document in documents
+            ]
+            self.write_workload(capture, documents)
+
+            result = prototype.generate_static_ir(capture)
+
+            self.assertEqual(
+                result["subjects"][0]["service_account"],
+                {"automount_token": False, "name": "workload-identity"},
+            )
+            self.assertEqual(
+                result["subjects"][0]["constraints"]["/OCI/Process/Env"][
+                    "SERVICE_ACCOUNT_NAME"
+                ],
+                "workload-identity",
+            )
+
+    def test_rejects_implicit_service_account_token_automount(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            documents = self.read_workload(capture)
+            del self.document(documents, "Pod")["spec"]["automountServiceAccountToken"]
+            self.write_workload(capture, documents)
+
+            with self.assertRaisesRegex(
+                ValueError, "automountServiceAccountToken must be explicitly false"
+            ):
+                prototype.generate_static_ir(capture)
+
+    def test_rejects_explicit_service_account_token_automount(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            documents = self.read_workload(capture)
+            self.document(documents, "Pod")["spec"]["automountServiceAccountToken"] = True
+            self.write_workload(capture, documents)
+
+            with self.assertRaisesRegex(
+                ValueError, "automountServiceAccountToken must be explicitly false"
+            ):
+                prototype.generate_static_ir(capture)
+
+    def test_rejects_explicit_service_account_token_projection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            documents = self.read_workload(capture)
+            pod = self.document(documents, "Pod")
+            pod["spec"]["volumes"].append(
+                {
+                    "name": "identity",
+                    "projected": {
+                        "sources": [
+                            {
+                                "serviceAccountToken": {
+                                    "audience": "api",
+                                    "expirationSeconds": 3600,
+                                    "path": "token",
+                                }
+                            }
+                        ]
+                    },
+                }
+            )
+            pod["spec"]["containers"][0]["volumeMounts"].append(
+                {"mountPath": "/identity", "name": "identity", "readOnly": True}
+            )
+            self.write_workload(capture, documents)
+
+            with self.assertRaisesRegex(
+                ValueError, "unsupported without trusted in-guest token verification"
+            ):
+                prototype.generate_static_ir(capture)
+
+    def test_rejects_downward_api_volume(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            documents = self.read_workload(capture)
+            pod = self.document(documents, "Pod")
+            pod["spec"]["volumes"].append(
+                {
+                    "downwardAPI": {
+                        "items": [
+                            {
+                                "fieldRef": {"fieldPath": "metadata.name"},
+                                "path": "name",
+                            }
+                        ]
+                    },
+                    "name": "podinfo",
+                }
+            )
+            pod["spec"]["containers"][0]["volumeMounts"].append(
+                {"mountPath": "/podinfo", "name": "podinfo", "readOnly": True}
+            )
+            self.write_workload(capture, documents)
+
+            with self.assertRaisesRegex(
+                ValueError, "incompatible with the Kata-CC threat model"
+            ):
+                prototype.generate_static_ir(capture)
+
+    def test_rejects_projected_downward_api_volume(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            documents = self.read_workload(capture)
+            pod = self.document(documents, "Pod")
+            pod["spec"]["volumes"].append(
+                {
+                    "name": "projected-podinfo",
+                    "projected": {
+                        "sources": [
+                            {
+                                "downwardAPI": {
+                                    "items": [
+                                        {
+                                            "fieldRef": {
+                                                "fieldPath": "metadata.name"
+                                            },
+                                            "path": "name",
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    },
+                }
+            )
+            pod["spec"]["containers"][0]["volumeMounts"].append(
+                {
+                    "mountPath": "/projected-podinfo",
+                    "name": "projected-podinfo",
+                    "readOnly": True,
+                }
+            )
+            self.write_workload(capture, documents)
+
+            with self.assertRaisesRegex(
+                ValueError, "incompatible with the Kata-CC threat model"
+            ):
+                prototype.generate_static_ir(capture)
 
     def test_generates_dmverity_rootfs_from_trusted_artifact_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -551,7 +808,9 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
             )
 
             result = prototype.generate_static_ir(
-                capture, rootfs_artifacts_path=artifacts
+                capture,
+                rootfs_mode="erofs-dmverity",
+                rootfs_artifacts_path=artifacts,
             )
 
             rootfs = result["subjects"][0]["rootfs"]
@@ -559,15 +818,37 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
             self.assertEqual(rootfs["image_manifest_digest"], f"sha256:{'a' * 64}")
             self.assertEqual(rootfs["dm_verity_root_hash"], f"sha256:{'c' * 64}")
             self.assertRegex(rootfs["artifact_manifest_digest"], r"^sha256:[0-9a-f]{64}$")
+            self.assertNotIn("profile_identity", rootfs)
+            marker = result["subjects"][0]["rootfs_identity_storage"]
+            self.assertEqual(marker["driver"], "dmverity-roothashes")
+            self.assertEqual(marker["options"], [f"sha256:{'c' * 64}"])
 
-    def test_dmverity_rootfs_requires_trusted_artifact(self):
+    def test_configured_rootfs_mode_does_not_depend_on_capture_profile(self):
         with tempfile.TemporaryDirectory() as temporary:
             capture = Path(temporary)
             self.make_capture(capture)
             self.write_profile(capture, "erofs-dmverity")
 
+            result = prototype.generate_static_ir(capture)
+
+            self.assertEqual(
+                result["subjects"][0]["rootfs"],
+                {
+                    "image_manifest_digest": f"sha256:{'a' * 64}",
+                    "mode": "guest-pull",
+                },
+            )
+
+    def test_dmverity_rootfs_requires_trusted_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+
             with self.assertRaisesRegex(ValueError, "rootfs artifact is missing"):
-                prototype.generate_static_ir(capture)
+                prototype.generate_static_ir(
+                    capture,
+                    rootfs_mode="erofs-dmverity",
+                )
 
     def test_static_rootfs_requires_capture_profile(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -633,12 +914,21 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = prototype.generate_static_ir(capture, baseline)
+            result = prototype.generate_static_ir(
+                capture,
+                uvm_baseline_path=baseline,
+            )
 
             sandbox = result["subjects"][1]
             self.assertEqual(sandbox["subject"], "sandbox/default/test")
             self.assertEqual(sandbox["constraints"], constraints)
             self.assertEqual(sandbox["static_artifact"], f"sha256:{'a' * 64}")
+            rendered = prototype.render_static_rego_ir(result)
+            rendered_ir = json.loads(rendered.split("ir := ", 1)[1])
+            self.assertEqual(
+                rendered_ir["subjects"][1]["policy"]["OCI"]["Process"]["Env"],
+                ["PATH=/usr/bin"],
+            )
 
     def test_rejects_profile_owned_uvm_static_path(self):
         with tempfile.TemporaryDirectory() as temporary:

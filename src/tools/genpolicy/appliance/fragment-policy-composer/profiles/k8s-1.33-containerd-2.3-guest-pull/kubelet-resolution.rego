@@ -86,15 +86,37 @@ named_service_port_claims(ir) := [claim |
   }
 ]
 
-# Combines regex-valued Service variables and exact named-port variables into
-# the complete kubelet-resolution mutation stream.
+# Resolves typed workload fieldRef declarations into the framework placeholders
+# that runtime validation binds to the request's Pod and node identities.
+environment_resolution_claims(ir) := [claim |
+  some subject in ir.subjects
+  some resolution in subject.environment_resolutions
+  resolution.owner == "kubelet-resolution"
+  resolution.target.collection == "environment"
+  resolution.target.path == sprintf("/OCI/Process/Env/%s", [resolution.target.name])
+  resolution.source.kind == "field-ref"
+  resolution.value_type == "string"
+  claim := {
+    "addition": {"OCI": {"Process": {"Env": {resolution.target.name: resolution.value}}}},
+    "category": "kubelet-resolution",
+    "operation": "resolve",
+    "subject": subject.id,
+    "target": {"path": resolution.target.path},
+  }
+]
+
+# Combines declared fieldRef values, regex-valued Service variables, and exact
+# named-port variables into the complete kubelet-resolution mutation stream.
 service_link_claims(ir) := array.concat(
-  service_env_regex_claims(ir),
-  named_service_port_claims(ir),
+  environment_resolution_claims(ir),
+  array.concat(
+    service_env_regex_claims(ir),
+    named_service_port_claims(ir),
+  ),
 )
 
-# The remaining resolution contract permits only literal unresolved workload
-# environment names; arbitrary environment-path mutations are not accepted.
+# HOSTNAME is a kubelet default rather than a workload valueFrom declaration.
+# It remains an explicit typed-IR gap until hostname policy is modeled.
 fragment := {
   "applies_to": {
     "kubernetes": ["v1.33.13"]
@@ -106,10 +128,7 @@ fragment := {
     {
       "operations": ["resolve"],
       "paths": [
-        "/OCI/Process/Env/HOSTNAME",
-        "/OCI/Process/Env/NODE_NAME",
-        "/OCI/Process/Env/POD_NAME",
-        "/OCI/Process/Env/POD_UID"
+        "/OCI/Process/Env/HOSTNAME"
       ]
     }
   ],

@@ -1,7 +1,7 @@
 package profile_runtime_rs_envelope
 
 # Builds non-OCI Agent request policy owned by runtime-rs: emptyDir storage
-# envelopes and exact CopyFile roots for resolved ConfigMap and Secret volumes.
+# envelopes and exact CopyFile roots for declared ConfigMap and Secret volumes.
 resource_volume_transport := "copy-to-rootfs"
 
 empty_dir_storage(volume) := {
@@ -42,7 +42,7 @@ volume_supported(volume) if {
 volume_supported(volume) if {
 	volume.role in {"config-map", "secret"}
 	resource_volume_transport == "copy-to-rootfs"
-	volume.source.status == "resolved"
+	volume.source.content_trust == "untrusted-runtime"
 	regex.match("^[A-Za-z0-9_-]+$", volume.destination_basename)
 	object.get(volume, "sub_path", "") == ""
 	object.get(volume, "mount_propagation", "") == ""
@@ -55,16 +55,25 @@ volumes_supported(subject) if {
 	}
 }
 
+rootfs_identity_storages(subject) := [subject.rootfs_identity_storage] if {
+	subject.rootfs_identity_storage.driver in {"dmverity-roothashes", "guest-pull-images"}
+}
+
+rootfs_identity_storages(subject) := [] if {
+	not subject.rootfs_identity_storage.driver in {"dmverity-roothashes", "guest-pull-images"}
+}
+
 # Replaces /storages for each fully supported subject. Memory emptyDir becomes
 # guest tmpfs, node-default emptyDir becomes local storage, and copy-to-rootfs
 # ConfigMap/Secret volumes intentionally add no Storage object.
 volume_storage_claims(ir) := [claim |
 	some subject in ir.subjects
 	volumes_supported(subject)
-	storages := [empty_dir_storage(volume) |
+	volume_storages := [empty_dir_storage(volume) |
 		some volume in subject.volumes
 		volume.role == "empty-dir"
 	]
+	storages := array.concat(rootfs_identity_storages(subject), volume_storages)
 	claim := {
 		"addition": {"storages": storages},
 		"category": "runtime-rs-envelope",
@@ -74,8 +83,9 @@ volume_storage_claims(ir) := [claim |
 	}
 ]
 
-# Derives deduplicated CopyFile root prefixes from resolved ConfigMap and Secret
-# destination basenames. The prefix deliberately carries no end anchor: the
+# Derives deduplicated CopyFile root prefixes from declared ConfigMap and Secret
+# destination basenames. Content delivered beneath these roots is untrusted and
+# mutable. The prefix deliberately carries no end anchor: the
 # Agent builds its symlink rule by concatenating ".*/.+" onto each entry, so a
 # trailing "$" would make symlinks unmatchable and a trailing "/" would consume
 # the separator that suffix needs, denying the "..data" and per-key symlinks
@@ -86,7 +96,7 @@ copy_file_patterns(ir) := sort({pattern |
 	some subject in ir.subjects
 	some volume in subject.volumes
 	volume.role in {"config-map", "secret"}
-	volume.source.status == "resolved"
+	volume.source.content_trust == "untrusted-runtime"
 	regex.match("^[A-Za-z0-9_-]+$", volume.destination_basename)
 	pattern := sprintf(
 		"^$(cpath)/$(bundle-id)-[0-9a-f]{16}-%s",

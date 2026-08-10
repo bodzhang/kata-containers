@@ -50,11 +50,12 @@ class RegorusFragmentInputTests(unittest.TestCase):
             "static_policy": {"policy_data": {}, "subjects": []},
         }
         profile = {
-            "rootfs_mode": "guest-pull",
+            "rootfs_mode": "erofs-dmverity",
             "values": {"CONTAINERD_VERSION": "v2.3.3", "KUBERNETES_VERSION": "v1.33.13"},
         }
+        static_ir = {"rootfs_mode": "guest-pull", "subjects": []}
 
-        result = renderer.regorus_static_ir(report, None, profile)
+        result = renderer.regorus_static_ir(report, static_ir, profile)
 
         self.assertNotIn("profile_identity", result)
         self.assertEqual(result["capture_provenance"], "a" * 64)
@@ -70,7 +71,52 @@ class RegorusFragmentInputTests(unittest.TestCase):
             },
         )
 
-    def test_copy_file_patterns_are_sorted_deduplicated_and_resolved(self):
+    def test_static_rego_ir_preserves_rootfs_authority(self):
+        report = {
+            "binding": {
+                "profile_identity": "a" * 64,
+                "static_base_digest": "b" * 64,
+            },
+            "fragments": [],
+            "static_policy": {
+                "policy_data": {},
+                "subjects": [
+                    {
+                        "id": "container/app",
+                        "ordinal": 0,
+                        "policy": {},
+                    }
+                ],
+            },
+        }
+        rootfs = {
+            "artifact_manifest_digest": f"sha256:{'c' * 64}",
+            "dm_verity_root_hash": f"sha256:{'d' * 64}",
+            "image_manifest_digest": f"sha256:{'e' * 64}",
+        }
+        static_ir = {
+            "rootfs_mode": "erofs-dmverity",
+            "subjects": [
+                {
+                    "rootfs": rootfs,
+                    "rootfs_identity_storage": {
+                        "driver": "dmverity-roothashes",
+                        "options": [f"sha256:{'d' * 64}"],
+                    },
+                    "subject": "container/app",
+                }
+            ]
+        }
+
+        result = renderer.regorus_static_ir(report, static_ir)
+
+        self.assertEqual(result["subjects"][0]["rootfs"], rootfs)
+        self.assertEqual(
+            result["subjects"][0]["rootfs_identity_storage"]["driver"],
+            "dmverity-roothashes",
+        )
+
+    def test_copy_file_patterns_are_sorted_deduplicated_and_watchable(self):
         static_ir = {
             "subjects": [
                 {
@@ -78,22 +124,22 @@ class RegorusFragmentInputTests(unittest.TestCase):
                         {
                             "role": "secret",
                             "destination_basename": "credentials",
-                            "source": {"status": "resolved"},
+                            "source": {"content_trust": "untrusted-runtime"},
                         },
                         {
                             "role": "config-map",
                             "destination_basename": "configuration",
-                            "source": {"status": "resolved"},
+                            "source": {"content_trust": "untrusted-runtime"},
                         },
                         {
                             "role": "config-map",
                             "destination_basename": "configuration",
-                            "source": {"status": "resolved"},
+                            "source": {"content_trust": "untrusted-runtime"},
                         },
                         {
                             "role": "secret",
                             "destination_basename": "missing",
-                            "source": {"status": "absent"},
+                            "source": {"content_trust": "pinned-static"},
                         },
                     ]
                 }
@@ -350,6 +396,41 @@ class RegorusFragmentInputTests(unittest.TestCase):
         )
         self.assertEqual(result[1], materializations[1])
 
+    def test_filter_removes_only_declared_environment_resolutions(self):
+        materializations = [
+            {
+                "category": "kubelet-resolution",
+                "claims": [
+                    {"target": {"path": "/OCI/Process/Env/POD_UID"}},
+                    {"target": {"path": "/OCI/Process/Env/HOSTNAME"}},
+                ],
+            }
+        ]
+        static_ir = {
+            "subjects": [
+                {
+                    "environment_resolutions": [
+                        {
+                            "target": {
+                                "name": "POD_UID",
+                                "path": "/OCI/Process/Env/POD_UID",
+                            }
+                        }
+                    ],
+                    "subject": "container/app",
+                }
+            ]
+        }
+
+        result = renderer.remove_profile_generated_materializations(
+            materializations, static_ir
+        )
+
+        self.assertEqual(
+            result[0]["claims"],
+            [{"target": {"path": "/OCI/Process/Env/HOSTNAME"}}],
+        )
+
     def test_filter_removes_only_profile_generated_oci_defaults(self):
         generated_path = "/OCI/Linux/MaskedPaths"
         unresolved_path = "/OCI/Mounts"
@@ -456,13 +537,13 @@ class RegorusFragmentInputTests(unittest.TestCase):
                             "destination_basename": "configuration",
                             "name": "config",
                             "role": "config-map",
-                            "source": {"status": "resolved"},
+                            "source": {"content_trust": "untrusted-runtime"},
                         },
                         {
                             "destination_basename": "credentials",
                             "name": "secret",
                             "role": "secret",
-                            "source": {"status": "resolved"},
+                            "source": {"content_trust": "untrusted-runtime"},
                         },
                     ],
                 },

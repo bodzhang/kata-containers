@@ -76,9 +76,11 @@ and
 ## Terminology
 
 Static policy
-:   Constraints derived from trusted workload YAML, referenced ConfigMaps and
-  Secrets, image configuration bound to a manifest digest, or a measured UVM
-  artifact such as the built-in pause container.
+:   Constraints derived from trusted workload YAML, authenticated optional
+  policy inputs, image configuration bound to a manifest digest, or a measured
+  UVM artifact such as the built-in pause container. A ConfigMap or Secret
+  volume reference is static intent; its mutable runtime content is not static
+  policy.
 
 UVM-static policy
 :   Constraints derived from the measured UVM image and independent of the
@@ -286,10 +288,11 @@ either generated policy:
 - explicit or image working directory;
 - explicit no-new-privileges and read-only-rootfs intent;
 - probe and lifecycle exec commands; and
-- a per-container rootfs authorization plan for guest-pull or EROFS dm-verity;
+- per-container rootfs authority containing the digest-bound image identity and
+  any independently trusted artifact measurements;
 - per-container volume mount intent for supported YAML-native volume classes;
-- unresolved `valueFrom` declarations as typed `resolve` anchors, not captured
-  values.
+- typed environment resolution declarations with explicit policy targets and
+  sources, never captured values.
 
 It rejects image references that are not manifest-digest bound. It does not yet
 classify user and group resolution, capability deltas other than explicit final
@@ -326,18 +329,135 @@ contributes no environment values.
 
 !!! warning "Object content authority"
     Workload YAML names an object but does not authenticate its contents. The
-    supplied ConfigMap or Secret must come from trusted deployment input or be
-    verified against an independently trusted digest. The content digest binds
-    the static base to the supplied data; it does not by itself establish who
-    supplied that data.
+    supplied ConfigMap or Secret may become an exact environment constraint
+    only when it is authenticated policy-generation input. A normal
+    host-resolved Kubernetes object is mutable and controlled by the untrusted
+    host in the Kata-CC threat model; it must not be relabeled trusted or
+    accepted through an unconstrained environment value. Such environment
+    references fail closed until an authenticated in-guest resolver or an
+    explicit workload-owner constraint is available.
+
+##### Restart and rollout semantics
+
+Kubernetes resolves `envFrom`, `configMapKeyRef`, and `secretKeyRef` while
+constructing a container environment. Updating the referenced object does not
+change the environment of an already running process and does not by itself
+restart a Pod. A later container restart, replacement Pod, or Deployment
+rollout can resolve the same object reference to different values.
+
+| Event | Kubernetes behavior | Kata-CC policy behavior |
+| --- | --- | --- |
+| ConfigMap or Secret changes while the container runs | Existing process environment is unchanged | Existing exact environment constraint remains valid |
+| Container restarts in the same Pod | Kubelet may construct the new container with current object values | Changed values are denied by the existing policy |
+| Pod replacement or Deployment rollout | New containers may receive current object values | Changed values require a newly authenticated policy |
+| Object has `immutable: true` | Kubernetes API mutation is disabled | The field does not authenticate bytes against the untrusted host |
+
+!!! warning "Transparent restart updates are not secure"
+    A policy cannot distinguish an intended ConfigMap or Secret update from a
+    malicious host substitution when both arrive as changed environment
+    strings. Authorizing any value for a declared environment name is unsafe:
+    variables can alter dynamic linking, executable lookup, credentials, or
+    application control flow. Consequently, the normal Kubernetes expectation
+    that a restarted container can consume newly resolved values is
+    intentionally fail-closed under the Kata-CC threat model.
+
+    Supporting an intended change requires one of these trust transitions:
+
+    - generate and install a new policy from authenticated object contents
+      before restarting the container;
+    - verify workload-owner-signed or authenticated-encrypted content through
+      a trusted in-guest resolver; or
+    - deliver the data as an explicitly untrusted mounted input to an
+      application designed to validate it, rather than as process environment.
+
+    Restarting without one of these transitions may fail container creation.
+    This availability cost is required to avoid silently converting host
+    mutation into trusted process configuration.
+
+#### Static `valueFrom` IR
+
+Every deferred environment declaration identifies its collection, exact target
+name and JSON-pointer path, source type, owner, and value type. Environment
+context is therefore explicit rather than implied by an opaque `unresolved`
+list:
+
+```json
+{
+  "owner": "kubelet-resolution",
+  "source": {
+    "api_version": "v1",
+    "field_path": "metadata.uid",
+    "kind": "field-ref"
+  },
+  "target": {
+    "collection": "environment",
+    "name": "POD_UID",
+    "path": "/OCI/Process/Env/POD_UID"
+  },
+  "value": "$(pod-uid)",
+  "value_type": "string"
+}
+```
+
+The current prototype supports `metadata.name`, `metadata.namespace`,
+`metadata.uid`, `spec.nodeName`, and `spec.serviceAccountName`. The
+ServiceAccount name is an exact static environment value derived from trusted
+Pod intent; the other generated fields use typed resolution declarations where
+needed. Kubelet-resolution Rego iterates those declarations and emits an exact
+claim at each declared target; capture-derived materializations for those paths
+are removed before composition. A fragment cannot introduce another
+environment name because no declaration provides its target.
+
+`configMapKeyRef` and `secretKeyRef` become exact static environment values
+when the referenced trusted object and key are supplied. Missing required
+objects or keys fail generation, while a missing optional reference contributes
+no value. Unsupported field paths, `resourceFieldRef`, and unknown or malformed
+`valueFrom` forms currently fail generation. `resourceFieldRef` can be enabled
+after container resource intent and divisor arithmetic are represented in the
+IR.
+
+!!! danger "No runtime binding for object-derived environment values"
+    The prototype can place a ConfigMap or Secret value in static policy when
+    an authenticated object is supplied during policy generation. The current
+    framework, however, has no end-to-end mechanism that binds the
+    `configMapKeyRef`, `secretKeyRef`, or `envFrom` value presented in a later
+    `CreateContainerRequest` to that authenticated generation-time object. It
+    also has no trusted object watcher or in-guest Kubernetes API resolver.
+
+    Consequently, policy generation from an ordinary cluster ConfigMap or
+    Secret must not imply that the runtime value is trusted. An untrusted host
+    can substitute the environment string before initial container creation or
+    after an intended object update and restart. The Agent sees only the final
+    name/value environment entries; it does not receive authenticated object
+    identity, key, resource version, or content provenance with which to
+    distinguish those cases.
+
+    Production support therefore requires a framework layer that carries an
+    authenticated binding from workload-owner policy input to the exact
+    environment value checked by the Agent. Until that exists, ordinary
+    host-resolved ConfigMap and Secret environment references are unsupported
+    and fail closed. A value embedded by the prototype demonstrates static
+    policy construction, not secure Kubernetes watch or restart semantics.
 
 #### Static rootfs IR
 
-The rootfs plan records workload authority separately from the concrete Agent
-`Storage` envelope. For guest-pull, it is derived from the digest-bound image
-reference and the capture profile. For EROFS dm-verity, generation additionally
-requires a trusted rootfs artifact manifest supplied with
-`--rootfs-artifacts`:
+The rootfs object records workload and image authority separately from the
+concrete Agent `Storage` envelope. Rootfs mode is an explicit trusted input to
+the IR generator, not a value learned from a capture. The generator accepts
+`guest-pull` or `erofs-dmverity` and emits the exact per-container identity rule
+for that mode. It does not embed capture-profile identity.
+
+Every workload image reference must be manifest-digest pinned. The generator
+may fetch the image index, selected-platform manifest, config, and layers from
+an external registry or content store; that source is not trusted. Before using
+the content, it verifies the requested digest, selected-manifest descriptor,
+config digest, every compressed layer digest and size, and every uncompressed
+layer `diff_id` from the image config. Image configuration and container
+binaries become trusted policy-generation input only through this verified
+digest chain.
+
+EROFS dm-verity measurements are supplied through a trusted rootfs artifact
+manifest passed with `--rootfs-artifacts`:
 
 ```json title="rootfs-artifacts.json"
 {
@@ -351,24 +471,33 @@ requires a trusted rootfs artifact manifest supplied with
 ```
 
 The artifact map is keyed by manifest digest rather than repository-qualified
-image reference. The generated subject records the selected mode, manifest
-digest, capture-profile identity, and, for dm-verity, the exact root hash and a
-digest of the artifact manifest. The profile identity binds rootfs mode and the
-captured Kata configuration hashes; the static-base digest subsequently binds
-the complete rootfs plan.
+image reference. Every generated container subject records the manifest digest.
+When a matching trusted artifact is supplied, it also records the exact
+dm-verity root hash and a digest of the artifact manifest. The static-base
+digest binds this complete rootfs authority.
+
+For guest-pull, the static subject emits a policy-only `guest-pull-images`
+marker containing the exact manifest digest. For EROFS dm-verity, generation
+requires the trusted artifact measurement and emits a policy-only
+`dmverity-roothashes` marker containing the exact root hash. These markers are
+ordinary static policy rules consumed by the Agent storage validator; they are
+never sent in an Agent request. Generation fails when the selected mode lacks
+its required identity input.
 
 !!! warning "Artifact authority"
     Passing a JSON file does not establish its trust. The caller must obtain the
-    dm-verity artifact manifest through a trusted image build, snapshotter, or
-    signing workflow and verify it before policy generation. Final Agent
-    requests and storage-predictor output are comparison evidence, not root-hash
-    authority.
+  dm-verity artifact manifest from an EROFS/verity build over the verified
+  image contents and authenticate the binding to the manifest digest. A
+  future integrated builder can perform this step inside GenPolicy. Final
+  Agent requests and storage-predictor output are comparison evidence, not
+  root-hash authority.
 
-The plan intentionally excludes bundle and sandbox IDs, mount points, writable
-upper-layer devices, and block-device addresses. Runtime validators correlate
-those generated transport values with the static subject. Unit tests generate
-both guest-pull and dm-verity plans with empty request directories, proving that
-the rootfs identity is not learned from a captured `CreateContainerRequest`.
+The rootfs object intentionally excludes bundle and sandbox IDs, mount points,
+writable upper-layer devices, and block-device addresses. Runtime validators
+correlate those generated transport values with the static subject. Unit tests
+generate both manifest-only and dm-verity authority with empty request
+directories, proving that the rootfs identity is not learned from a captured
+`CreateContainerRequest`.
 
 #### Static volume mount IR
 
@@ -389,28 +518,148 @@ destination, read-only state, and source semantics. For example:
 }
 ```
 
-The prototype supports disk and memory `emptyDir`, ConfigMap, Secret, downward
-API, and projected volumes. Projected ConfigMap and Secret entries retain their
-object identity, and service-account-token projections retain their declared
-audience, path, and expiration settings. Static `subPath`, mount propagation,
-and recursive-read-only declarations are preserved.
+The prototype supports disk and memory `emptyDir`, direct ConfigMap and Secret
+mounts, and projected volumes that do not contain a Downward API source.
+Projected ConfigMap and Secret entries retain their object identity. Projected
+ServiceAccount tokens are rejected until trusted guest verification exists.
+Static `subPath`, mount propagation, and recursive-read-only declarations are
+preserved.
 
 Generation fails for undeclared or duplicate volume identities, duplicate
 destinations, unsupported source types, dynamic `subPathExpr`, and
-`volumeDevices`. The last two require typed value binding and device authority
-rather than being copied from a final request.
+`volumeDevices`. Direct ConfigMap and Secret mounts remain supported with
+`content_trust = untrusted-runtime`; their presence does not authorize object
+bytes as policy facts. Direct Downward API volumes and projected volumes
+containing a `downwardAPI` source fail policy generation because the current
+Agent interface cannot authenticate their rendered values. Dynamic subpaths
+and devices require typed value binding and device authority rather than being
+copied from a final request.
 
 The IR does not contain host source paths, watchable sandbox paths, runtime-rs
 `Storage` objects, or block-device addresses. HostPath, PVC, CSI, and other
 externally resolved sources remain unsupported until a trusted resolver can
 bind their workload declaration to the required host or device identity.
 
-!!! warning "Mounted object contents"
-  ConfigMap, Secret, downward-API, and projected source identity constrains
-  which declared object may populate a mount; it does not authenticate the
-  bytes delivered through a host-backed shared filesystem. Integrity or
-  confidentiality of those bytes requires a trusted in-guest copy,
-  verification, or secret-delivery mechanism.
+!!! warning "Mounted object contents are adversarial"
+    ConfigMap, Secret, downward-API, and projected source identity constrains
+    the declared mount role; it does not authenticate bytes delivered by the
+    untrusted host. The IR marks ConfigMap and Secret content as
+    `untrusted-runtime` for ConfigMap and Secret content and deliberately
+    carries no content digest or resolved snapshot. This permits Kubernetes
+    watch updates without treating any update as trusted. Downward API volume
+    delivery is rejected separately.
+
+    The guest confines delivery to a declared staging root, rejects traversal
+    and absolute symlink targets, and correlates an exact read-only container
+    mount with the declared destination. These controls limit filesystem
+    authority but cannot make arbitrary application input safe. Workloads must
+    parse mounted data defensively. Security-critical configuration and
+    confidential secrets require workload-owner signatures, authenticated
+    encryption, or a trusted in-guest secret-delivery mechanism. A normal
+    Kubernetes Secret is neither integrity-protected from nor confidential
+    against the host under this threat model.
+
+##### Downward API mounted-volume challenges
+
+A Downward API volume asks kubelet to render Pod metadata or container
+resource data as files. The workload declaration fixes the destination and
+requested field, but the untrusted host supplies the staged directory, file
+bytes, metadata, symlinks, and update sequence observed by the guest. Merely
+authorizing a declared `fieldRef` does not prove that the corresponding file
+contains the declared field's correct value.
+
+Downward API sources have different authority requirements:
+
+| Source class | Examples | Required Kata-CC treatment |
+| --- | --- | --- |
+| YAML-static | Explicit namespace, labels, annotations, resource requests and limits | Derive the expected bytes from authenticated workload IR |
+| Platform-generated but bindable | Pod name, Pod UID, node name, Pod IP | Bind the generated identity once, then require mounted bytes to equal that binding |
+| Mutable metadata | Labels and annotations changed after Pod creation | Treat updates as untrusted unless authorized by a new policy or authenticated in-guest channel |
+| Computed resources | `resourceFieldRef` with container selection and divisor | Reproduce Kubernetes quantity and divisor arithmetic from typed resource IR |
+
+The current Agent `CopyFileRequest` policy cannot compare regular-file data
+with an expected IR value because regular-file bytes are intentionally omitted
+from policy input. It can constrain the staging path, file type, offset, and
+symlink shape, but a malicious host can still place attacker-selected bytes in
+an otherwise authorized Downward API file. Atomic `..data` symlink swaps also
+mean validation must cover every update, not only the directory mounted during
+container creation.
+
+Until a trusted guest component renders Downward API files from bound IR, or
+the Agent verifies authenticated file content before exposure, the container
+must treat mounted values as adversarial. This is adequate only when the
+application validates the data and does not use it as security authority. It
+is not adequate for values that select executables, credentials, policy,
+network peers, or other privileged behavior. Unlike direct ConfigMap and Secret
+mounts, Downward API files claim to represent platform identity and resource
+facts that policy may otherwise bind and trust. The static IR generator
+therefore rejects both direct and projected Downward API volume delivery rather
+than retaining captured materializations that could silently authorize forged
+platform facts.
+
+!!! warning "Environment delivery is more dangerous than file delivery"
+    With a mounted volume, an application can choose a defensive parser,
+    validate a signature, reject an unexpected value, or ignore the file. A
+    `fieldRef`, `resourceFieldRef`, `configMapKeyRef`, `secretKeyRef`, or
+    `envFrom` value is inserted into the process environment before the
+    application starts. The value may influence the dynamic loader, executable
+    search, language runtime, credentials, or application initialization before
+    application-level validation is possible.
+
+    Typed `fieldRef` placeholders are safe only where fragments correlate them
+    with an independently trusted or bound Pod value. `resourceFieldRef` remains
+    unsupported until its arithmetic is derived from typed resource intent.
+    ConfigMap and Secret environment values remain unsupported for ordinary
+    mutable Kubernetes objects because the framework has no authenticated path
+    from the generation-time object to the runtime environment entry.
+
+##### ServiceAccount token admission and policy generation
+
+Kubernetes assigns every Pod a ServiceAccount, using `default` when
+`serviceAccountName` is absent. Unless Pod-level or ServiceAccount-level
+`automountServiceAccountToken` disables automount, admission normally injects a
+`kube-api-access` projected volume and mount. That projection commonly combines
+a short-lived `serviceAccountToken`, the namespace through Downward API, and a
+root-CA ConfigMap. This behavior occurs even when none of those volumes appears
+in the submitted workload YAML.
+
+The appliance submission path creates a real Pod through the API server, so
+its captured Pod and `CreateContainerRequest` can include this admission-added
+projection. The storage predictor and policy compiler then treat the projection
+as a generic kubelet-prepared bind mount: they normalize and constrain its guest
+path, but do not verify token signature, issuer, audience, expiration,
+ServiceAccount UID, or Pod UID binding. Capture therefore proves transport
+shape only; it does not establish token authority.
+
+The static IR generator applies these fail-closed rules:
+
+- every Pod or controller template must set
+  `automountServiceAccountToken: false` explicitly;
+- `serviceAccountName` is allowed and recorded when Pod-level automount is
+  disabled;
+- omission and explicit `automountServiceAccountToken: true` are rejected;
+- every explicit projected `serviceAccountToken` source is rejected; and
+- every direct or projected Downward API volume remains rejected.
+
+The appliance submission validator applies the same checks before calling
+`kubectl create`, preventing API admission from injecting an unsupported token
+volume during production policy generation. Explicit capture-only runs may
+bypass this guard to collect comparison evidence. Such a capture remains
+ineligible for static IR generation and cannot become production policy
+authority.
+
+Requiring the Pod-level field avoids depending on a separately resolved and
+mutable ServiceAccount object. A ServiceAccount-level
+`automountServiceAccountToken: false` does not satisfy generation because the
+current static generator has no authenticated admission resolver proving that
+the setting governed the created Pod.
+
+!!! note "Future token support"
+    A projected token could be supported after a trusted guest component
+    verifies the API-server signature and trusted issuer, expected audience,
+    expiry, ServiceAccount identity, and bound Pod identity on initial delivery
+    and every rotation. Until then, allowing the mount merely because its path
+    matches would delegate identity authority to the untrusted host.
 
 ### Kubernetes API and controller fragment
 
@@ -434,7 +683,8 @@ not identify their behavior.
 
 This fragment owns translation from the bound Pod to CRI input:
 
-- `fieldRef`, `resourceFieldRef`, ConfigMap, and Secret environment resolution;
+- typed `fieldRef`, ConfigMap, and Secret environment resolution
+  (`resourceFieldRef` remains fail-closed pending typed resource arithmetic);
 - service-link environment variables;
 - Pod hostname;
 - termination-message and Kubernetes-managed file mounts;
@@ -560,7 +810,7 @@ profile constant.
 
 | Runtime-rs behavior | Dependency class | Required static or bound input | Reusable rule shape |
 | --- | --- | --- | --- |
-| Bundle annotation and guest root path | Bound identity plus static rootfs identity | Exact workload subject, image/rootfs mode, bound bundle ID | Require one bundle ID across annotation, root path, rootfs storage, and mounts |
+| Bundle annotation and guest root path | Bound identity plus static rootfs identity | Exact workload subject, image identity, optional root hash, bound bundle ID | Require one bundle ID across annotation, root path, rootfs storage, and mounts |
 | Container-type annotation | Static role | Application, sandbox, or explicitly modeled single-container role | Add the exact annotation value selected by the static role |
 | PID/network/time namespace normalization | Static Pod namespace intent plus runtime profile | Host namespace and shared-PID declarations | Remove paths/types only for the reviewed profile branch and require the expected final namespace set |
 | Mount-source rewrites | Static volume role and destination plus bound IDs | Declared volume, destination, access mode, Pod/sandbox ID, bundle ID | Rewrite only the source representation; preserve exact destination and volume semantics |
@@ -598,23 +848,19 @@ dependencies. Its `runtime-rs` and `runtime-rs-envelope` labels establish
 provisional transformation ownership, not static independence or publishable
 fragment scope.
 
-### Rootfs and storage-mode fragment
+### Rootfs and storage lowering
 
-Storage behavior merits a separate fragment because it depends on trusted Kata
-configuration and snapshotter artifacts, not only runtime-rs version:
+Rootfs identity does not require a separate profile fragment. GenPolicy emits
+the final guest-pull digest or dm-verity root-hash marker in static IR. Existing
+Agent framework rules compare concrete rootfs storage requests with that exact
+per-container marker.
 
-- guest pull: exact workload manifest digest; the built-in pause root remains
-  UVM-static and is not authorized by a CRI image reference;
-- EROFS/dm-verity: exact root hash, layer identity, driver, and options;
-- shared filesystem: source constrained to the configured shared domain;
-- `shared_fs = "none"`: Agent-local disk `emptyDir` fallback;
-- encrypted block `emptyDir`: encryption options and device correlation;
-- plain block `emptyDir`: explicit opt-in and exact unencrypted shape;
-- memory `emptyDir`: exact tmpfs storage shape;
-- ConfigMap, Secret, downward API, and projected-volume copy-to-guest rewrites.
-
-This category consumes static volume intent but cannot change volume role,
-destination, access mode, or encryption requirement.
+The runtime-rs envelope fragment still owns profile-dependent transport shape:
+drivers, mount points, generated device addresses, writable upper layers, and
+correlation with bundle and sandbox IDs. It also lowers static volume intent
+for shared filesystems, `emptyDir`, and copy-to-guest transports. Those rules
+may carry a static rootfs marker into the final `storages` collection, but they
+cannot select, broaden, or replace its digest or root hash.
 
 ### Generated identity and correlation framework
 
@@ -723,8 +969,9 @@ A fragment feed is readable metadata, not sufficient compatibility proof.
 Composition binds two different identities:
 
 Static base identity
-:   Hashes the trusted workload inputs, digest-bound workload images, measured
-    UVM image, and built-in pause artifact.
+:   Hashes the trusted workload inputs, verified digest-bound workload image
+  content, selected rootfs mode and identity rules, measured UVM image, and
+  built-in pause artifact.
 
 Mutation profile identity
 :   Hashes only the components, configurations, and operating modes that can
@@ -732,9 +979,10 @@ Mutation profile identity
 
 Separating them permits one reviewed containerd fragment to be reused across
 UVM images when its claims do not depend on UVM content. A fragment declares
-any static-base capability it consumes; a rootfs/storage fragment may depend on
-UVM facilities even though a containerd OCI fragment does not. The composition
-manifest binds both identities and rejects an undeclared dependency.
+any static-base capability it consumes; a runtime-rs envelope fragment may
+depend on UVM storage facilities even though a containerd OCI fragment does
+not. The composition manifest binds both identities and rejects an undeclared
+dependency.
 
 !!! warning "Identity binding is declarative in the prototype"
     The generator computes both identities: `profile_identity` is a verified
@@ -889,10 +1137,12 @@ flowchart LR
 ```
 
 `generate_regorus_fragment_inputs.py` invokes the independent static generator
-on workload YAML, digest-indexed image configuration, trusted ConfigMap and
-Secret objects, and a measured UVM pause baseline. The generated sparse IR does
-not read policy-compiler output to obtain static values. It contains stable,
-ordered subjects and explicit leaf ownership metadata.
+on workload YAML, digest-indexed image configuration, optional authenticated
+ConfigMap and Secret inputs for exact environment values, and a measured UVM
+pause baseline. Mutable volume content is not a static generator input. The
+generated sparse IR does not read policy-compiler output to obtain static
+values. It contains stable, ordered subjects and explicit leaf ownership
+metadata.
 
 The selected mutation inputs retain the design's two non-static layers:
 
@@ -914,10 +1164,11 @@ or any generated materialization lacks a contract. `compose.rego` repeats the
 materialization-contract check in Regorus.
 
 Reviewed category contracts constrain each layer. Kubernetes/controller claims
-derive or generate OCI annotations. Kubelet resolution claims add environment
-entries anchored to declared inputs and bound cluster state. Containerd claims
-add OCI defaults. Runtime-rs claims add guest rewrites, while runtime envelope
-claims add non-OCI request fields. Policy-framework claims add global settings.
+derive or generate OCI annotations. Kubelet resolution claims iterate typed
+`environment_resolutions` and add Service entries anchored to declared inputs
+and bound cluster state. Containerd claims add OCI defaults. Runtime-rs claims
+add guest rewrites, while runtime envelope claims add non-OCI request fields.
+Policy-framework claims add global settings.
 
 `kubelet-or-containerd.rego` is also an executable transformation, not only a
 path contract. For every selected static-IR subject it generates the exact
@@ -943,15 +1194,15 @@ records each container's volume name, destination, read-only flag, and typed
 source intent. For `emptyDir`, that source includes `memory` or `node-default`
 medium and an optional size limit; it does not contain a captured guest path or
 storage driver. ConfigMap and Secret sources record namespace, object name,
-resolved or absent status, sorted keys, and a content digest without embedding
-values. The digest participates in static-base binding even though the Agent
-mount policy does not inspect file content.
+optionality, and `content_trust = untrusted-runtime`. They do not record current
+existence, keys, values, or a content digest. Object appearance, removal, and
+watch updates therefore do not require policy regeneration.
 
 `runtime-rs-envelope.rego` lowers supported intents into exact per-container
 `storages`: memory volumes become pinned ephemeral `tmpfs` templates and
 node-default volumes become local-storage templates parameterized by
 `$(cpath)` and `$(sandbox-id)`. The selected profile declares
-`copy-to-rootfs` resource transport, so resolved ConfigMap and Secret volumes
+`copy-to-rootfs` resource transport, so declared ConfigMap and Secret volumes
 add no storage. `runtime-rs.rego` combines reviewed role-specific base mounts
 with exact bind mounts derived from destination and read-only intent. Resource
 mount sources pin the destination basename and parameterize only the container
@@ -960,7 +1211,7 @@ ID and runtime-rs random segment:
 
 The runtime-rs envelope also owns the policy-wide
 `/request_defaults/CopyFileRequest` array. It derives one sorted, deduplicated
-prefix for each resolved ConfigMap or Secret destination:
+prefix for each declared ConfigMap or Secret destination:
 `^$(cpath)/$(bundle-id)-[0-9a-f]{16}-<basename>`. This denies every undeclared
 destination basename, and an absent optional resource contributes no prefix.
 This replaces the compiler's broad `$(sfprefix)` default, which admitted every
@@ -980,14 +1231,19 @@ runtime-generated copy root.
 
 The Agent still validates file type, offset range, path traversal, and relative
 symlink targets. It intentionally omits regular-file data from policy input, so
-the trusted content digest binds static evidence but does not provide CopyFile
-content-integrity enforcement.
+the policy cannot authenticate ConfigMap or Secret bytes. The current rules
+also do not impose a cumulative byte quota or constrain requested ownership and
+mode. Guest-side quotas and metadata constraints are required hardening against
+resource-exhaustion and permission attacks; they still would not establish
+content integrity.
 
 Lowering is all-or-nothing per subject. A size-limited `emptyDir`, unresolved
-optional resource, unsafe basename, subpath, mount propagation, projected
-volume, or downward-API volume keeps both mount and storage materializations
-until its complete typed transformation exists. The generator removes no claim
-for a partially supported or unknown subject.
+optional resource, unsafe basename, subpath, mount propagation, or supported
+projected volume keeps both mount and storage materializations until its
+complete typed transformation exists. Direct or projected Downward API volume
+delivery fails policy generation instead of entering this fallback. The
+generator removes no claim for any other partially supported or unknown
+subject.
 
 Service environment variables illustrate the separation. The static IR records
 the trusted Service name, namespace, declared ports, and each container's
@@ -1171,7 +1427,7 @@ complex-workload bundles produced the following result:
 | UVM-static pause constraints generated | 7 | 7 |
 | Matching Legacy constraints | 9 | 9 |
 | Matching request-derived compiler constraints | 16 | 16 |
-| Unresolved `valueFrom` anchors retained | 3 | 3 |
+| Typed environment resolutions retained | 3 | 3 |
 
 The constraints cover two workload containers. They include arguments,
 environment subsets, working directories, no-new-privileges, and exec commands.
@@ -1289,12 +1545,12 @@ defaults that should be expressed as exact role rules rather than regex.
 | Pod hostname and `HOSTNAME` | Do not use a free-standing hostname regex | Only when the profile injects it into every application container | Derive the value from the bound Pod name or exact `spec.hostname`, then fan out that exact value |
 | Namespace and node name | No generic regex; both select administrative or scheduling context | Only fields that the platform actually emits | Use the exact default or workload namespace and the selected, profile-authorized node identity |
 | CRI Pod annotations | Grammars may validate encoded IDs, not authorize new identities | Common annotation keys may use an application-role template | Require each annotation value to equal the already bound Pod, sandbox, container, namespace, or workload value |
-| `fieldRef` environment | No generic value regex | Only containers that statically declare that `fieldRef` | Resolve the declared field from bound Pod data and add the exact name/value to those subjects |
-| `resourceFieldRef` environment | Numeric syntax alone is insufficient | Only the declaring container | Derive the exact value from that container's static resource request/limit and divisor |
-| ConfigMap and Secret environment | No regex for names or values | Only containers with the corresponding `env` or `envFrom` declaration | Bind the declared object/key and exact resolved content, or a trusted content digest; preserve precedence per container |
+| `fieldRef` environment | No generic value regex | Only containers with a typed `environment_resolutions` declaration | Generate an exact claim from the declaration's target and bound placeholder value |
+| `resourceFieldRef` environment | Numeric syntax alone is insufficient | Not accepted by the current generator | Fail generation until the container's resource request/limit and divisor are typed IR inputs |
+| ConfigMap and Secret environment | No regex for names or values | Only containers with the corresponding `env` or `envFrom` declaration | Accept only authenticated exact policy input or resolve through a trusted in-guest channel; ordinary host-resolved mutable values fail closed |
 | Kubernetes-managed `/etc/hostname`, `/etc/hosts`, and `/etc/resolv.conf` mounts | A path regex is insufficient | A structural rule may target the application role when the DNS/profile predicate requires the mount | Keep fixed destinations and options exact; bind each source to the same Pod/sandbox and selected DNS mode |
 | Termination-log mount | A bounded container-ID grammar may validate one component only | Usually repeated, but parameterized per container | Keep the destination exact from workload/default intent and derive the source from the bound Pod and exact container identity |
-| Kubelet-prepared volume sources, including projected and downward-API data | No generic source or destination regex | Only containers mounting the statically declared volume role | Select by exact volume role and destination, then correlate the generated source with Pod UID, volume identity, and storage object |
+| Direct ConfigMap and Secret mounts, and supported projected sources | No generic source or destination regex | Only containers mounting the statically declared volume role | Confine exact role and destination, correlate generated transport identity, and classify object bytes as untrusted runtime input; reject any Downward API volume source |
 | Resource-to-cgroup calculations | Not a regex problem | Values are container- and Pod-QoS-specific | Validate the arithmetic relationship to static requests/limits and Pod aggregate state |
 | Security-context projection | No regex | Shared values may be lowered to a role rule only when every selected subject has the same static intent | Keep user, group, capability, privilege, and no-new-privileges constraints exact and statically anchored |
 | Probe and lifecycle commands | No regex | Only the container declaring the command | Keep exact in static policy; platform defaulting must not broaden executable or argument selection |
@@ -1485,8 +1741,8 @@ values. This supports the current additive decomposition for the exercised
 workloads: the Kubernetes update did not require a static overwrite, claim
 removal, or new mutation claim. It does not establish reusable fragment
 completeness because additional role and parameter lowering, the kubelet CRI
-boundary, measured UVM binding, and sandbox Seccomp absence rule remain
-unresolved.
+boundary, measured UVM binding, and sandbox Seccomp absence rule remain to be
+implemented.
 
 The secured service-environment policy was also rebuilt from the Kubernetes
 `1.36.3` complex-workload capture and replayed against all five stored Agent
@@ -1502,7 +1758,7 @@ trusted static data, claim order did not alter canonical output, complete
 policy-data reconstruction passed, and the reconstructed secured policy
 authorized every captured request. This is a bounded experimental conclusion,
 not proof of universal additivity or publishable fragment completeness. The
-unresolved completeness conditions listed above still apply.
+remaining completeness conditions listed above still apply.
 
 The first 1.36 run also demonstrated why a profile is more than component
 version labels. Its environment file was present, but its companion Legacy
@@ -1681,7 +1937,7 @@ Each claim requires more than one type of evidence:
 
 | Evidence | What it establishes | Limitation |
 | --- | --- | --- |
-| Static derivation | Value follows from YAML, digest-bound image data, or a trusted object | Covers only implemented input forms |
+| Static derivation | Value follows from YAML, digest-bound image data, or authenticated policy input | Covers only implemented input forms; mutable host object bytes are excluded |
 | Same-profile repetition | Separates stable behavior from generated or nondeterministic values | Does not identify the producing component |
 | Adjacent-boundary capture | Shows the stage at which a mutation occurred | Requires every relevant boundary |
 | One-factor profile comparison | Attributes a behavior change to one component or configuration family | Misses unexercised branches |
@@ -1704,7 +1960,8 @@ hashes from the profile, and covers the code that owns each claim:
 | Kubelet resolution | Environment resolution, security-context projection, resources, DNS, and volume preparation |
 | containerd OCI | CRI-to-OCI defaults, annotations, mounts, capabilities, namespaces, sysctls, and cgroups |
 | runtime-rs | OCI-to-Agent rewrites, storage/device construction, annotation injection, and Seccomp handling |
-| Rootfs/storage mode | Snapshotter metadata, guest-pull identity, shared-fs mode, dm-verity, and encryption options |
+| Rootfs identity generation | Registry digest verification, platform-manifest selection, layer `diff_id` verification, and EROFS artifact binding |
+| runtime-rs storage transport | Snapshotter metadata, shared-fs mode, generated devices, writable layers, and encryption options |
 | UVM pause baseline | Built-in pause binary, process identity, packaging, and measured UVM-root relationship |
 
 The claim ledger records repository, commit, file and symbol, controlling
@@ -1776,7 +2033,8 @@ selected pairwise interactions:
 | containerd | Current 1.7 and 2.x profiles, plus another supported 2.x release when behavior changes |
 | runtime-rs and Agent | Two commits or releases with containerd and workload held constant |
 | Runtime configuration | Seccomp on/off, annotation allowlist, sandbox sharing, and relevant feature gates |
-| Rootfs/storage | Guest pull, EROFS/dm-verity, shared fs, Agent-local `emptyDir`, encrypted and plain block |
+| Static rootfs generation | Guest pull and EROFS/dm-verity, with exact per-container identity rules generated from verified inputs |
+| Runtime storage transport | Shared fs, Agent-local `emptyDir`, encrypted and plain block, generated devices, and writable layers |
 | UVM image | Two measured UVM builds when the built-in pause artifact changes; component-only changes reuse one UVM baseline |
 | Host environment | cgroup v1/v2 where supported, at least amd64 and arm64, IPv4 and dual stack |
 | Runtime baseline | runtime-rs capture and runc-native raw-OCI baseline |
@@ -1915,8 +2173,9 @@ policy-compiler output.
 - How should Regorus expose safe additive module loading and removal?
 - Should API-server and kubelet fragments execute in Agent policy, or should a
   trusted compiler reduce them into final correlations before deployment?
-- How should Secret-derived evidence be retained and reviewed without exposing
-  plaintext in fragment provenance?
+- Which authenticated in-guest delivery protocol should carry confidential or
+  integrity-sensitive configuration without exposing plaintext in policy
+  provenance?
 - Which admission, CSI, and device-plugin behaviors are stable enough to become
   reviewed fragments?
 

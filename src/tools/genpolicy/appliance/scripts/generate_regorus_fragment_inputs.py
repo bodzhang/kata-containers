@@ -99,7 +99,8 @@ def copy_file_patterns(static_ir: dict) -> list[str]:
             for subject in static_ir.get("subjects", [])
             for volume in subject.get("volumes", [])
             if volume.get("role") in {"config-map", "secret"}
-            and (volume.get("source") or {}).get("status") == "resolved"
+            and (volume.get("source") or {}).get("content_trust")
+            == "untrusted-runtime"
             and re.fullmatch(
                 r"[A-Za-z0-9_-]+", volume.get("destination_basename", "")
             )
@@ -121,6 +122,9 @@ def production_safe_policy(
     result["request_defaults"]["CopyFileRequest"] = copy_file_patterns(
         static_ir or {}
     )
+    static_subjects = {
+        subject["subject"]: subject for subject in (static_ir or {}).get("subjects", [])
+    }
     for container in result["containers"]:
         annotations = container["OCI"].get("Annotations", {})
         identity = (
@@ -128,6 +132,17 @@ def production_safe_policy(
             annotations.get("io.kubernetes.cri.container-name", ""),
         )
         process = container["OCI"]["Process"]
+        container_name = annotations.get("io.kubernetes.cri.container-name")
+        static_subject = static_subjects.get(f"container/{container_name}", {})
+        rootfs_identity = static_subject.get("rootfs_identity_storage")
+        if rootfs_identity is not None:
+            runtime_storages = [
+                storage
+                for storage in container.get("storages", [])
+                if storage.get("driver")
+                not in {"dmverity-roothashes", "guest-pull-images"}
+            ]
+            container["storages"] = [copy.deepcopy(rootfs_identity), *runtime_storages]
         dynamic_variables = scoped_variables.get(identity, set())
         exact = []
         scoped = list(process.get("EnvRegex", []))
@@ -187,6 +202,8 @@ def regorus_static_ir(
             "static_base_digest": report["binding"]["static_base_digest"],
         }
     )
+    if static_ir is not None:
+        result["environment"]["rootfs_mode"] = static_ir["rootfs_mode"]
     # The composer accepts fragments by declared applicability, not by capture hash.
     result.pop("profile_identity", None)
     result["services"] = copy.deepcopy((static_ir or {}).get("services", []))
@@ -199,6 +216,13 @@ def regorus_static_ir(
         capabilities = static_subject.get("capabilities", {})
         subject["capability_adds"] = capabilities.get("add", [])
         subject["capability_drops"] = capabilities.get("drop", [])
+        subject["environment_resolutions"] = copy.deepcopy(
+            static_subject.get("environment_resolutions", [])
+        )
+        subject["rootfs"] = copy.deepcopy(static_subject.get("rootfs", {}))
+        subject["rootfs_identity_storage"] = copy.deepcopy(
+            static_subject.get("rootfs_identity_storage", {})
+        )
         subject["volumes"] = copy.deepcopy(static_subject.get("volumes", []))
         subject["owned_paths"] = leaf_paths(subject["policy"])
         subject["role"] = (
@@ -340,6 +364,14 @@ def service_link_materialization_paths(static_ir: dict) -> set[str]:
     return paths
 
 
+def environment_resolution_paths(static_ir: dict) -> set[str]:
+    return {
+        resolution["target"]["path"]
+        for subject in static_ir.get("subjects", [])
+        for resolution in subject.get("environment_resolutions", [])
+    }
+
+
 PROFILE_GENERATED_KUBELET_CONTAINERD_PATHS = {
     "/OCI/Annotations/io.katacontainers.pkg.oci.bundle_path",
     "/OCI/Annotations/io.katacontainers.pkg.oci.container_type",
@@ -367,11 +399,19 @@ def remove_profile_generated_materializations(
     materializations: list[dict], static_ir: dict
 ) -> list[dict]:
     generated_paths = service_link_materialization_paths(static_ir)
+    resolution_paths = environment_resolution_paths(static_ir)
     static_subjects = {
         subject["subject"]: subject for subject in static_ir.get("subjects", [])
     }
     result = copy.deepcopy(materializations)
     for fragment in result:
+        if fragment["category"] == "kubelet-resolution":
+            fragment["claims"] = [
+                claim
+                for claim in fragment["claims"]
+                if claim["target"]["path"] not in resolution_paths
+            ]
+            continue
         if fragment["category"] != "kubelet-or-containerd":
             if fragment["category"] == "runtime-rs-envelope":
                 fragment["claims"] = [
@@ -424,7 +464,7 @@ def volume_policy_supported(subject: dict | None) -> bool:
             if "size_limit" in volume:
                 return False
         elif volume.get("role") in {"config-map", "secret"}:
-            if (volume.get("source") or {}).get("status") != "resolved":
+            if (volume.get("source") or {}).get("content_trust") != "untrusted-runtime":
                 return False
             if re.fullmatch(
                 r"[A-Za-z0-9_-]+", volume.get("destination_basename", "")
@@ -438,6 +478,11 @@ def volume_policy_supported(subject: dict | None) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--capture", required=True, type=Path)
+    parser.add_argument(
+        "--rootfs-mode",
+        required=True,
+        choices=("guest-pull", "erofs-dmverity"),
+    )
     parser.add_argument("--uvm-baseline", required=True, type=Path)
     parser.add_argument("--rootfs-artifacts", type=Path)
     parser.add_argument("--compiler-policy", required=True, type=Path)
@@ -451,7 +496,10 @@ def main() -> None:
     args = parser.parse_args()
 
     static_ir = static_policy.generate_static_ir(
-        args.capture, args.uvm_baseline, args.rootfs_artifacts
+        args.capture,
+        rootfs_mode=args.rootfs_mode,
+        uvm_baseline_path=args.uvm_baseline,
+        rootfs_artifacts_path=args.rootfs_artifacts,
     )
     expected = production_safe_policy(
         static_policy.policy_data(args.compiler_policy),

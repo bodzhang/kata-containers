@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import gzip
 import base64
 import copy
 import hashlib
@@ -72,6 +73,18 @@ def workload_documents(path: Path) -> list[dict]:
         return [document for document in yaml.safe_load_all(source) if isinstance(document, dict)]
 
 
+def service_account_intent(spec: dict) -> dict:
+    automount = spec.get("automountServiceAccountToken")
+    if automount is not False:
+        raise ValueError(
+            "automountServiceAccountToken must be explicitly false for Kata-CC policy generation"
+        )
+    name = spec.get("serviceAccountName", "default")
+    if not isinstance(name, str) or not name:
+        raise ValueError("serviceAccountName must be a non-empty string")
+    return {"automount_token": False, "name": name}
+
+
 def trusted_objects(documents: list[dict]) -> tuple[dict[str, dict], dict[str, dict]]:
     config_maps = {}
     secrets = {}
@@ -123,12 +136,80 @@ def trusted_services(documents: list[dict]) -> list[dict]:
     return services
 
 
+def verified_image_document(images_dir: Path, path: str, digest: str) -> dict:
+    raw = (images_dir / path).read_bytes()
+    actual = "sha256:" + hashlib.sha256(raw).hexdigest()
+    if actual != digest:
+        raise ValueError(f"image content digest mismatch: expected {digest}, got {actual}")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError(f"image content is not an object: {digest}")
+    return value
+
+
+def verified_layer_diff_id(raw: bytes, media_type: str) -> str:
+    if media_type.endswith("+gzip") or media_type.endswith(".gzip"):
+        raw = gzip.decompress(raw)
+    elif not media_type.endswith(".tar"):
+        raise ValueError(f"unsupported verified layer media type: {media_type}")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def verify_image_descriptor(images_dir: Path, reference: str, descriptor: dict) -> dict:
+    requested_digest = image_manifest_digest(reference)
+    if descriptor.get("requested_digest") != requested_digest:
+        raise ValueError(f"verified image request digest mismatch: {reference}")
+    requested = verified_image_document(
+        images_dir, descriptor["requested_path"], requested_digest
+    )
+    manifest_digest = descriptor["manifest_digest"]
+    manifest = verified_image_document(
+        images_dir, descriptor["manifest_path"], manifest_digest
+    )
+    if requested_digest != manifest_digest and not any(
+        item.get("digest") == manifest_digest for item in requested.get("manifests", [])
+    ):
+        raise ValueError(f"selected manifest is not bound to image index: {reference}")
+    config_digest = descriptor["config_digest"]
+    config = verified_image_document(
+        images_dir, descriptor["config_path"], config_digest
+    )
+    if (manifest.get("config") or {}).get("digest") != config_digest:
+        raise ValueError(f"image config is not bound to manifest: {reference}")
+    manifest_layers = manifest.get("layers", [])
+    layers = descriptor.get("layers", [])
+    diff_ids = (config.get("rootfs") or {}).get("diff_ids", [])
+    if len(manifest_layers) != len(layers) or len(layers) != len(diff_ids):
+        raise ValueError(f"verified image layer chain is incomplete: {reference}")
+    for manifest_layer, layer, diff_id in zip(
+        manifest_layers, layers, diff_ids, strict=True
+    ):
+        if manifest_layer.get("digest") != layer.get("digest"):
+            raise ValueError(f"image layer is not bound to manifest: {reference}")
+        raw = (images_dir / layer["path"]).read_bytes()
+        actual_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if actual_digest != layer["digest"]:
+            raise ValueError(
+                f"image layer digest mismatch: expected {layer['digest']}, got {actual_digest}"
+            )
+        actual_diff_id = verified_layer_diff_id(raw, layer["media_type"])
+        if actual_diff_id != diff_id or layer.get("diff_id") != diff_id:
+            raise ValueError(f"image layer diff-id mismatch: {reference}")
+    return config.get("config") or {}
+
+
 def image_configs(capture: Path) -> dict[str, dict]:
-    index = json.loads((capture / "images" / "index.json").read_text(encoding="utf-8"))
+    images_dir = capture / "images"
+    index = json.loads((images_dir / "index.json").read_text(encoding="utf-8"))
     result = {}
     for reference, descriptor in index["images"].items():
+        if index.get("schema_version") == 1:
+            result[reference] = verify_image_descriptor(
+                images_dir, reference, descriptor
+            )
+            continue
         document = json.loads(
-            (capture / "images" / descriptor["config_path"]).read_text(encoding="utf-8")
+            (images_dir / descriptor["config_path"]).read_text(encoding="utf-8")
         )
         result[reference] = document.get("config") or {}
     return result
@@ -211,21 +292,14 @@ def rootfs_artifacts(path: Path | None) -> tuple[dict[str, dict], str | None]:
 
 def rootfs_plan(
     image_reference: str,
-    profile: dict,
+    mode: str,
     artifacts: dict[str, dict],
     artifact_manifest_digest: str | None,
-) -> dict | None:
-    mode = profile.get("rootfs_mode")
-    profile_identity = profile.get("identity")
-    if not isinstance(profile_identity, str) or re.fullmatch(
-        r"[0-9a-f]{64}", profile_identity
-    ) is None:
-        raise ValueError("capture profile requires a sha256 identity")
+) -> dict:
     manifest_digest = image_manifest_digest(image_reference)
     plan = {
         "image_manifest_digest": manifest_digest,
         "mode": mode,
-        "profile_identity": profile_identity,
     }
     if mode == "guest-pull":
         return plan
@@ -236,9 +310,26 @@ def rootfs_plan(
         plan["artifact_manifest_digest"] = artifact_manifest_digest
         plan["dm_verity_root_hash"] = artifact["root_hash"]
         return plan
-    if mode == "native":
-        return None
     raise ValueError(f"unsupported rootfs mode: {mode}")
+
+
+def rootfs_identity_storage(rootfs: dict) -> dict:
+    if rootfs["mode"] == "guest-pull":
+        driver = "guest-pull-images"
+        identity = rootfs["image_manifest_digest"]
+    else:
+        driver = "dmverity-roothashes"
+        identity = rootfs["dm_verity_root_hash"]
+    return {
+        "driver": driver,
+        "driver_options": [],
+        "source": "",
+        "fstype": "",
+        "options": [identity],
+        "mount_point": "",
+        "fs_group": None,
+        "shared": False,
+    }
 
 
 def key_values(values: list[str]) -> dict[str, str]:
@@ -255,10 +346,88 @@ def content_digest(values: dict[str, str]) -> str:
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
+FIELD_REF_VALUES = {
+    "metadata.name": "$(sandbox-name)",
+    "metadata.uid": "$(pod-uid)",
+    "spec.nodeName": "$(node-name)",
+}
+
+
+def environment_value_from(
+    name: str,
+    value_from: dict,
+    namespace: str,
+    service_account_name: str,
+    config_maps: dict,
+    secrets: dict,
+) -> tuple[str | None, dict | None]:
+    if not isinstance(value_from, dict) or len(value_from) != 1:
+        raise ValueError(f"environment {name} valueFrom requires exactly one source")
+    kind, reference = next(iter(value_from.items()))
+    if not isinstance(reference, dict):
+        raise ValueError(f"environment {name} {kind} must be an object")
+    if kind == "fieldRef":
+        unknown = set(reference) - {"apiVersion", "fieldPath"}
+        api_version = reference.get("apiVersion", "v1")
+        field_path = reference.get("fieldPath")
+        if unknown or api_version != "v1" or not isinstance(field_path, str):
+            raise ValueError(f"environment {name} has invalid fieldRef")
+        if field_path == "metadata.namespace":
+            value = namespace
+        elif field_path == "spec.serviceAccountName":
+            return service_account_name, None
+        else:
+            value = FIELD_REF_VALUES.get(field_path)
+        if value is None:
+            raise ValueError(
+                f"environment {name} has unsupported fieldRef path: {field_path}"
+            )
+        return None, {
+            "owner": "kubelet-resolution",
+            "source": {
+                "api_version": api_version,
+                "field_path": field_path,
+                "kind": "field-ref",
+            },
+            "target": {
+                "collection": "environment",
+                "name": name,
+                "path": f"/OCI/Process/Env/{name}",
+            },
+            "value": value,
+            "value_type": "string",
+        }
+    if kind not in {"configMapKeyRef", "secretKeyRef"}:
+        raise ValueError(f"environment {name} has unsupported valueFrom source: {kind}")
+    unknown = set(reference) - {"key", "name", "optional"}
+    object_name = reference.get("name")
+    key = reference.get("key")
+    optional = reference.get("optional", False)
+    if (
+        unknown
+        or not isinstance(object_name, str)
+        or not object_name
+        or not isinstance(key, str)
+        or not key
+        or not isinstance(optional, bool)
+    ):
+        raise ValueError(f"environment {name} has invalid {kind}")
+    objects = config_maps if kind == "configMapKeyRef" else secrets
+    values = objects.get((namespace, object_name))
+    if values is None or key not in values:
+        if optional:
+            return None, None
+        raise ValueError(
+            f"required environment {kind} is missing: {namespace}/{object_name}/{key}"
+        )
+    return values[key], None
+
+
 def static_environment(
     container: dict,
     image: dict,
     namespace: str,
+    service_account_name: str,
     config_maps: dict,
     secrets: dict,
 ) -> tuple[dict[str, str], list[dict], list[dict]]:
@@ -324,22 +493,35 @@ def static_environment(
         for key, value in values.items():
             environment[prefix + key] = value
             evidence.append({"field": f"envFrom/{name}/{key}", "source": source_name})
-    unresolved = []
+    resolutions = []
     for entry in container.get("env") or []:
+        if not isinstance(entry, dict):
+            raise ValueError("environment entry must be an object")
         name = entry.get("name", "")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+            raise ValueError(f"invalid environment name: {name}")
+        if ("value" in entry) == ("valueFrom" in entry):
+            raise ValueError(f"environment {name} requires exactly one value or valueFrom")
         if "value" in entry:
             environment[name] = str(entry["value"])
             evidence.append({"field": f"env/{name}", "source": "workload-yaml"})
-        elif "valueFrom" in entry:
-            unresolved.append(
-                {
-                    "anchor": entry["valueFrom"],
-                    "name": name,
-                    "operation": "resolve",
-                    "source": "workload-yaml",
-                }
+        else:
+            value, resolution = environment_value_from(
+                name,
+                entry["valueFrom"],
+                namespace,
+                service_account_name,
+                config_maps,
+                secrets,
             )
-    return environment, unresolved, env_from
+            if value is not None:
+                environment[name] = value
+                evidence.append(
+                    {"field": f"env/{name}", "source": "trusted-workload-object"}
+                )
+            if resolution is not None:
+                resolutions.append(resolution)
+    return environment, resolutions, env_from
 
 
 def process_args(container: dict, image: dict) -> list[str]:
@@ -375,6 +557,14 @@ def projected_source(source: dict, namespace: str) -> dict:
     if len(kinds) != 1 or len(source) != 1:
         raise ValueError("projected volume source requires exactly one supported type")
     kind = kinds[0]
+    if kind == "downwardAPI":
+        raise ValueError(
+            "Downward API projected volume content is incompatible with the Kata-CC threat model"
+        )
+    if kind == "serviceAccountToken":
+        raise ValueError(
+            "serviceAccountToken projected volume is unsupported without trusted in-guest token verification"
+        )
     value = copy.deepcopy(source[kind])
     if not isinstance(value, dict):
         raise ValueError(f"invalid projected volume source: {kind}")
@@ -383,11 +573,11 @@ def projected_source(source: dict, namespace: str) -> dict:
         if not isinstance(name, str) or not name:
             raise ValueError(f"projected {kind} source requires a name")
         value["namespace"] = namespace
+        value["content_trust"] = "untrusted-runtime"
     roles = {
         "configMap": "config-map",
         "downwardAPI": "downward-api",
         "secret": "secret",
-        "serviceAccountToken": "service-account-token",
     }
     return {"role": roles[kind], "source": value}
 
@@ -395,8 +585,6 @@ def projected_source(source: dict, namespace: str) -> dict:
 def volume_source(
     volume: dict,
     namespace: str,
-    config_maps: dict,
-    secrets: dict,
 ) -> dict:
     if not isinstance(volume, dict):
         raise ValueError("volume declaration must be an object")
@@ -432,23 +620,15 @@ def volume_source(
         optional = source.get("optional", False)
         if not isinstance(optional, bool):
             raise ValueError(f"{kind} volume source optional must be boolean")
-        values = (config_maps if kind == "configMap" else secrets).get(
-            (namespace, name)
-        )
         role = "config-map" if kind == "configMap" else "secret"
-        if values is None and not optional:
-            raise ValueError(
-                f"required {role} volume is missing: {namespace}/{name}"
-            )
         source["name"] = source.pop(name_field)
         source["namespace"] = namespace
-        source["status"] = "absent" if values is None else "resolved"
-        if values is not None:
-            source["content_digest"] = content_digest(values)
-            source["keys"] = sorted(values)
+        source["content_trust"] = "untrusted-runtime"
         return {"role": role, "source": source}
     if kind == "downwardAPI":
-        return {"role": "downward-api", "source": source}
+        raise ValueError(
+            "Downward API volume content is incompatible with the Kata-CC threat model"
+        )
     sources = source.get("sources")
     if not isinstance(sources, list) or not sources:
         raise ValueError("projected volume requires sources")
@@ -465,17 +645,13 @@ def container_volume_intents(
     spec: dict,
     container: dict,
     namespace: str,
-    config_maps: dict,
-    secrets: dict,
 ) -> list[dict]:
     volumes = {}
     for volume in spec.get("volumes") or []:
         name = volume.get("name")
         if not isinstance(name, str) or not name or name in volumes:
             raise ValueError(f"invalid or duplicate volume name: {name}")
-        volumes[name] = volume_source(
-            volume, namespace, config_maps, secrets
-        )
+        volumes[name] = volume_source(volume, namespace)
     if container.get("volumeDevices"):
         raise ValueError("static volumeDevices intent is not yet supported")
     intents = []
@@ -546,6 +722,8 @@ def uvm_static_baseline(path: Path) -> dict:
 
 def generate_static_ir(
     capture: Path,
+    *,
+    rootfs_mode: str = "guest-pull",
     uvm_baseline_path: Path | None = None,
     rootfs_artifacts_path: Path | None = None,
 ) -> dict:
@@ -564,6 +742,7 @@ def generate_static_ir(
         if resolved is None:
             continue
         spec, namespace, workload_name = resolved
+        service_account = service_account_intent(spec)
         containers = [
             container
             for field in ("initContainers", "containers", "ephemeralContainers")
@@ -575,8 +754,13 @@ def generate_static_ir(
             if image_reference not in images:
                 raise ValueError(f"capture has no image config for {image_reference}")
             image = images[image_reference]
-            environment, unresolved, env_from = static_environment(
-                container, image, namespace, config_maps, secrets
+            environment, environment_resolutions, env_from = static_environment(
+                container,
+                image,
+                namespace,
+                service_account["name"],
+                config_maps,
+                secrets,
             )
             constraints = {
                 "/OCI/Annotations/io.kubernetes.cri.container-name": container["name"],
@@ -597,25 +781,26 @@ def generate_static_ir(
             subject = {
                 "capabilities": normalized_capabilities(security_context),
                 "constraints": constraints,
+                "environment_resolutions": environment_resolutions,
                 "env_from": env_from,
                 "image": image_reference,
                 "namespace": namespace,
+                "service_account": copy.deepcopy(service_account),
                 "service_links_enabled": spec.get("enableServiceLinks", True),
                 "subject": f"container/{container['name']}",
-                "unresolved": unresolved,
                 "volumes": container_volume_intents(
-                    spec, container, namespace, config_maps, secrets
+                    spec, container, namespace
                 ),
                 "workload": {"kind": document["kind"], "name": workload_name},
             }
             rootfs = rootfs_plan(
                 image_reference,
-                profile,
+                rootfs_mode,
                 artifacts,
                 artifact_manifest_digest,
             )
-            if rootfs is not None:
-                subject["rootfs"] = rootfs
+            subject["rootfs"] = rootfs
+            subject["rootfs_identity_storage"] = rootfs_identity_storage(rootfs)
             subjects.append(subject)
         if uvm_baseline is not None:
             subjects.append(
@@ -624,7 +809,7 @@ def generate_static_ir(
                     "namespace": namespace,
                     "static_artifact": uvm_baseline["artifact_digest"],
                     "subject": f"sandbox/{namespace}/{workload_name}",
-                    "unresolved": [],
+                    "environment_resolutions": [],
                     "workload": {"kind": document["kind"], "name": workload_name},
                 }
             )
@@ -647,6 +832,7 @@ def generate_static_ir(
             workload_keys.add(key)
     return {
         "profile_identity": profile["identity"],
+        "rootfs_mode": rootfs_mode,
         "schema_version": 1,
         "services": services,
         "subjects": subjects,
@@ -674,10 +860,12 @@ def render_static_rego_ir(ir: dict) -> str:
             if pointer in constraints:
                 process[field] = constraints[pointer]
         if "/OCI/Process/Env" in constraints:
-            process["Env"] = [
-                f"{name}={value}"
-                for name, value in sorted(constraints["/OCI/Process/Env"].items())
-            ]
+            environment = constraints["/OCI/Process/Env"]
+            process["Env"] = (
+                [f"{name}={value}" for name, value in sorted(environment.items())]
+                if isinstance(environment, dict)
+                else list(environment)
+            )
         subjects.append(
             {
                 "id": subject["subject"],
@@ -706,6 +894,7 @@ def render_static_rego_ir(ir: dict) -> str:
             "sandbox": {},
         },
         "profile_identity": ir["profile_identity"],
+        "rootfs_mode": ir["rootfs_mode"],
         "schema_version": ir["schema_version"],
         "subjects": subjects,
         "workloads": ir["workloads"],
@@ -977,6 +1166,7 @@ def profile_layer(baseline: Path, candidate: Path) -> dict:
 
 def analyze(
     capture: Path,
+    rootfs_mode: str,
     legacy_policy_path: Path,
     compiler_policy_path: Path,
     settings_path: Path | None = None,
@@ -986,7 +1176,12 @@ def analyze(
     uvm_baseline: Path | None = None,
     rootfs_artifacts_path: Path | None = None,
 ) -> dict:
-    static_ir = generate_static_ir(capture, uvm_baseline, rootfs_artifacts_path)
+    static_ir = generate_static_ir(
+        capture,
+        rootfs_mode=rootfs_mode,
+        uvm_baseline_path=uvm_baseline,
+        rootfs_artifacts_path=rootfs_artifacts_path,
+    )
     legacy = policy_data(legacy_policy_path)
     compiler = policy_data(compiler_policy_path)
     transformations, provenance = request_provenance.analyze(capture)
@@ -1035,6 +1230,11 @@ def analyze(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--capture", required=True, type=Path)
+    parser.add_argument(
+        "--rootfs-mode",
+        required=True,
+        choices=("guest-pull", "erofs-dmverity"),
+    )
     parser.add_argument("--legacy-policy", required=True, type=Path)
     parser.add_argument("--compiler-policy", required=True, type=Path)
     parser.add_argument("--settings", type=Path)
@@ -1047,6 +1247,7 @@ def main() -> None:
     args = parser.parse_args()
     report = analyze(
         args.capture,
+        args.rootfs_mode,
         args.legacy_policy,
         args.compiler_policy,
         args.settings,

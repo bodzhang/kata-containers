@@ -22,9 +22,25 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
                         "/OCI/Process/Args": ["/bin/app"],
                         "/OCI/Process/Env": {"STATIC": "image"},
                     },
+                    "environment_resolutions": [
+                        {
+                            "owner": "kubelet-resolution",
+                            "source": {
+                                "api_version": "v1",
+                                "field_path": "metadata.uid",
+                                "kind": "field-ref",
+                            },
+                            "target": {
+                                "collection": "environment",
+                                "name": "POD_UID",
+                                "path": "/OCI/Process/Env/POD_UID",
+                            },
+                            "value": "$(pod-uid)",
+                            "value_type": "string",
+                        }
+                    ],
                     "namespace": "default",
                     "subject": "container/app",
-                    "unresolved": [{"name": "POD_UID"}],
                 },
                 {
                     "constraints": {
@@ -32,9 +48,9 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
                         "/OCI/Process/Env": ["PATH=/usr/bin"],
                         "/OCI/Root/Path": "$(root_path)",
                     },
+                    "environment_resolutions": [],
                     "namespace": "default",
                     "subject": "sandbox/default/demo",
-                    "unresolved": [],
                 },
             ],
         }

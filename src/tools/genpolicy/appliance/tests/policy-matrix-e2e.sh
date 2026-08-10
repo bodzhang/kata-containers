@@ -24,7 +24,7 @@ if (($# == 0)); then
 		"${script_dir}/fixtures/policy-matrix-env-pod.yaml" \
 		"${script_dir}/fixtures/policy-matrix-process-pod.yaml" \
 		"${script_dir}/fixtures/complex-workload.yaml" \
-		"${script_dir}/fixtures/storage-classes-workload.yaml"
+		"${script_dir}/fixtures/service-account-workload.yaml"
 fi
 
 case "${output_root}" in

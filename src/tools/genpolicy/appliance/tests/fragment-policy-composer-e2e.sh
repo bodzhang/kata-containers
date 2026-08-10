@@ -16,6 +16,7 @@ trap 'rm -rf "${temporary}"' EXIT
 
 python3 "${appliance_dir}/scripts/generate_regorus_fragment_inputs.py" \
 	--capture "${capture}" \
+	--rootfs-mode guest-pull \
 	--uvm-baseline "${composer}/fixtures/run-complex-uvm-baseline.json" \
 	--compiler-policy "${run_complex}/output/policy.rego" \
 	--tag-manifest "${run_complex}/output/dynamic-tags.json" \
@@ -81,7 +82,7 @@ assert {fragment["category"] for fragment in profile_fragments} == {
 	"runtime-rs-envelope",
 }
 assert sum(len(fragment["claims"]) for fragment in profile_fragments) == 39
-assert sum(len(fragment["claims"]) for fragment in materializations) == 42
+assert sum(len(fragment["claims"]) for fragment in materializations) == 39
 assert all(
 	contract["path_regex"].startswith("^")
 	and contract["path_regex"].endswith("$")
@@ -100,12 +101,29 @@ assert kubelet_fragment["materialization_contracts"] == [
 		"operations": ["resolve"],
 		"paths": [
 			"/OCI/Process/Env/HOSTNAME",
-			"/OCI/Process/Env/NODE_NAME",
-			"/OCI/Process/Env/POD_NAME",
-			"/OCI/Process/Env/POD_UID",
 		],
 	}
 ]
+workload_subject = next(
+	subject for subject in static_ir["subjects"] if subject["id"] == "container/workload"
+)
+assert {
+	resolution["target"]["path"]
+	for resolution in workload_subject["environment_resolutions"]
+} == {
+	"/OCI/Process/Env/NODE_NAME",
+	"/OCI/Process/Env/POD_NAME",
+	"/OCI/Process/Env/POD_UID",
+}
+assert all(
+	claim["target"]["path"] not in {
+		"/OCI/Process/Env/NODE_NAME",
+		"/OCI/Process/Env/POD_NAME",
+		"/OCI/Process/Env/POD_UID",
+	}
+	for fragment in materializations
+	for claim in fragment["claims"]
+)
 assert "[A-Z][A-Z0-9_]*" not in reviewed_profile
 assert all(
 	token not in reviewed_profile
