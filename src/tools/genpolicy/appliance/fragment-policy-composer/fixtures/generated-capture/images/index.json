@@ -1,0 +1,7 @@
+{
+  "images": {
+    "registry.example/app@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc": {
+      "config_path": "configs/app.json"
+    }
+  }
+}

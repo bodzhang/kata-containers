@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 
@@ -245,7 +246,11 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
         }
         absences = {"inventory": "loaded", "uncovered": 0}
 
-        result = coverage.finalize_report(report, absences, {"uvm_bound": True})
+        validators = {"inventory": "loaded", "uncovered": 0}
+
+        result = coverage.finalize_report(
+            report, absences, validators, {"uvm_bound": True}
+        )
 
         self.assertEqual(result["result"], "incomplete")
         self.assertEqual(
@@ -532,11 +537,17 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
             "inventory": "loaded",
             "uncovered": 1,
         }
+        validators = {
+            "inventory": "loaded",
+            "uncovered": 1,
+        }
 
-        result = coverage.finalize_report(report, absences, {"uvm_bound": False})
+        result = coverage.finalize_report(
+            report, absences, validators, {"uvm_bound": False}
+        )
 
         self.assertEqual(result["result"], "incomplete")
-        self.assertEqual(len(result["blockers"]), 3)
+        self.assertEqual(len(result["blockers"]), 4)
 
     def test_final_report_passes_complete_evidence(self):
         report = {"coverage": {"ambiguous_boundary_claims": 0}}
@@ -544,11 +555,183 @@ class FragmentCoveragePrototypeTests(unittest.TestCase):
             "inventory": "loaded",
             "uncovered": 0,
         }
+        validators = {
+            "inventory": "loaded",
+            "uncovered": 0,
+        }
 
-        result = coverage.finalize_report(report, absences, {"uvm_bound": True})
+        result = coverage.finalize_report(
+            report, absences, validators, {"uvm_bound": True}
+        )
 
         self.assertEqual(result["result"], "pass")
         self.assertEqual(result["blockers"], [])
+
+    def test_runtime_validator_inventory_exposes_uncovered_claim(self):
+        report = {
+            "fragments": [
+                {
+                    "category": "containerd-oci",
+                    "claims": [
+                        {
+                            "operation": "default",
+                            "target": {
+                                "cardinality": "all",
+                                "path": "/OCI/Version",
+                                "role": "all",
+                                "scope": "container",
+                            },
+                            "value": "1.1.0",
+                        },
+                        {
+                            "operation": "default",
+                            "target": {
+                                "cardinality": "all",
+                                "path": coverage.CONTAINER_TYPE_PATH,
+                                "role": "application",
+                                "scope": "container",
+                            },
+                            "value": "container",
+                        },
+                    ],
+                }
+            ]
+        }
+        inventory = {
+            "schema_version": 1,
+            "validators": [
+                {
+                    "category": "containerd-oci",
+                    "evidence": "src/tools/genpolicy/rules.rego: allow_oci_version",
+                    "path": "/OCI/Version",
+                    "test": "src/tools/genpolicy/appliance/tests/fragment_runtime_validators_test.rego: test_fragment_oci_version_mismatch_denied",
+                }
+            ],
+        }
+
+        result = coverage.runtime_validator_coverage(report, inventory)
+
+        self.assertEqual(result["required"], 2)
+        self.assertEqual(result["covered"], 1)
+        self.assertEqual(result["uncovered"], 1)
+        self.assertEqual(result["entries"][1]["status"], "uncovered")
+
+    def test_runtime_validator_inventory_rejects_duplicate_ownership(self):
+        report = {
+            "fragments": [
+                {
+                    "category": "containerd-oci",
+                    "claims": [
+                        {
+                            "operation": "default",
+                            "target": {"path": "/OCI/Version", "scope": "policy"},
+                            "value": "1.1.0",
+                        }
+                    ],
+                }
+            ]
+        }
+        validator = {
+            "category": "containerd-oci",
+            "evidence": "src/tools/genpolicy/rules.rego: allow_oci_version",
+            "path": "/OCI/Version",
+            "test": "src/tools/genpolicy/appliance/tests/fragment_runtime_validators_test.rego: test_fragment_oci_version_mismatch_denied",
+        }
+
+        with self.assertRaisesRegex(coverage.CoverageError, "multiple runtime validators"):
+            coverage.runtime_validator_coverage(
+                report,
+                {"schema_version": 1, "validators": [validator, validator]},
+            )
+
+    def test_runtime_validator_inventory_rejects_stale_evidence(self):
+        report = {
+            "fragments": [
+                {
+                    "category": "containerd-oci",
+                    "claims": [
+                        {
+                            "operation": "default",
+                            "target": {"path": "/OCI/Version", "scope": "policy"},
+                            "value": "1.1.0",
+                        }
+                    ],
+                }
+            ]
+        }
+        inventory = {
+            "schema_version": 1,
+            "validators": [
+                {
+                    "category": "containerd-oci",
+                    "evidence": "src/tools/genpolicy/rules.rego: missing_validator",
+                    "path": "/OCI/Version",
+                    "test": "src/tools/genpolicy/appliance/tests/fragment_runtime_validators_test.rego: test_fragment_oci_version_mismatch_denied",
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(
+            coverage.CoverageError, "runtime validator evidence symbol does not exist"
+        ):
+            coverage.runtime_validator_coverage(report, inventory)
+
+    def test_runtime_validator_inventory_can_scope_a_role(self):
+        report = {
+            "fragments": [
+                {
+                    "category": "containerd-oci",
+                    "claims": [
+                        {
+                            "operation": "default",
+                            "target": {
+                                "cardinality": "all",
+                                "path": coverage.CONTAINER_TYPE_PATH,
+                                "role": "application",
+                                "scope": "container",
+                            },
+                            "value": "container",
+                        }
+                    ],
+                }
+            ]
+        }
+        inventory = {
+            "schema_version": 1,
+            "validators": [
+                {
+                    "category": "containerd-oci",
+                    "evidence": "src/tools/genpolicy/rules.rego: allow_container_role",
+                    "path": coverage.CONTAINER_TYPE_PATH,
+                    "role": "sandbox",
+                    "test": "src/tools/genpolicy/appliance/tests/fragment_runtime_validators_test.rego: test_fragment_container_role_mismatch_denied",
+                }
+            ],
+        }
+
+        result = coverage.runtime_validator_coverage(report, inventory)
+
+        self.assertEqual(result["covered"], 0)
+        self.assertEqual(result["uncovered"], 1)
+
+    def test_current_profile_claims_have_runtime_validator_evidence(self):
+        report = coverage.derive_candidate_coverage(
+            self.static_ir(), self.expected_policy(), self.source_report()
+        )
+        inventory_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "fragments"
+            / "runtime-validator-inventory.json"
+        )
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+
+        result = coverage.runtime_validator_coverage(report, inventory)
+
+        self.assertEqual(result["inventory"], "loaded")
+        self.assertEqual(result["required"], 5)
+        self.assertEqual(result["covered"], 5)
+        self.assertEqual(result["uncovered"], 0)
 
     def test_binds_fragments_to_profile_and_static_base(self):
         static_ir = self.static_ir()

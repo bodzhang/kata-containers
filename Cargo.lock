@@ -2281,6 +2281,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fragment-policy-composer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "regorus",
+ "serde_json",
+]
+
+[[package]]
 name = "fs2"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

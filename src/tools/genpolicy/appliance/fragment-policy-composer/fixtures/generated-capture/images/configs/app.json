@@ -1,0 +1,7 @@
+{
+  "config": {
+    "Entrypoint": ["/usr/bin/image-app"],
+    "Env": ["MODE=production"],
+    "WorkingDir": "/work"
+  }
+}

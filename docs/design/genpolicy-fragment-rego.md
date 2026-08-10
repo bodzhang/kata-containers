@@ -124,6 +124,13 @@ derived from trusted static inputs. The current PoC does not implement this
 lowering step, so its exact-subject candidates are reconstruction evidence,
 not publishable profile fragments.
 
+Static-base materialization is workload-specific lowering, not
+literalization. A materialized claim may contain an exact static value, an
+anchored typed regular expression, or a bind-once correlation rule. Values
+assigned by the disposable capture cluster, such as ClusterIPs, Pod UIDs,
+generated Pod names, node names, and runtime IDs, must not become exact policy
+literals for a production cluster.
+
 ```mermaid
 flowchart LR
     YAML[Workload YAML and image data] --> IR[Static policy IR]
@@ -154,9 +161,20 @@ construct policy data. In particular:
   exact workload subjects with explicit cardinality;
 - fragment order cannot affect the result when claims are disjoint;
 - an addition cannot overwrite a static constraint;
+- an addition is the single-branch object rooted exactly at its declared
+  `target.path`, so ownership, overlap, and category checks constrain the value
+  that composition actually applies;
 - duplicate, missing, or ambiguous subjects fail composition;
 - the final policy contains ordinary policy data and can use the existing
   Agent policy interface.
+
+!!! warning "The addition is the mutation, not the target path"
+    Composition merges `addition`, while every ownership, overlap, and category
+    check reads `target.path`. Unless the composer proves the two agree, a claim
+    can declare an innocuous path and silently overwrite an unrelated
+    statically-owned field. `compose.rego` therefore rejects any claim whose
+    addition is not exactly the single branch reaching `target.path`, and
+    applies the same check to profile-generated claims.
 
 A platform transformation described as a rewrite is still additive at this
 boundary. For example, the static IR omits the host root path and the
@@ -268,12 +286,131 @@ either generated policy:
 - explicit or image working directory;
 - explicit no-new-privileges and read-only-rootfs intent;
 - probe and lifecycle exec commands; and
+- a per-container rootfs authorization plan for guest-pull or EROFS dm-verity;
+- per-container volume mount intent for supported YAML-native volume classes;
 - unresolved `valueFrom` declarations as typed `resolve` anchors, not captured
   values.
 
 It rejects image references that are not manifest-digest bound. It does not yet
 classify user and group resolution, capability deltas other than explicit final
-sets, volume intent, or emit the UVM-static pause subject.
+sets, block `volumeDevices`, or externally resolved hostPath, PVC, and CSI
+volumes. The UVM-static pause subject requires a separate measured-UVM baseline.
+
+#### Static `envFrom` IR
+
+An `envFrom` declaration statically determines the referenced ConfigMap or
+Secret identity, namespace, optionality, prefix, and its position in container
+environment precedence. Exact values are static only when the referenced object
+contents are supplied as trusted policy-generation input. The prototype emits
+both the final exact environment constraint and typed provenance for each
+source:
+
+```json
+{
+  "content_digest": "sha256:<canonical-object-data-digest>",
+  "keys": ["LOG_LEVEL"],
+  "name": "app-config",
+  "namespace": "default",
+  "optional": false,
+  "prefix": "CFG_",
+  "role": "config-map",
+  "status": "resolved"
+}
+```
+
+Environment precedence remains image values, then ordered `envFrom` sources,
+then explicit `env` entries. A missing required object, duplicate trusted object
+identity, malformed reference, or invalid optional/prefix type fails policy
+generation. A missing optional object is represented with `status = absent` and
+contributes no environment values.
+
+!!! warning "Object content authority"
+    Workload YAML names an object but does not authenticate its contents. The
+    supplied ConfigMap or Secret must come from trusted deployment input or be
+    verified against an independently trusted digest. The content digest binds
+    the static base to the supplied data; it does not by itself establish who
+    supplied that data.
+
+#### Static rootfs IR
+
+The rootfs plan records workload authority separately from the concrete Agent
+`Storage` envelope. For guest-pull, it is derived from the digest-bound image
+reference and the capture profile. For EROFS dm-verity, generation additionally
+requires a trusted rootfs artifact manifest supplied with
+`--rootfs-artifacts`:
+
+```json title="rootfs-artifacts.json"
+{
+  "schema_version": 1,
+  "images": {
+    "sha256:<manifest-digest>": {
+      "root_hash": "sha256:<dm-verity-root-hash>"
+    }
+  }
+}
+```
+
+The artifact map is keyed by manifest digest rather than repository-qualified
+image reference. The generated subject records the selected mode, manifest
+digest, capture-profile identity, and, for dm-verity, the exact root hash and a
+digest of the artifact manifest. The profile identity binds rootfs mode and the
+captured Kata configuration hashes; the static-base digest subsequently binds
+the complete rootfs plan.
+
+!!! warning "Artifact authority"
+    Passing a JSON file does not establish its trust. The caller must obtain the
+    dm-verity artifact manifest through a trusted image build, snapshotter, or
+    signing workflow and verify it before policy generation. Final Agent
+    requests and storage-predictor output are comparison evidence, not root-hash
+    authority.
+
+The plan intentionally excludes bundle and sandbox IDs, mount points, writable
+upper-layer devices, and block-device addresses. Runtime validators correlate
+those generated transport values with the static subject. Unit tests generate
+both guest-pull and dm-verity plans with empty request directories, proving that
+the rootfs identity is not learned from a captured `CreateContainerRequest`.
+
+#### Static volume mount IR
+
+Each container subject carries only the Pod-declared volumes that it mounts. A
+mount intent records its stable volume name, typed role, exact guest
+destination, read-only state, and source semantics. For example:
+
+```json
+{
+  "destination": "/etc/configuration",
+  "name": "configuration",
+  "read_only": true,
+  "role": "config-map",
+  "source": {
+    "name": "app-config",
+    "namespace": "default"
+  }
+}
+```
+
+The prototype supports disk and memory `emptyDir`, ConfigMap, Secret, downward
+API, and projected volumes. Projected ConfigMap and Secret entries retain their
+object identity, and service-account-token projections retain their declared
+audience, path, and expiration settings. Static `subPath`, mount propagation,
+and recursive-read-only declarations are preserved.
+
+Generation fails for undeclared or duplicate volume identities, duplicate
+destinations, unsupported source types, dynamic `subPathExpr`, and
+`volumeDevices`. The last two require typed value binding and device authority
+rather than being copied from a final request.
+
+The IR does not contain host source paths, watchable sandbox paths, runtime-rs
+`Storage` objects, or block-device addresses. HostPath, PVC, CSI, and other
+externally resolved sources remain unsupported until a trusted resolver can
+bind their workload declaration to the required host or device identity.
+
+!!! warning "Mounted object contents"
+  ConfigMap, Secret, downward-API, and projected source identity constrains
+  which declared object may populate a mount; it does not authenticate the
+  bytes delivered through a host-backed shared filesystem. Integrity or
+  confidentiality of those bytes requires a trusted in-guest copy,
+  verification, or secret-delivery mechanism.
 
 ### Kubernetes API and controller fragment
 
@@ -599,6 +736,23 @@ any static-base capability it consumes; a rootfs/storage fragment may depend on
 UVM facilities even though a containerd OCI fragment does not. The composition
 manifest binds both identities and rejects an undeclared dependency.
 
+!!! warning "Identity binding is declarative in the prototype"
+    The generator computes both identities: `profile_identity` is a verified
+    sha256 over the canonicalized capture profile, and `static_base_digest` is a
+    sha256 over the canonicalized static IR. The composer, however, only
+    compares them as strings and binds neither to the fragment code, which
+    declares its `profile_identity` as a constant. They therefore answer which
+    environment and static base a policy targets, not whether a fragment is the
+    reviewed artifact, and a digest recomputed by the same pipeline that emits
+    the fragment cannot establish that. Fragment authenticity is deferred to the
+    issuer, feed, and minimum-SVN signing described above. Until then, every
+    loaded `.rego` file is policy code in one engine, so the composer restricts
+    loaded modules to the `selected_profile_fragments`,
+    `selected_materializations`, `static_policy_ir`, `fragment_composer`, and
+    `profile_*` packages, stopping an injected module from adding permissive
+    definitions of the composer's own validation rules. That allowlist is
+    containment during iteration, not a substitute for signing.
+
 Across the selected fragments, mutation profile identities cover at least:
 
 - Kubernetes, kubelet, containerd, runtime-rs, runc, CNI, and Agent versions;
@@ -671,6 +825,244 @@ This proves the additive composition mechanics without Agent changes. The
 coverage prototype additionally separates policy-data reconstruction from
 runtime-request absence coverage; success at the first cannot hide a gap in the
 second.
+
+### Runtime validator coverage
+
+Canonical policy-data reconstruction does not prove that `rules.rego` consumes
+every fragment-owned path. The coverage prototype therefore accepts a separate
+runtime validator inventory through `--validator-inventory`. Every reusable
+profile claim must match exactly one inventory entry with:
+
+- the same fragment category and policy-data path;
+- an optional matching container role;
+- a repository-relative runtime rule reference; and
+- a repository-relative mutation-negative OPA test reference.
+
+The referenced files and symbols must exist. A missing inventory, an uncovered
+claim, duplicate validator ownership, a role mismatch, or a stale rule/test
+reference keeps the final result `incomplete`. The appliance validation suite
+executes the referenced Rego test file, so claim coverage cannot be satisfied
+only by reconstructing unused JSON.
+
+The checked-in
+`tests/fixtures/fragments/runtime-validator-inventory.json` currently proves
+runtime consumption for all five reusable claims exercised by the focused
+coverage fixture:
+
+- OCI version through `allow_oci_version`;
+- the CRI application and sandbox roles through `allow_container_role`;
+- the shared container path through `substitute_cpath`; and
+- the empty global environment-regex default through `allow_var`.
+
+The first three validators have direct exact-value and mutation-negative tests
+in `fragment_runtime_validators_test.rego`. The environment default is tied to
+the existing Service-environment denial test. The inventory deliberately uses
+exact paths rather than prefixes, so adding a new fragment-owned leaf fails
+coverage until its runtime rule and negative test are named explicitly.
+
+!!! warning "Current proof boundary"
+    Symbol resolution proves that the named rule and test exist, and the test
+    suite proves that the Rego test passes. It does not mechanically prove that
+    the named test exercises every semantic branch of the named rule. Review of
+    the test mutation remains part of fragment publication until claim-specific
+    tests are generated directly from the inventory.
+
+### Regorus composition prototype
+
+The appliance includes an executable build-time prototype that turns trusted
+inputs into a static Rego IR module, lowers reusable profile declarations and
+static-base materialization claims, and evaluates the complete layered claim
+set using Regorus:
+
+```mermaid
+flowchart LR
+    YAML[Workload YAML and image metadata] --> GEN[Static IR generator]
+    GEN --> S[static-ir.rego]
+    PF[Reusable profile fragments] --> R[Regorus]
+    MF[Static-base materialization] --> R
+    S --> R
+    C[compose.rego] --> R
+    R --> D[Canonical policy_data JSON]
+    F[Embedded versioned Agent framework] --> P[Agent packaging]
+    D --> P
+    P --> A[Final Agent policy]
+```
+
+`generate_regorus_fragment_inputs.py` invokes the independent static generator
+on workload YAML, digest-indexed image configuration, trusted ConfigMap and
+Secret objects, and a measured UVM pause baseline. The generated sparse IR does
+not read policy-compiler output to obtain static values. It contains stable,
+ordered subjects and explicit leaf ownership metadata.
+
+The selected mutation inputs retain the design's two non-static layers:
+
+- checked-in reusable profile fragments use `policy` or container-role
+  selectors and never embed workload subject IDs;
+- static-base materialization sets carry the exact static-base digest and may
+  target stable workload subjects after role and parameter lowering.
+
+The PoC profile directory contains six independently reviewable Rego modules:
+`containerd-oci`, `kubelet-or-containerd`, `kubelet-resolution`,
+`policy-framework-settings`, `runtime-rs`, and `runtime-rs-envelope`. Exact
+profile constants are additive claims. Workload-dependent mutations are
+covered by `materialization_contracts` that constrain operation and target
+domains without naming YAML objects or containers. Environment contracts use
+literal JSON-pointer `paths`; regex path domains are permitted only for
+non-environment structures and must be anchored. The generator
+rejects a reviewed profile when its exact claims differ from candidate coverage
+or any generated materialization lacks a contract. `compose.rego` repeats the
+materialization-contract check in Regorus.
+
+Reviewed category contracts constrain each layer. Kubernetes/controller claims
+derive or generate OCI annotations. Kubelet resolution claims add environment
+entries anchored to declared inputs and bound cluster state. Containerd claims
+add OCI defaults. Runtime-rs claims add guest rewrites, while runtime envelope
+claims add non-OCI request fields. Policy-framework claims add global settings.
+
+`kubelet-or-containerd.rego` is also an executable transformation, not only a
+path contract. For every selected static-IR subject it generates the exact
+Kata and CRI annotations, role-specific masked paths, read-only paths, empty
+device list, network sysctls, terminal default, and conditional
+no-new-privileges and read-only-root defaults. Kubernetes capability intent is
+normalized into literal OCI capability names in static IR. Rego starts from
+the reviewed profile default set, subtracts `drop`, appends `add`, and emits the
+five exact OCI capability arrays. Static YAML or measured-UVM ownership always
+wins: the profile does not generate a conditional default for an already-owned
+path.
+
+Four materialization contracts remain as explicit typed-IR gaps rather than a
+wildcard authorization surface. They cover only seven literal paths: canonical
+CRI image name, controller-generated sandbox name, the OCI mount array, and
+the four process user/group fields. Their contracts name the missing input
+needed to replace them: canonical CRI image identity, controller naming intent,
+kubelet/containerd mount intent, or a digest-bound image user and group
+database. No other `kubelet-or-containerd` path can be materialized.
+
+Volume handling follows the same intent-to-transformation model. Static IR
+records each container's volume name, destination, read-only flag, and typed
+source intent. For `emptyDir`, that source includes `memory` or `node-default`
+medium and an optional size limit; it does not contain a captured guest path or
+storage driver. ConfigMap and Secret sources record namespace, object name,
+resolved or absent status, sorted keys, and a content digest without embedding
+values. The digest participates in static-base binding even though the Agent
+mount policy does not inspect file content.
+
+`runtime-rs-envelope.rego` lowers supported intents into exact per-container
+`storages`: memory volumes become pinned ephemeral `tmpfs` templates and
+node-default volumes become local-storage templates parameterized by
+`$(cpath)` and `$(sandbox-id)`. The selected profile declares
+`copy-to-rootfs` resource transport, so resolved ConfigMap and Secret volumes
+add no storage. `runtime-rs.rego` combines reviewed role-specific base mounts
+with exact bind mounts derived from destination and read-only intent. Resource
+mount sources pin the destination basename and parameterize only the container
+ID and runtime-rs random segment:
+`^$(cpath)/$(bundle-id)-[0-9a-f]{16}-<basename>$`.
+
+The runtime-rs envelope also owns the policy-wide
+`/request_defaults/CopyFileRequest` array. It derives one sorted, deduplicated
+prefix for each resolved ConfigMap or Secret destination:
+`^$(cpath)/$(bundle-id)-[0-9a-f]{16}-<basename>`. This denies every undeclared
+destination basename, and an absent optional resource contributes no prefix.
+This replaces the compiler's broad `$(sfprefix)` default, which admitted every
+runtime-generated copy root.
+
+!!! warning "The prefix cannot carry an end anchor"
+    The Agent builds its symlink rule by concatenating `.*/.+` onto each
+    configured entry. A trailing `$` therefore makes symlinks unmatchable, and a
+    trailing `/` consumes the separator that suffix requires. Either form denies
+    the `..data` and per-key symlinks that the shim copies directly beneath each
+    resource root, breaking container start and secret rotation. Because the
+    prefix must stay open, a sibling resource whose name extends a declared
+    basename also matches; such a copy lands on a guest path that no mount
+    admits, and the exact, end-anchored mount source regex still pins the
+    mounted resource. Tightening this further requires an Agent-side change
+    rather than a different emitted pattern.
+
+The Agent still validates file type, offset range, path traversal, and relative
+symlink targets. It intentionally omits regular-file data from policy input, so
+the trusted content digest binds static evidence but does not provide CopyFile
+content-integrity enforcement.
+
+Lowering is all-or-nothing per subject. A size-limited `emptyDir`, unresolved
+optional resource, unsafe basename, subpath, mount propagation, projected
+volume, or downward-API volume keeps both mount and storage materializations
+until its complete typed transformation exists. The generator removes no claim
+for a partially supported or unknown subject.
+
+Service environment variables illustrate the separation. The static IR records
+the trusted Service name, namespace, declared ports, and each container's
+`enableServiceLinks` setting, but no ClusterIP. `kubelet-resolution.rego`
+implements Service-link expansion and derives literal names such as
+`BACKEND_SERVICE_HOST`, `BACKEND_SERVICE_PORT_HTTPS`, and the corresponding
+port variables. Environment names are never regexes. Exact declared named-port
+values remain exact `Env` entries; ClusterIPs and other cluster-assigned values
+become anchored, typed `NAME=<value-pattern>` entries in
+`OCI.Process.EnvRegex` on selected application subjects. They are not copied
+from the capture and are not placed in the global `allow_env_regex` list.
+Repeated identities that require equality across fields use bind-once
+correlation instead of independent regular expressions. The reusable profile
+layer contains no exact container ID, and the sandbox does not receive an
+application Service environment.
+
+The Rust `fragment-policy-composer` binary contains no policy mutation logic. It
+loads the static IR, fragment, and composer modules into Regorus, evaluates
+`data.fragment_composer.final_policy`, and serializes the canonical data. Agent
+packaging appends that data to the independently versioned
+`agent-framework.rego` compiled into the tool. The PoC does not read or package
+legacy GenPolicy `rules.rego`, and neither workload input nor an appliance
+profile can select a replacement framework.
+
+The static Rego IR declares `agent_framework_version`. The generator and
+embedded framework currently target schema version `1`, and `compose.rego`
+fails closed before materialization when the version differs. A Kata-CC policy
+framework change therefore requires a coordinated framework, generator, and
+composer version change. YAML, image, cluster, or appliance-profile changes do
+not change the framework artifact. The resulting Agent module is parsed in the
+same Regorus engine used by the Agent.
+
+The composer fails closed when:
+
+- fragment and static profile identities differ;
+- static IR targets a different Agent framework version;
+- static-base materialization uses the wrong static-base digest;
+- a reusable selector has missing or ambiguous role cardinality;
+- an exact materialization subject does not exist;
+- a materialization operation or path is not covered by its reviewed layer;
+- a category uses an unreviewed operation or target domain;
+- a claim would overwrite static data;
+- two claims overlap; or
+- a claim is not additive.
+
+The end-to-end test uses the checked-in `run-complex` YAML, BusyBox image
+configuration, ConfigMap, Secret, Service, measured pause baseline, source
+provenance, policy-compiler output, tagged requests, and dynamic-tag manifest.
+The independent static generator produces the sparse base. Regorus loads the
+six checked-in profile modules and separately generated exact-subject
+materializations. The profile contributes `39` exact reusable claims and
+leaves `42` generated workload-bound claims. The reviewed
+`kubelet-or-containerd` transformation generates `44` exact-subject claims from
+typed static IR and profile constants, leaving `13` claims on six declared gap
+paths for this fixture. Runtime Rego generates three exact mount claims and
+three empty storage arrays; the same rules generate non-empty storage and mount
+arrays when typed `emptyDir` intents are present. Kubelet Rego additionally
+generates six exact-subject Service-link claims for the two application
+containers directly from trusted Service IR and profile-owned Kubernetes API
+Service intent. For comparison only, the candidate renderer applies the current
+policy-compiler Service environment contract to the older checked-in golden.
+The resulting JSON is byte-for-byte equal to that production-safe compiler
+target. The test also rejects captured ClusterIP, Pod UID, Pod name, and
+node-name literals. The generated Agent module embeds the resulting value after
+the versioned Agent framework and parses in Regorus.
+
+!!! warning "Reviewed structure, not a signed production profile"
+    Exact reconstruction is proved for `run-complex`, and reusable claims are
+    now checked in rather than generated during the e2e. They remain PoC review
+    candidates derived from controlled policy/capture evidence. The `42`
+    remaining static-base materialization declarations include workload and cluster
+    constraints and are intentionally not reusable fragments. Signing still
+    requires security review, independent profile provenance, complete
+    CRI-boundary ownership, runtime-validator coverage, and measured profile
+    binding for every claim and contract.
 
 ### Runtime binding prototype
 

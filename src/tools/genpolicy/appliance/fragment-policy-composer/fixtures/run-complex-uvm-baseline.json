@@ -1,0 +1,18 @@
+{
+  "artifact_digest": "sha256:bf07a8fa6b6b5ab9c57bdcc1f6028cd1c339ce0d853fd194dfcc38f2fb042a6b",
+  "pause_constraints": {
+    "/OCI/Process/Args": ["/pause"],
+    "/OCI/Process/Cwd": "/",
+    "/OCI/Process/Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+    "/OCI/Process/NoNewPrivileges": true,
+    "/OCI/Process/User": {
+      "AdditionalGids": [65535],
+      "GID": 65535,
+      "UID": 65535,
+      "Username": ""
+    },
+    "/OCI/Root/Path": "$(root_path)",
+    "/OCI/Root/Readonly": true
+  },
+  "schema_version": 1
+}

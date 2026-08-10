@@ -54,6 +54,8 @@ for script in "${appliance_dir}"/scripts/*.sh "${appliance_dir}"/scripts/runc-ca
 	bash -n "${script}"
 done
 
+"${appliance_dir}/tests/fragment-policy-composer-e2e.sh"
+
 grep -Fq "ARG KUBERNETES_VERSION=${KUBERNETES_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "ARG CONTAINERD_VERSION=${CONTAINERD_VERSION}" "${appliance_dir}/Dockerfile"
 grep -Fq "ARG RUNC_VERSION=${RUNC_VERSION}" "${appliance_dir}/Dockerfile"
@@ -71,7 +73,7 @@ if command -v opa >/dev/null 2>&1; then
 	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/exec_process_test.rego"
 	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/legacy_bindings_test.rego"
 	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/service_env_test.rego"
-	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/network_requests_test.rego"
+	opa test "${appliance_dir}/../rules.rego" "${appliance_dir}/tests/fragment_runtime_validators_test.rego"
 	opa test "${appliance_dir}/scripts/prototype_fragment_bindings.rego" "${appliance_dir}/tests/fragment_bindings_test.rego"
 else
 	echo "opa not found; skipping rego policy tests" >&2
@@ -79,6 +81,7 @@ fi
 
 (
 	cd "${appliance_dir}/../../../.."
+	cargo test --locked --package fragment-policy-composer
 	cargo test --locked --package genpolicy-oci-compiler
 	cargo test --locked --package kata-storage-predictor
 	cargo test --locked --package kata-createreq-capture

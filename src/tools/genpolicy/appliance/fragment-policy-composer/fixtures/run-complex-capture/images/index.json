@@ -1,0 +1,7 @@
+{
+  "images": {
+    "genpolicy.local:5000/busybox@sha256:c0aae9d756395ade52df06b55e160e6e32d2ecfe0181ed2c14c68effc5e3fe45": {
+      "config_path": "configs/busybox.json"
+    }
+  }
+}

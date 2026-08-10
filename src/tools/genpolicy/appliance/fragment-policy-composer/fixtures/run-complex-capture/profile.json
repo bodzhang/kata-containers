@@ -1,0 +1,11 @@
+{
+  "identity": "8b0ae298134cf114935b140f42fc2ca8a8294a674ecbeb58d4727ee2f33f00d2",
+  "rootfs_mode": "guest-pull",
+  "schema_version": 1,
+  "values": {
+    "CNI_PLUGINS_VERSION": "v1.7.1",
+    "CONTAINERD_VERSION": "v2.3.3",
+    "KUBERNETES_VERSION": "v1.33.13",
+    "RUNC_VERSION": "v1.2.8"
+  }
+}

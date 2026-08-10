@@ -32,7 +32,29 @@ class CoverageError(ValueError):
     pass
 
 
+REPO_ROOT = Path(__file__).resolve().parents[5]
+
+
+def validate_source_reference(reference: str, kind: str) -> None:
+    try:
+        relative_path, symbol = reference.split(": ", 1)
+    except ValueError as error:
+        raise CoverageError(f"runtime validator {kind} must use 'path: symbol'") from error
+    path = (REPO_ROOT / relative_path).resolve()
+    try:
+        path.relative_to(REPO_ROOT)
+    except ValueError as error:
+        raise CoverageError(f"runtime validator {kind} escapes the repository") from error
+    if not path.is_file():
+        raise CoverageError(f"runtime validator {kind} file does not exist: {relative_path}")
+    if re.search(rf"\b{re.escape(symbol)}\b", path.read_text(encoding="utf-8")) is None:
+        raise CoverageError(
+            f"runtime validator {kind} symbol does not exist: {reference}"
+        )
+
+
 WORKLOAD_DERIVED_POLICY_PATHS = {
+    "/request_defaults/CopyFileRequest",
     "/request_defaults/CreateContainerRequest/allow_env_regex",
 }
 CONTAINER_TYPE_PATH = "/OCI/Annotations/io.kubernetes.cri.container-type"
@@ -45,6 +67,8 @@ WORKLOAD_APPLICATION_ROLE_PATHS = {"/OCI/Process/EnvRegex"}
 
 
 def materialization_scope(subject: str, path: str, value=None) -> str:
+    if subject == "policy" and path == "/request_defaults/CopyFileRequest":
+        return "static-base-materialization"
     if subject != "policy" or (
         path in WORKLOAD_DERIVED_POLICY_PATHS and value != []
     ):
@@ -276,6 +300,78 @@ def request_absence_coverage(observed: list[dict], inventory: dict | None) -> di
     }
 
 
+def runtime_validator_coverage(report: dict, inventory: dict | None) -> dict:
+    if inventory is None:
+        validators = []
+        inventory_status = "missing"
+    else:
+        if inventory.get("schema_version") != 1 or not isinstance(
+            inventory.get("validators"), list
+        ):
+            raise CoverageError("invalid runtime validator inventory")
+        validators = inventory["validators"]
+        for validator in validators:
+            if not isinstance(validator, dict):
+                raise CoverageError("runtime validator must be an object")
+            if not all(
+                isinstance(validator.get(field), str) and validator[field]
+                for field in ("category", "evidence", "path", "test")
+            ):
+                raise CoverageError(
+                    "runtime validator requires category, evidence, path, and test"
+                )
+            composition.pointer_tokens(validator["path"])
+            validate_source_reference(validator["evidence"], "evidence")
+            validate_source_reference(validator["test"], "test")
+            if validator.get("role") is not None and (
+                not isinstance(validator["role"], str) or not validator["role"]
+            ):
+                raise CoverageError("runtime validator role must be a non-empty string")
+        inventory_status = "loaded"
+
+    claims = [
+        {"category": fragment["category"], **claim}
+        for fragment in report.get("fragments", [])
+        for claim in fragment.get("claims", [])
+    ]
+    entries = []
+    for claim in claims:
+        target = claim["target"]
+        matches = [
+            validator
+            for validator in validators
+            if validator["category"] == claim["category"]
+            and validator["path"] == target["path"]
+            and (
+                validator.get("role") is None
+                or validator["role"] == target.get("role")
+            )
+        ]
+        if len(matches) > 1:
+            raise CoverageError(
+                "multiple runtime validators cover "
+                f"{claim['category']} {target.get('role', 'policy')} {target['path']}"
+            )
+        entry = {
+            "category": claim["category"],
+            "operation": claim["operation"],
+            "path": target["path"],
+            "role": target.get("role"),
+            "status": "covered" if matches else "uncovered",
+        }
+        if matches:
+            entry["rule_evidence"] = matches[0]["evidence"]
+            entry["negative_test"] = matches[0]["test"]
+        entries.append(entry)
+    return {
+        "covered": sum(entry["status"] == "covered" for entry in entries),
+        "entries": entries,
+        "inventory": inventory_status,
+        "required": len(entries),
+        "uncovered": sum(entry["status"] == "uncovered" for entry in entries),
+    }
+
+
 def bind_profile(report: dict, static_ir: dict, profile: dict) -> dict:
     identity = profile.get("identity")
     if not isinstance(identity, str) or re.fullmatch(r"[0-9a-f]{64}", identity) is None:
@@ -317,9 +413,13 @@ def bind_profile(report: dict, static_ir: dict, profile: dict) -> dict:
 
 
 def finalize_report(
-    report: dict, absence_coverage: dict, binding: dict | None = None
+    report: dict,
+    absence_coverage: dict,
+    validator_coverage: dict,
+    binding: dict | None = None,
 ) -> dict:
     report["request_absence_coverage"] = absence_coverage
+    report["runtime_validator_coverage"] = validator_coverage
     blockers = []
     ambiguous = report["coverage"]["ambiguous_boundary_claims"]
     if ambiguous:
@@ -329,6 +429,12 @@ def finalize_report(
     if absence_coverage["uncovered"]:
         blockers.append(
             f"{absence_coverage['uncovered']} observed runtime absences are uncovered"
+        )
+    if validator_coverage["inventory"] != "loaded":
+        blockers.append("runtime validator inventory is missing")
+    if validator_coverage["uncovered"]:
+        blockers.append(
+            f"{validator_coverage['uncovered']} fragment claims have no runtime validator"
         )
     if binding is None or not binding.get("uvm_bound"):
         blockers.append("capture profile does not bind the measured UVM artifact")
@@ -376,6 +482,12 @@ def claim_classification(
     sources: dict[str, str],
 ) -> tuple[str, str, str]:
     if subject == "policy":
+        if path == "/request_defaults/CopyFileRequest":
+            return (
+                "runtime-rs-envelope",
+                "envelope",
+                "trusted-resource-volume-intent",
+            )
         if path in WORKLOAD_DERIVED_POLICY_PATHS:
             return (
                 "policy-framework-settings",
@@ -392,6 +504,8 @@ def claim_classification(
         name = composition.pointer_tokens(path)[-1]
         if name in unresolved:
             return "kubelet-resolution", "resolve", "workload-valueFrom"
+        if name == "HOSTNAME":
+            return "kubelet-resolution", "resolve", "kubelet-hostname"
         return "kubelet-or-containerd", "resolve", "missing-kubelet-CRI-boundary"
     source = nearest_source(sources, path)
     if path == "/OCI/Root/Path" or (source and source.startswith("settings-kata")):
@@ -759,13 +873,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--capture", required=True, type=Path)
     parser.add_argument("--uvm-baseline", required=True, type=Path)
+    parser.add_argument("--rootfs-artifacts", type=Path)
     parser.add_argument("--compiler-policy", required=True, type=Path)
     parser.add_argument("--source-report", required=True, type=Path)
     parser.add_argument("--absence-inventory", type=Path)
+    parser.add_argument("--validator-inventory", type=Path)
     parser.add_argument("--allow-incomplete", action="store_true")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
-    static_ir = static_policy.generate_static_ir(args.capture, args.uvm_baseline)
+    static_ir = static_policy.generate_static_ir(
+        args.capture, args.uvm_baseline, args.rootfs_artifacts
+    )
     expected = static_policy.policy_data(args.compiler_policy)
     source_report = json.loads(args.source_report.read_text(encoding="utf-8"))
     report = derive_candidate_coverage(static_ir, expected, source_report)
@@ -776,11 +894,17 @@ def main() -> None:
         if args.absence_inventory is not None
         else None
     )
+    validator_inventory = (
+        json.loads(args.validator_inventory.read_text(encoding="utf-8"))
+        if args.validator_inventory is not None
+        else None
+    )
     report = finalize_report(
         report,
         request_absence_coverage(
             observed_request_absences(args.capture, static_ir), inventory
         ),
+        runtime_validator_coverage(report, validator_inventory),
         report["binding"],
     )
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
