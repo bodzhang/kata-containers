@@ -219,6 +219,9 @@ def regorus_static_ir(
         subject["environment_resolutions"] = copy.deepcopy(
             static_subject.get("environment_resolutions", [])
         )
+        subject["device_requests"] = copy.deepcopy(
+            static_subject.get("device_requests", {})
+        )
         subject["rootfs"] = copy.deepcopy(static_subject.get("rootfs", {}))
         subject["rootfs_identity_storage"] = copy.deepcopy(
             static_subject.get("rootfs_identity_storage", {})
@@ -419,7 +422,14 @@ def remove_profile_generated_materializations(
                     for claim in fragment["claims"]
                     if not (
                         claim["target"]["path"]
-                        == "/request_defaults/CopyFileRequest"
+                        in {
+                            "/devices",
+                            "/request_defaults/CopyFileRequest",
+                            "/runtime_anno_patterns",
+                        }
+                        or claim["target"]["path"].startswith(
+                            "/runtime_anno_patterns/"
+                        )
                         or (
                             claim["target"]["path"] == "/storages"
                             and volume_policy_supported(
@@ -465,6 +475,17 @@ def volume_policy_supported(subject: dict | None) -> bool:
                 return False
         elif volume.get("role") in {"config-map", "secret"}:
             if (volume.get("source") or {}).get("content_trust") != "untrusted-runtime":
+                return False
+            if re.fullmatch(
+                r"[A-Za-z0-9_-]+", volume.get("destination_basename", "")
+            ) is None:
+                return False
+        elif volume.get("role") == "direct-volume":
+            uvm = volume.get("uvm") or {}
+            if uvm != {
+                "content_trust": "untrusted-runtime",
+                "transport": "shared-fs",
+            }:
                 return False
             if re.fullmatch(
                 r"[A-Za-z0-9_-]+", volume.get("destination_basename", "")

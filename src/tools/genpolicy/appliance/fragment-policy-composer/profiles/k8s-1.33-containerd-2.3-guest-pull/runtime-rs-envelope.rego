@@ -3,6 +3,10 @@ package profile_runtime_rs_envelope
 # Builds non-OCI Agent request policy owned by runtime-rs: emptyDir storage
 # envelopes and exact CopyFile roots for declared ConfigMap and Secret volumes.
 resource_volume_transport := "copy-to-rootfs"
+vfio_device_path := "/dev/vfio/devices/vfio"
+vfio_device_type := "vfio-pci-gk"
+vfio_annotation_key := "^cdi\\.k8s\\.io/vfio[0-9]+$"
+vfio_annotation_value := "^nvidia\\.com/gpu=[0-9]+$"
 
 empty_dir_storage(volume) := {
 	"driver": "ephemeral",
@@ -34,6 +38,16 @@ volume_supported(volume) if {
 	volume.role == "empty-dir"
 	volume.medium in {"memory", "node-default"}
 	object.get(volume, "size_limit", "") == ""
+	object.get(volume, "sub_path", "") == ""
+	object.get(volume, "mount_propagation", "") == ""
+	object.get(volume, "recursive_read_only", false) == false
+}
+
+volume_supported(volume) if {
+	volume.role == "direct-volume"
+	volume.uvm.transport == "shared-fs"
+	volume.uvm.content_trust == "untrusted-runtime"
+	regex.match("^[A-Za-z0-9_-]+$", volume.destination_basename)
 	object.get(volume, "sub_path", "") == ""
 	object.get(volume, "mount_propagation", "") == ""
 	object.get(volume, "recursive_read_only", false) == false
@@ -114,6 +128,72 @@ copy_file_claims(ir) := [{
 	"target": {"path": "/request_defaults/CopyFileRequest"},
 }]
 
+volume_devices(subject) := [{
+	"container_path": request.device_path,
+	"id": "",
+	"options": [],
+	"type_": "",
+	"vm_path": "",
+} | some request in subject.device_requests.volume_devices]
+
+gpu_devices(subject) := [device |
+	some request in subject.device_requests.extended_resources
+	request.resource in {"nvidia.com/gpu", "nvidia.com/pgpu"}
+	request.count > 0
+	some _ in numbers.range(1, request.count)
+	device := {
+		"container_path": vfio_device_path,
+		"id": "",
+		"options": [],
+		"type_": vfio_device_type,
+		"vm_path": "",
+	}
+]
+
+device_claims(ir) := [claim |
+	some subject in ir.subjects
+	devices := array.concat(volume_devices(subject), gpu_devices(subject))
+	claim := {
+		"addition": {"devices": devices},
+		"category": "runtime-rs-envelope",
+		"operation": "envelope",
+		"subject": subject.id,
+		"target": {"path": "/devices"},
+	}
+]
+
+application_runtime_patterns(subject) := patterns if {
+	subject.role == "application"
+	base := {
+		"^io\\.kubernetes\\.container\\.terminationMessagePath$": "^/.*$",
+		"^io\\.kubernetes\\.container\\.terminationMessagePolicy$": "^(File|FallbackToLogsOnError)$",
+	}
+	has_gpu := count(gpu_devices(subject)) > 0
+	patterns := object.union(base, {vfio_annotation_key: vfio_annotation_value})
+	has_gpu
+}
+
+application_runtime_patterns(subject) := {
+	"^io\\.kubernetes\\.container\\.terminationMessagePath$": "^/.*$",
+	"^io\\.kubernetes\\.container\\.terminationMessagePolicy$": "^(File|FallbackToLogsOnError)$",
+} if {
+	subject.role == "application"
+	count(gpu_devices(subject)) == 0
+}
+
+application_runtime_patterns(subject) := {} if { subject.role == "sandbox" }
+
+runtime_pattern_claims(ir) := [claim |
+	some subject in ir.subjects
+	claim := {
+		"addition": {"runtime_anno_patterns": application_runtime_patterns(subject)},
+		"category": "runtime-rs-envelope",
+		"operation": "envelope",
+		"subject": subject.id,
+		"target": {"path": "/runtime_anno_patterns"},
+	}
+]
+
 # Other non-OCI request fields remain behind a narrow materialization contract
 # until runtime-rs envelope transformations are modeled from typed inputs.
 fragment := {
@@ -126,7 +206,7 @@ fragment := {
 	"materialization_contracts": [
 		{
 			"operations": ["envelope"],
-			"path_regex": "^/(storages|devices|sandbox_pidns|exec_commands|runtime_anno_patterns(?:/.*)?)$"
+			"path_regex": "^/(sandbox_pidns|exec_commands)$"
 		}
 	],
 	"schema_version": 1,

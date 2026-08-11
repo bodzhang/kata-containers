@@ -196,9 +196,11 @@ mod tests {
 
 volume_storage_claims(_ir) := []
 copy_file_claims(_ir) := []
+device_claims(_ir) := []
+runtime_pattern_claims(_ir) := []
 ";
     const GENERATED_RUNTIME_RS_PROFILE: &str =
-        "package profile_runtime_rs\n\nvolume_mount_claims(_ir) := []\n";
+        "package profile_runtime_rs\n\nvolume_mount_claims(_ir) := []\ndevice_claims(_ir) := []\n";
     const RUNTIME_ENVELOPE_PROFILE: &str =
         include_str!("../profiles/k8s-1.33-containerd-2.3-guest-pull/runtime-rs-envelope.rego");
     const RUNTIME_RS_PROFILE: &str =
@@ -694,5 +696,74 @@ ir := {"subjects": [{
                 "^$(cpath)/$(bundle-id)-[0-9a-f]{16}-missing"
             ])
         );
+    }
+
+    #[test]
+    fn runtime_fragments_lower_uvm_only_device_and_direct_volume_intent() {
+        let static_ir = r#"package static_policy_ir
+
+ir := {"subjects": [{
+    "id": "container/app",
+    "role": "application",
+    "device_requests": {
+        "extended_resources": [{"count": 2, "resource": "nvidia.com/gpu", "resolution": "device-profile"}],
+        "volume_devices": [{"device_path": "/dev/data", "name": "claim-block", "resolution": "uvm-device"}],
+    },
+    "volumes": [{
+        "destination": "/external/host",
+        "destination_basename": "host",
+        "name": "host-data",
+        "read_only": true,
+        "role": "direct-volume",
+        "uvm": {"content_trust": "untrusted-runtime", "transport": "shared-fs"},
+    }],
+}]}
+"#;
+        let value = evaluate_modules_query(
+            &[
+                ("static-ir.rego", static_ir),
+                ("runtime-rs.rego", RUNTIME_RS_PROFILE),
+            ],
+            "{\"mounts\": data.profile_runtime_rs.volume_mount_claims(data.static_policy_ir.ir), \"linux\": data.profile_runtime_rs.device_claims(data.static_policy_ir.ir)}",
+        )
+        .unwrap();
+        let claims = serde_json::to_value(value).unwrap();
+        let mounts = claims["mounts"][0]["addition"]["OCI"]["Mounts"]
+            .as_array()
+            .unwrap();
+        let direct_mount = mounts.last().unwrap();
+        assert_eq!(direct_mount["destination"], "/external/host");
+        assert_eq!(
+            direct_mount["source"],
+            "^$(cpath)/$(bundle-id)-[0-9a-f]{16}-host$"
+        );
+        assert_eq!(
+            claims["linux"][0]["addition"]["OCI"]["Linux"]["Devices"],
+            serde_json::json!([{"Path": "/dev/data", "Type": ""}])
+        );
+
+        let value = evaluate_modules_query(
+            &[
+                ("static-ir.rego", static_ir),
+                ("runtime-envelope.rego", RUNTIME_ENVELOPE_PROFILE),
+            ],
+            "{\"devices\": data.profile_runtime_rs_envelope.device_claims(data.static_policy_ir.ir), \"patterns\": data.profile_runtime_rs_envelope.runtime_pattern_claims(data.static_policy_ir.ir)}",
+        )
+        .unwrap();
+        let claims = serde_json::to_value(value).unwrap();
+        let devices = claims["devices"][0]["addition"]["devices"]
+            .as_array()
+            .unwrap();
+        assert_eq!(devices.len(), 3);
+        assert_eq!(devices[0]["container_path"], "/dev/data");
+        assert!(devices[0]["id"].as_str().unwrap().is_empty());
+        assert_eq!(devices[1]["container_path"], "/dev/vfio/devices/vfio");
+        assert_eq!(devices[1]["type_"], "vfio-pci-gk");
+        assert_eq!(devices[2], devices[1]);
+        let serialized = serde_json::to_string(&claims).unwrap();
+        assert!(serialized.contains("cdi\\\\.k8s\\\\.io/vfio"));
+        assert!(!serialized.contains("/var/lib"));
+        assert!(!serialized.contains("0000:"));
+        assert!(!serialized.contains("device-test-data"));
     }
 }

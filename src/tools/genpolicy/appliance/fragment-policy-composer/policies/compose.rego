@@ -12,10 +12,19 @@ profile_generated_claims(ir) := array.concat(
 	array.concat(
 		data.profile_kubelet_resolution.service_link_claims(ir),
 		array.concat(
-			data.profile_runtime_rs.volume_mount_claims(ir),
 			array.concat(
-				data.profile_runtime_rs_envelope.volume_storage_claims(ir),
-				data.profile_runtime_rs_envelope.copy_file_claims(ir),
+				data.profile_runtime_rs.volume_mount_claims(ir),
+				data.profile_runtime_rs.device_claims(ir),
+			),
+			array.concat(
+				array.concat(
+					data.profile_runtime_rs_envelope.volume_storage_claims(ir),
+					data.profile_runtime_rs_envelope.copy_file_claims(ir),
+				),
+				array.concat(
+					data.profile_runtime_rs_envelope.device_claims(ir),
+					data.profile_runtime_rs_envelope.runtime_pattern_claims(ir),
+				),
 			),
 		),
 	),

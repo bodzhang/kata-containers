@@ -96,10 +96,6 @@ masked_paths(subject) := sandbox_masked_paths if { subject.role == "sandbox" }
 
 common_default_specs(subject) := [
   {
-    "addition": {"OCI": {"Linux": {"Devices": []}}},
-    "path": "/OCI/Linux/Devices",
-  },
-  {
     "addition": {"OCI": {"Linux": {"MaskedPaths": masked_paths(subject)}}},
     "path": "/OCI/Linux/MaskedPaths",
   },
@@ -286,14 +282,6 @@ fragment := {
       "operations": ["default"],
       "paths": [
         "/OCI/Annotations/io.kubernetes.cri.sandbox-name"
-      ],
-      "status": "requires-typed-static-ir"
-    },
-    {
-      "input": "kubelet-and-containerd-mount-intent",
-      "operations": ["default"],
-      "paths": [
-        "/OCI/Mounts"
       ],
       "status": "requires-typed-static-ir"
     },

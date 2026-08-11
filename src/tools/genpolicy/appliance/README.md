@@ -509,8 +509,8 @@ is added.
 
 | Surface | Appliance status | Enforcement boundary |
 |---|---|---|
-| Non-VFIO `CreateContainerRequest.devices` | Supported for final-request shape admission. | The compiler retains captured records. Rego requires exact cardinality and unique paths; non-empty captured `id`, type, `vm_path`, and options are exact. Empty legacy placeholder fields remain path-only. This does not bind a resolved physical device identity. |
-| Kubernetes `volumeDevices` | Supported as a bounded container-visible device path, subject to authoritative final request capture. | Workload YAML supplies the declared path as an additional OCI policy check. It does not prove the backing block device's identity, integrity, confidentiality, or contents. |
+| Non-VFIO `CreateContainerRequest.devices` | Supported only through typed workload intent and a reviewed UVM device profile. | Captured `id`, type, `vm_path`, options, host paths, and device addresses are ignored. Rego requires exact cardinality and unique guest paths. |
+| Kubernetes `volumeDevices` | Supported as a bounded container-visible device path without capture authority. | Workload YAML supplies the exact guest path. The policy leaves `id`, type, `vm_path`, and options empty and does not identify or trust the backing block device. |
 | NVIDIA pGPU through VFIO/CDI | Rule-tested at the request-shape level, not capture-confirmed or physical-device identity enforcement. | The compiler preserves one unsuffixed VFIO requirement per declared pGPU instead of pinning captured runtime numbers. Rego checks count, type, guest path shape, PCI option grammar, unique runtime device numbers, and CDI suffix correlation. Current profiles have no GPU device plugin, extended-resource capacity, CDI installation, or VFIO hardware; trusted hotplug registry binding and post-CDI effective-plan authorization require future Agent changes. |
 | Probe and lifecycle exec actions | Supported with exact argv arrays read from trusted workload YAML. | These future requests are absent from `CreateContainerRequest`. Rego also checks the target container's recorded state and process user, environment, cwd, no-new-privileges, empty exec capabilities, and terminal semantics. Authorization is command-based, not caller/probe provenance-based: the same exact request can be issued through another exec client. |
 | Arbitrary `kubectl exec` | Denied by default. | The appliance defaults contain no global allowed commands or exec regexes. A command identical to an allowed probe or lifecycle action is nevertheless admitted. Until one-shot stream binding is implemented in the Agent, exec-process passfd ports are required to be zero. |
@@ -526,20 +526,20 @@ capture bundle or policy. Exposing a GPU on the host does not change this
 without installing the device plugin, advertising capacity, and configuring
 CDI inside the throwaway cluster.
 
-`nvidia.com/pgpu` is the default YAML resource key interpreted as a pGPU policy
-declaration. `nvidia.com/gpu` is currently expected only in runtime-injected CDI
-annotation values; using it as a resource limit still requests an unavailable
-extended resource and does not create a pGPU policy requirement unless it is
-added to the versioned `pgpu_resource_keys` setting. Likewise,
-`volumeDevices` requires an authoritative final device capture, but the current
-cluster has no CSI driver to provision a raw-block PVC.
+The fragment prototype recognizes `nvidia.com/pgpu` and `nvidia.com/gpu` as
+reviewed pGPU declarations. It emits one unsuffixed VFIO guest-path requirement
+per requested device plus the reviewed CDI key/value grammar. Runtime device
+numbers and PCI addresses are request inputs correlated by Agent Rego, not
+policy-generation inputs. The current cluster still has no CSI driver to
+exercise raw-block PVC allocation end to end.
 
 ## Volume and shared-mount handling
 
-The appliance requires a captured `CreateContainerRequest` as the authority for
-every container. Missing or incomplete request capture fails generation. The
-storage predictor remains an audit artifact and workload YAML supplies only
-policy data for operations absent from container creation, such as exec probes.
+The appliance may require a captured `CreateContainerRequest` for comparison
+coverage, but capture is diagnostic evidence rather than policy authority.
+Device and volume policy is generated from trusted workload intent and reviewed
+UVM profile rules. Captured host paths, storage sources, device IDs, PCI
+addresses, and contents are never serialized into final policy.
 
 The evidence labels below are deliberate. **Capture-confirmed** means a final
 request recorded by `RecordingAgent` exercised the class. **Rule-tested** means
@@ -550,7 +550,7 @@ shape, but generated policy does not admit it.
 | Volume form | Legacy GenPolicy | Appliance handling | Policy result |
 |---|---|---|---|
 | ConfigMap, Secret, and downward API with `shared_fs = "none"` | Predicts a settings-based `$(sfprefix)` bind mount and, by default, no Agent `Storage`; it does not execute the shim's `CopyFile` path. | Runs the real runtime-rs copy-to-guest path. The recording Agent accepts `CopyFile` calls, and the captured final request contains no `Storage` but has a rewritten bind source matching `<cpath>/<cid>-<16 hex>-<destination basename>`. | **Capture-confirmed.** Pins the rewritten mount shape and confines `CopyFile` paths and file types; it does not attest the host-supplied file contents. A composite Kubernetes `projected` volume is not yet capture-confirmed. |
-| Raw-block PVC through `volumeDevices` | Emits an `agent::Device` and OCI Linux device from the declared `devicePath`; pins only the container path. | Uses the final captured request devices. | Supported. Bounds the device path, not the device identity, integrity, confidentiality, or mutable contents. |
+| Raw-block PVC through `volumeDevices` | Emits an `agent::Device` and OCI Linux device from the declared `devicePath`; pins only the container path. | Uses the workload-declared guest path and ignores captured device identity fields. | Supported. Bounds the device path, not the device identity, integrity, confidentiality, or mutable contents. |
 | Filesystem PVC through shared fs | Emits a generic shared bind mount and no block `Storage`. | The clean-room cluster has no CSI driver, so it cannot materialize an ordinary PVC from YAML. | Fail-closed unless a separately supported authoritative fixture can reproduce the final shim request. |
 | Memory `emptyDir` | Emits `ephemeral`/`tmpfs` storage. | Runs the real runtime-rs ephemeral-volume handler. | **Capture-confirmed.** Pins source, filesystem, options, sharing, and the exact guest mount point. |
 | Disk `emptyDir` in shared-fs mode | Emits `local` storage. | Runs the real runtime-rs local-volume handler. | **Capture-confirmed.** Pins source, filesystem, options, sharing, and the sandbox-correlated guest path. |

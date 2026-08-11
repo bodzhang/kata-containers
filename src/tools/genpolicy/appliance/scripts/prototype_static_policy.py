@@ -546,6 +546,33 @@ def exec_commands(container: dict) -> list[list[str]]:
     return commands
 
 
+def extended_resource_requests(container: dict) -> list[dict]:
+    limits = ((container.get("resources") or {}).get("limits") or {})
+    if not isinstance(limits, dict):
+        raise ValueError("container resource limits must be an object")
+    requests = []
+    for resource, quantity in sorted(limits.items()):
+        if "/" not in resource:
+            continue
+        if resource not in {"nvidia.com/gpu", "nvidia.com/pgpu"}:
+            raise ValueError(
+                f"extended resource has no reviewed UVM device profile: {resource}"
+            )
+        value = str(quantity)
+        if re.fullmatch(r"[0-9]+", value) is None:
+            raise ValueError(
+                f"extended resource limit must be a non-negative integer: {resource}={value}"
+            )
+        requests.append(
+            {
+                "count": int(value),
+                "resource": resource,
+                "resolution": "device-profile",
+            }
+        )
+    return requests
+
+
 def projected_source(source: dict, namespace: str) -> dict:
     if not isinstance(source, dict):
         raise ValueError("projected volume source must be an object")
@@ -590,7 +617,16 @@ def volume_source(
         raise ValueError("volume declaration must be an object")
     kinds = [
         kind
-        for kind in ("emptyDir", "configMap", "secret", "downwardAPI", "projected")
+        for kind in (
+            "emptyDir",
+            "configMap",
+            "secret",
+            "downwardAPI",
+            "projected",
+            "hostPath",
+            "persistentVolumeClaim",
+            "csi",
+        )
         if kind in volume
     ]
     source_keys = set(volume) - {"name"}
@@ -629,6 +665,28 @@ def volume_source(
         raise ValueError(
             "Downward API volume content is incompatible with the Kata-CC threat model"
         )
+    if kind == "hostPath":
+        path = source.get("path")
+        source_type = source.get("type", "")
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ValueError("hostPath volume requires an absolute path")
+        if source_type not in {"", "Directory", "DirectoryOrCreate"}:
+            raise ValueError(
+                f"hostPath type {source_type or '<unset>'} has no reviewed UVM volume profile"
+            )
+        return {
+            "role": "direct-volume",
+            "uvm": {
+                "content_trust": "untrusted-runtime",
+                "transport": "shared-fs",
+            },
+        }
+    if kind == "persistentVolumeClaim":
+        raise ValueError(
+            "mounted persistentVolumeClaim has no reviewed UVM volume profile"
+        )
+    if kind == "csi":
+        raise ValueError("mounted CSI volume has no reviewed UVM volume profile")
     sources = source.get("sources")
     if not isinstance(sources, list) or not sources:
         raise ValueError("projected volume requires sources")
@@ -651,9 +709,7 @@ def container_volume_intents(
         name = volume.get("name")
         if not isinstance(name, str) or not name or name in volumes:
             raise ValueError(f"invalid or duplicate volume name: {name}")
-        volumes[name] = volume_source(volume, namespace)
-    if container.get("volumeDevices"):
-        raise ValueError("static volumeDevices intent is not yet supported")
+        volumes[name] = volume
     intents = []
     destinations = set()
     for mount in container.get("volumeMounts") or []:
@@ -682,7 +738,7 @@ def container_volume_intents(
             "destination_basename": destination_basename,
             "name": name,
             "read_only": read_only,
-            **copy.deepcopy(volumes[name]),
+            **volume_source(volumes[name], namespace),
         }
         for source_key, target_key in (
             ("mountPropagation", "mount_propagation"),
@@ -693,6 +749,44 @@ def container_volume_intents(
                 intent[target_key] = mount[source_key]
         intents.append(intent)
         destinations.add(destination)
+    return intents
+
+
+def container_volume_device_intents(spec: dict, container: dict, namespace: str) -> list[dict]:
+    volumes = {}
+    for volume in spec.get("volumes") or []:
+        name = volume.get("name")
+        if not isinstance(name, str) or not name or name in volumes:
+            raise ValueError(f"invalid or duplicate volume name: {name}")
+        volumes[name] = volume
+    intents = []
+    names = set()
+    paths = set()
+    for device in container.get("volumeDevices") or []:
+        if not isinstance(device, dict) or set(device) != {"devicePath", "name"}:
+            raise ValueError("volumeDevice requires exactly name and devicePath")
+        name = device["name"]
+        device_path = device["devicePath"]
+        if name not in volumes:
+            raise ValueError(f"volumeDevice references undeclared volume: {name}")
+        if not isinstance(device_path, str) or not device_path.startswith("/"):
+            raise ValueError(f"volumeDevice requires an absolute devicePath: {name}")
+        if name in names or device_path in paths:
+            raise ValueError(f"duplicate volumeDevice name or path: {name}")
+        volume = volumes[name]
+        if "persistentVolumeClaim" not in volume:
+            raise ValueError(
+                f"volumeDevice {name} has no reviewed UVM block-device profile"
+            )
+        intents.append(
+            {
+                "device_path": device_path,
+                "name": name,
+                "resolution": "uvm-device",
+            }
+        )
+        names.add(name)
+        paths.add(device_path)
     return intents
 
 
@@ -783,6 +877,12 @@ def generate_static_ir(
                 "constraints": constraints,
                 "environment_resolutions": environment_resolutions,
                 "env_from": env_from,
+                "device_requests": {
+                    "extended_resources": extended_resource_requests(container),
+                    "volume_devices": container_volume_device_intents(
+                        spec, container, namespace
+                    ),
+                },
                 "image": image_reference,
                 "namespace": namespace,
                 "service_account": copy.deepcopy(service_account),

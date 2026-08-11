@@ -82,7 +82,19 @@ assert {fragment["category"] for fragment in profile_fragments} == {
 	"runtime-rs-envelope",
 }
 assert sum(len(fragment["claims"]) for fragment in profile_fragments) == 39
-assert sum(len(fragment["claims"]) for fragment in materializations) == 39
+assert sum(len(fragment["claims"]) for fragment in materializations) == 31
+forbidden_materialization_paths = {
+	"/devices",
+	"/OCI/Linux/Devices",
+	"/OCI/Mounts",
+	"/storages",
+}
+assert all(
+	claim["target"]["path"] not in forbidden_materialization_paths
+	and not claim["target"]["path"].startswith("/runtime_anno_patterns")
+	for fragment in materializations
+	for claim in fragment["claims"]
+)
 assert all(
 	contract["path_regex"].startswith("^")
 	and contract["path_regex"].endswith("$")

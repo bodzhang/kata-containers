@@ -482,12 +482,39 @@ class RegorusFragmentInputTests(unittest.TestCase):
             materializations, {"subjects": []}
         )
 
+        self.assertEqual(result, [])
+
+    def test_filter_removes_generated_device_runtime_patterns(self):
+        materializations = [
+            {
+                "category": "runtime-rs-envelope",
+                "claims": [
+                    {
+                        "target": {
+                            "path": "/runtime_anno_patterns/^cdi$",
+                            "subject": "container/app",
+                        }
+                    },
+                    {
+                        "target": {
+                            "path": "/sandbox_pidns",
+                            "subject": "container/app",
+                        }
+                    },
+                ],
+            }
+        ]
+
+        result = renderer.remove_profile_generated_materializations(
+            materializations, {"subjects": []}
+        )
+
         self.assertEqual(
             result[0]["claims"],
             [
                 {
                     "target": {
-                        "path": "/devices",
+                        "path": "/sandbox_pidns",
                         "subject": "container/app",
                     }
                 }
@@ -566,6 +593,49 @@ class RegorusFragmentInputTests(unittest.TestCase):
             [claim["target"]["subject"] for claim in result[1]["claims"]],
             ["container/projected", "container/missing"],
         )
+
+    def test_regorus_ir_preserves_static_device_requests(self):
+        report = {
+            "binding": {
+                "profile_identity": "a" * 64,
+                "static_base_digest": "b" * 64,
+            },
+            "fragments": [],
+            "static_policy": {
+                "policy_data": {},
+                "subjects": [
+                    {
+                        "id": "container/app",
+                        "ordinal": 0,
+                        "policy": {},
+                    }
+                ],
+            },
+        }
+        device_requests = {
+            "extended_resources": [
+                {
+                    "count": 2,
+                    "resource": "nvidia.com/gpu",
+                    "resolution": "device-profile",
+                }
+            ],
+            "volume_devices": [],
+        }
+        static_ir = {
+            "rootfs_mode": "guest-pull",
+            "services": [],
+            "subjects": [
+                {
+                    "subject": "container/app",
+                    "device_requests": device_requests,
+                }
+            ],
+        }
+
+        result = renderer.regorus_static_ir(report, static_ir)
+
+        self.assertEqual(result["subjects"][0]["device_requests"], device_requests)
 
     def test_reusable_fragments_do_not_embed_subject_ids(self):
         report = {

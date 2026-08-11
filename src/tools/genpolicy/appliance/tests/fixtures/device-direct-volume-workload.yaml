@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: device-direct-volume
+  namespace: default
+spec:
+  automountServiceAccountToken: false
+  runtimeClassName: kata
+  containers:
+    - name: workload
+      image: genpolicy.local:5000/busybox@sha256:c0aae9d756395ade52df06b55e160e6e32d2ecfe0181ed2c14c68effc5e3fe45
+      imagePullPolicy: Never
+      command: ["/bin/busybox", "sleep", "3600"]
+      resources:
+        limits:
+          nvidia.com/gpu: "2"
+      volumeMounts:
+        - name: host-data
+          mountPath: /external/host
+          readOnly: true
+      volumeDevices:
+        - name: claim-block
+          devicePath: /dev/workload-data
+  volumes:
+    - name: host-data
+      hostPath:
+        path: /var/lib/genpolicy/device-test
+        type: Directory
+    - name: claim-block
+      persistentVolumeClaim:
+        claimName: device-test-data
+        readOnly: false

@@ -291,13 +291,16 @@ either generated policy:
 - per-container rootfs authority containing the digest-bound image identity and
   any independently trusted artifact measurements;
 - per-container volume mount intent for supported YAML-native volume classes;
+- per-container extended-resource count and block-volume device-path intent;
+- UVM-visible direct-volume destination, access, and transport intent without
+  host path, PVC, CSI, or backing-device identity;
 - typed environment resolution declarations with explicit policy targets and
   sources, never captured values.
 
 It rejects image references that are not manifest-digest bound. It does not yet
 classify user and group resolution, capability deltas other than explicit final
-sets, block `volumeDevices`, or externally resolved hostPath, PVC, and CSI
-volumes. The UVM-static pause subject requires a separate measured-UVM baseline.
+sets, mounted PVC or CSI transports, or host block and character devices. The
+UVM-static pause subject requires a separate measured-UVM baseline.
 
 #### Static `envFrom` IR
 
@@ -519,26 +522,86 @@ destination, read-only state, and source semantics. For example:
 ```
 
 The prototype supports disk and memory `emptyDir`, direct ConfigMap and Secret
-mounts, and projected volumes that do not contain a Downward API source.
+mounts, projected volumes that do not contain a Downward API source,
+shared-filesystem host-directory mounts, and PVC-backed block
+`volumeDevices`.
 Projected ConfigMap and Secret entries retain their object identity. Projected
 ServiceAccount tokens are rejected until trusted guest verification exists.
 Static `subPath`, mount propagation, and recursive-read-only declarations are
 preserved.
 
 Generation fails for undeclared or duplicate volume identities, duplicate
-destinations, unsupported source types, dynamic `subPathExpr`, and
-`volumeDevices`. Direct ConfigMap and Secret mounts remain supported with
-`content_trust = untrusted-runtime`; their presence does not authorize object
-bytes as policy facts. Direct Downward API volumes and projected volumes
+destinations, unsupported source types, dynamic `subPathExpr`, malformed or
+duplicate `volumeDevices`, and non-integral or negative extended-resource
+limits. It also rejects mounted PVC and CSI volumes, host block or character
+devices, and extended resources without a reviewed UVM device profile. Direct
+ConfigMap and Secret mounts remain supported with `content_trust =
+untrusted-runtime`; their presence does not authorize object bytes as policy
+facts. Direct Downward API volumes and projected volumes
 containing a `downwardAPI` source fail policy generation because the current
 Agent interface cannot authenticate their rendered values. Dynamic subpaths
-and devices require typed value binding and device authority rather than being
-copied from a final request.
+require typed value binding rather than being copied from a final request.
 
-The IR does not contain host source paths, watchable sandbox paths, runtime-rs
-`Storage` objects, or block-device addresses. HostPath, PVC, CSI, and other
-externally resolved sources remain unsupported until a trusted resolver can
-bind their workload declaration to the required host or device identity.
+The IR and final policy contain only UVM-visible authority. A direct
+host-directory mount records its container destination, access mode,
+`content_trust = untrusted-runtime`, and UVM `shared-fs` transport. A block
+`volumeDevice` records only its guest container path. Neither representation
+contains the hostPath string, PVC claim name or namespace, CSI driver or
+attributes, watchable sandbox path, concrete runtime-rs `Storage`, block-device
+address, PCI address, VFIO suffix, host-generated device ID, resolved PVC
+backing, or CSI attachment identity.
+
+Fragments lower these declarations into guest path templates. Shared
+directories use an anchored `$(cpath)` and `$(bundle-id)` pattern. Volume
+devices use the exact guest container path. GPUs use the reviewed VFIO guest
+path prefix, device type, count, and CDI annotation grammar. Runtime-assigned
+identities are validated against those templates by Agent Rego and are never
+copied from capture into policy. Any volume or device class without a reviewed
+UVM template fails generation instead of retaining a materialization.
+
+#### Static device IR
+
+Kubernetes extended-resource limits and `volumeDevices` provide useful static
+authority even though they do not identify runtime hardware. Each subject
+contains typed device requests:
+
+```json
+{
+  "device_requests": {
+    "extended_resources": [
+      {
+        "count": 2,
+        "resource": "nvidia.com/gpu",
+        "resolution": "device-profile"
+      }
+    ],
+    "volume_devices": [
+      {
+        "device_path": "/dev/data",
+        "name": "data",
+        "resolution": "uvm-device"
+      }
+    ]
+  }
+}
+```
+
+The static generator records every Kubernetes extended resource as a resource
+key and non-negative integer count. A device profile may lower only resource
+keys it recognizes. For NVIDIA passthrough GPUs, the existing runtime profile
+uses the configured resource-key allowlist and requested count, then correlates
+runtime VFIO devices with CDI annotations. It cannot add an undeclared GPU,
+change the count, or substitute a different container device path. Runtime PCI
+addresses, VFIO device numbers, and CDI suffixes are correlation inputs rather
+than static workload authority.
+
+Legacy GenPolicy follows the same device model: `volumeDevices` emit only
+`container_path`, while NVIDIA pGPU entries emit only the unsuffixed VFIO guest
+path and reviewed device type. Legacy shared PVC and host-directory mounts use
+guest-side `$(sfprefix)` regular expressions rather than host paths. Legacy has
+an exception that serializes literal `/dev/*` and `/sys/*` hostPath sources;
+the fragment design deliberately does not inherit it and rejects those host
+device classes.
 
 !!! warning "Mounted object contents are adversarial"
     ConfigMap, Secret, downward-API, and projected source identity constrains

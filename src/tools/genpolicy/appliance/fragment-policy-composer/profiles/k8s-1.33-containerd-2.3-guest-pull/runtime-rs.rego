@@ -50,13 +50,34 @@ resource_mount(volume) := {
   resource_volume_transport == "copy-to-rootfs"
 }
 
+direct_volume_mount_options(volume) := ["rbind", "rprivate", "ro"] if { volume.read_only }
+direct_volume_mount_options(volume) := ["rbind", "rprivate", "rw"] if { not volume.read_only }
+
+direct_volume_mount(volume) := {
+  "destination": volume.destination,
+  "options": direct_volume_mount_options(volume),
+  "source": sprintf("^$(cpath)/$(bundle-id)-[0-9a-f]{16}-%s$", [volume.destination_basename]),
+  "type_": "bind",
+}
+
 volume_mount(volume) := empty_dir_mount(volume) if { volume.role == "empty-dir" }
 volume_mount(volume) := resource_mount(volume) if { volume.role in {"config-map", "secret"} }
+volume_mount(volume) := direct_volume_mount(volume) if { volume.role == "direct-volume" }
 
 volume_supported(volume) if {
   volume.role == "empty-dir"
   volume.medium in {"memory", "node-default"}
   object.get(volume, "size_limit", "") == ""
+  object.get(volume, "sub_path", "") == ""
+  object.get(volume, "mount_propagation", "") == ""
+  object.get(volume, "recursive_read_only", false) == false
+}
+
+volume_supported(volume) if {
+  volume.role == "direct-volume"
+  volume.uvm.transport == "shared-fs"
+  volume.uvm.content_trust == "untrusted-runtime"
+  regex.match("^[A-Za-z0-9_-]+$", volume.destination_basename)
   object.get(volume, "sub_path", "") == ""
   object.get(volume, "mount_propagation", "") == ""
   object.get(volume, "recursive_read_only", false) == false
@@ -92,6 +113,21 @@ volume_mount_claims(ir) := [claim |
     "operation": "rewrite",
     "subject": subject.id,
     "target": {"path": "/OCI/Mounts"},
+  }
+]
+
+volume_linux_devices(subject) := [{"Path": request.device_path, "Type": ""} |
+  some request in subject.device_requests.volume_devices
+]
+
+device_claims(ir) := [claim |
+  some subject in ir.subjects
+  claim := {
+    "addition": {"OCI": {"Linux": {"Devices": volume_linux_devices(subject)}}},
+    "category": "runtime-rs",
+    "operation": "rewrite",
+    "subject": subject.id,
+    "target": {"path": "/OCI/Linux/Devices"},
   }
 ]
 

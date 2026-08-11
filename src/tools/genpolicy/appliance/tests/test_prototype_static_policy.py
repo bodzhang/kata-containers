@@ -2,6 +2,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,13 @@ import yaml
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "prototype_static_policy.py"
+FIXTURES = Path(__file__).parent / "fixtures"
+CAPTURE_FIXTURE = (
+    Path(__file__).parents[1]
+    / "fragment-policy-composer"
+    / "fixtures"
+    / "run-complex-capture"
+)
 SPEC = importlib.util.spec_from_file_location("prototype_static_policy", SCRIPT)
 prototype = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -17,6 +25,43 @@ SPEC.loader.exec_module(prototype)
 
 
 class StaticPolicyPrototypeTests(unittest.TestCase):
+    def test_generates_device_direct_volume_fixture_ir(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary) / "capture"
+            shutil.copytree(CAPTURE_FIXTURE, capture)
+            shutil.copyfile(
+                FIXTURES / "device-direct-volume-workload.yaml",
+                capture / "workload.yaml",
+            )
+
+            result = prototype.generate_static_ir(capture, rootfs_mode="guest-pull")
+            subject = next(
+                subject
+                for subject in result["subjects"]
+                if subject["subject"] == "container/workload"
+            )
+
+            self.assertEqual(
+                subject["device_requests"]["extended_resources"],
+                [
+                    {
+                        "count": 2,
+                        "resource": "nvidia.com/gpu",
+                        "resolution": "device-profile",
+                    }
+                ],
+            )
+            self.assertEqual(
+                subject["device_requests"]["volume_devices"][0]["device_path"],
+                "/dev/workload-data",
+            )
+            self.assertEqual(
+                [volume["role"] for volume in subject["volumes"]],
+                ["direct-volume"],
+            )
+            self.assertNotIn("/var/lib/genpolicy/device-test", json.dumps(subject))
+            self.assertNotIn("device-test-data", json.dumps(subject))
+
     def test_rejects_image_content_tampered_after_fetch(self):
         with tempfile.TemporaryDirectory() as temporary:
             images = Path(temporary)
@@ -490,7 +535,7 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate trusted ConfigMap"):
                 prototype.generate_static_ir(capture)
 
-    def test_rejects_unsupported_volume_source(self):
+    def test_generates_host_path_volume_intent_as_untrusted(self):
         with tempfile.TemporaryDirectory() as temporary:
             capture = Path(temporary)
             self.make_capture(capture)
@@ -500,8 +545,21 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
             del volume["configMap"]
             self.write_workload(capture, documents)
 
-            with self.assertRaisesRegex(ValueError, "supported source"):
-                prototype.generate_static_ir(capture)
+            result = prototype.generate_static_ir(capture)
+            volume = next(
+                volume
+                for volume in result["subjects"][0]["volumes"]
+                if volume["name"] == "configuration"
+            )
+            self.assertEqual(volume["role"], "direct-volume")
+            self.assertEqual(
+                volume["uvm"],
+                {
+                    "content_trust": "untrusted-runtime",
+                    "transport": "shared-fs",
+                },
+            )
+            self.assertNotIn("/host/config", json.dumps(result))
 
     def test_rejects_undeclared_volume_mount(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -527,17 +585,129 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "subPathExpr"):
                 prototype.generate_static_ir(capture)
 
-    def test_rejects_volume_devices_until_device_intent_is_modeled(self):
+    def test_generates_pvc_volume_device_intent(self):
         with tempfile.TemporaryDirectory() as temporary:
             capture = Path(temporary)
             self.make_capture(capture)
             documents = self.read_workload(capture)
-            self.document(documents, "Pod")["spec"]["containers"][0]["volumeDevices"] = [
-                {"devicePath": "/dev/data", "name": "scratch"}
+            pod = self.document(documents, "Pod")
+            pod["spec"]["volumes"].append(
+                {
+                    "name": "data",
+                    "persistentVolumeClaim": {
+                        "claimName": "workload-data",
+                        "readOnly": True,
+                    },
+                }
+            )
+            pod["spec"]["containers"][0]["volumeDevices"] = [
+                {"devicePath": "/dev/data", "name": "data"}
             ]
             self.write_workload(capture, documents)
 
-            with self.assertRaisesRegex(ValueError, "volumeDevices intent"):
+            result = prototype.generate_static_ir(capture)
+
+            self.assertEqual(
+                result["subjects"][0]["device_requests"]["volume_devices"],
+                [
+                    {
+                        "device_path": "/dev/data",
+                        "name": "data",
+                        "resolution": "uvm-device",
+                    }
+                ],
+            )
+            self.assertNotIn("workload-data", json.dumps(result))
+
+    def test_generates_extended_gpu_resource_intent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            documents = self.read_workload(capture)
+            container = self.document(documents, "Pod")["spec"]["containers"][0]
+            container["resources"] = {
+                "limits": {"cpu": "2", "nvidia.com/gpu": "2"}
+            }
+            self.write_workload(capture, documents)
+
+            result = prototype.generate_static_ir(capture)
+
+            self.assertEqual(
+                result["subjects"][0]["device_requests"]["extended_resources"],
+                [
+                    {
+                        "count": 2,
+                        "resource": "nvidia.com/gpu",
+                        "resolution": "device-profile",
+                    }
+                ],
+            )
+
+    def test_rejects_malformed_extended_resource_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            documents = self.read_workload(capture)
+            container = self.document(documents, "Pod")["spec"]["containers"][0]
+            container["resources"] = {"limits": {"nvidia.com/gpu": "1.5"}}
+            self.write_workload(capture, documents)
+
+            with self.assertRaisesRegex(ValueError, "non-negative integer"):
+                prototype.generate_static_ir(capture)
+
+    def test_rejects_duplicate_volume_device_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            documents = self.read_workload(capture)
+            pod = self.document(documents, "Pod")
+            pod["spec"]["volumes"].extend(
+                [
+                    {
+                        "name": "first-data",
+                        "persistentVolumeClaim": {"claimName": "first"},
+                    },
+                    {
+                        "name": "second-data",
+                        "persistentVolumeClaim": {"claimName": "second"},
+                    },
+                ]
+            )
+            pod["spec"]["containers"][0]["volumeDevices"] = [
+                {"devicePath": "/dev/data", "name": "first-data"},
+                {"devicePath": "/dev/data", "name": "second-data"},
+            ]
+            self.write_workload(capture, documents)
+
+            with self.assertRaisesRegex(ValueError, "duplicate volumeDevice"):
+                prototype.generate_static_ir(capture)
+
+    def test_rejects_inline_csi_mount_without_uvm_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            self.make_capture(capture)
+            documents = self.read_workload(capture)
+            pod = self.document(documents, "Pod")
+            pod["spec"]["volumes"].append(
+                {
+                    "name": "plugin-data",
+                    "csi": {
+                        "driver": "example.csi.invalid",
+                        "readOnly": True,
+                        "volumeAttributes": {"profile": "safe"},
+                    },
+                }
+            )
+            pod["spec"]["containers"][0]["volumeMounts"].append(
+                {
+                    "mountPath": "/plugin-data",
+                    "name": "plugin-data",
+                    "readOnly": True,
+                }
+            )
+            self.write_workload(capture, documents)
+
+            with self.assertRaisesRegex(ValueError, "no reviewed UVM volume profile"):
                 prototype.generate_static_ir(capture)
 
     def test_optional_resource_volume_remains_watchable_when_initially_absent(self):
