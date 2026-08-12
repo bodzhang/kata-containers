@@ -1,6 +1,22 @@
 package agent_policy
 
-policy_data := {}
+policy_data := json.unmarshal(`{
+	"framework": {
+		"annotations": {
+			"sandbox_id": "io.kubernetes.cri.sandbox-id",
+			"sandbox_log_directory": "io.kubernetes.cri.sandbox-log-directory",
+			"sandbox_name": "io.kubernetes.cri.sandbox-name",
+			"sandbox_namespace": "io.kubernetes.cri.sandbox-namespace",
+			"sandbox_uid": "io.kubernetes.cri.sandbox-uid",
+			"cri_container_type": "io.kubernetes.cri.container-type"
+		},
+		"paths": {"pod_log_directory_format": "/var/log/pods/%s_%s_%s"},
+		"roles": {
+			"cri_container": "container",
+			"cri_sandbox": "sandbox"
+		}
+	}
+}`)
 
 legacy_sandbox_id := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 legacy_pod_uid := "12345678-1234-4234-8234-123456789abc"

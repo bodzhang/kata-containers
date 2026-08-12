@@ -13,10 +13,69 @@ policy_data := json.unmarshal(`{
 	"common": {
 		"cpath": "/run/kata-containers/shared/containers(?:/passthrough)?",
 		"sfprefix": "^$(cpath)/(watchable/)?$(bundle-id)-[a-z0-9]{16}-",
-		"spath": "/run/kata-containers/sandbox/storage"
+		"spath": "/run/kata-containers/sandbox/storage",
+		"substitutions": {
+			"cpath": "$(cpath)",
+			"sfprefix": "$(sfprefix)",
+			"bundle_id": "$(bundle-id)",
+			"sandbox_id": "$(sandbox-id)",
+			"spath": "$(spath)",
+			"b64_device_id": "$(b64_device_id)",
+			"unresolved_token_regex": "\\$\\([^)]+\\)"
+		}
+	},
+	"cluster_config": {
+		"cgroup_mount_extras_allowed": ["nsdelegate", "memory_recursiveprot"],
+		"mount_compatibility": {
+			"sysfs_type": "sysfs",
+			"sysfs_policy_read_write_option": "rw",
+			"sysfs_request_read_only_option": "ro",
+			"cgroup_type": "cgroup"
+		},
+		"rootfs_compatibility": {
+			"multi_layer_option": "X-kata.multi-layer=true",
+			"overlay_upper_option": "X-kata.overlay-upper",
+			"overlay_lower_option": "X-kata.overlay-lower",
+			"dmverity_enabled_option": "X-kata.dmverity-enabled=true",
+			"dmverity_roothash_option_prefix": "X-kata.dmverity.roothash=",
+			"guest_pull_fstype": "overlay",
+			"guest_pull_driver_option_prefix": "image_guest_pull=",
+			"erofs_upper_fstype": "ext4",
+			"erofs_lower_fstype": "erofs",
+			"block_transports": [
+				{"driver": "blk", "source_regex": "^[0-9a-f]{2}(/[0-9a-f]{2})?$"},
+				{"driver": "scsi", "source_regex": "^[0-9]+:[0-9]+$"},
+				{"driver": "mmioblk", "source_regex": "^/dev/vd[a-z]+$"},
+				{"driver": "blk-ccw", "source_regex": "^0\\.0\\.[0-9a-f]{4}$"},
+				{"driver": "nvdimm", "source_regex": "^/dev/pmem[0-9]+$"}
+			],
+			"rootfs_mount_points": [
+				"/run/kata-containers/$(bundle-id)/rootfs",
+				"/run/kata-containers/shared/containers/passthrough/$(bundle-id)/rootfs"
+			],
+			"overlayfs_driver": "overlayfs",
+			"overlayfs_source": "none",
+			"local_fstype": "local",
+			"bind_fstype": "bind",
+			"tmpfs_fstype": "tmpfs",
+			"hugetlbfs_fstype": "hugetlbfs"
+		}
 	},
 	"dmverity": {"allowed_roothashes": []}
 }`)
+
+mount_compatibility_policy(key, value) := object.union(policy_data, {
+	"cluster_config": object.union(policy_data.cluster_config, {
+		"mount_compatibility": object.union(
+			policy_data.cluster_config.mount_compatibility,
+			{key: value},
+		),
+	}),
+})
+
+guest_pull_policy(allowed_images) := object.union(policy_data, {
+	"guest_pull": {"allowed_images": allowed_images},
+})
 
 sandbox_id := "aaaabbbbccccdddd"
 
@@ -188,6 +247,54 @@ test_literal_mount_source_is_not_regex if {
 	not mount_source_allows(p_mount, i_mount, "bid", sandbox_id)
 }
 
+sysfs_policy_mount := {
+	"destination": "/sys", "type_": "sysfs", "source": "sysfs",
+	"options": ["nosuid", "noexec", "nodev", "rw"],
+}
+
+sysfs_request_mount := {
+	"destination": "/sys", "type_": "sysfs", "source": "sysfs",
+	"options": ["nosuid", "noexec", "nodev", "ro"],
+}
+
+test_sysfs_readonly_compatibility_allowed if {
+	check_mount(sysfs_policy_mount, sysfs_request_mount, "bid", sandbox_id)
+}
+
+test_sysfs_type_mutation_denied if {
+	mutated := mount_compatibility_policy("sysfs_type", "sysfs2")
+	not check_mount(sysfs_policy_mount, sysfs_request_mount, "bid", sandbox_id) with data.agent_policy.policy_data as mutated
+}
+
+test_sysfs_policy_option_mutation_denied if {
+	mutated := mount_compatibility_policy("sysfs_policy_read_write_option", "write")
+	not check_mount(sysfs_policy_mount, sysfs_request_mount, "bid", sandbox_id) with data.agent_policy.policy_data as mutated
+}
+
+test_sysfs_request_option_mutation_denied if {
+	mutated := mount_compatibility_policy("sysfs_request_read_only_option", "readonly")
+	not check_mount(sysfs_policy_mount, sysfs_request_mount, "bid", sandbox_id) with data.agent_policy.policy_data as mutated
+}
+
+cgroup_policy_mount := {
+	"destination": "/sys/fs/cgroup", "type_": "cgroup", "source": "cgroup",
+	"options": ["rw"],
+}
+
+cgroup_request_mount := {
+	"destination": "/sys/fs/cgroup", "type_": "cgroup", "source": "cgroup",
+	"options": ["rw", "nsdelegate"],
+}
+
+test_cgroup_extra_compatibility_allowed if {
+	check_mount(cgroup_policy_mount, cgroup_request_mount, "bid", sandbox_id)
+}
+
+test_cgroup_type_mutation_denied if {
+	mutated := mount_compatibility_policy("cgroup_type", "cgroup2")
+	not check_mount(cgroup_policy_mount, cgroup_request_mount, "bid", sandbox_id) with data.agent_policy.policy_data as mutated
+}
+
 # A hugepage-backed emptyDir (hugetlbfs) is admitted by the new clause.
 test_hugepage_storage_allowed if {
 	allow_storages(
@@ -218,7 +325,7 @@ guest_pull_runtime(image) := {
 # marker.
 test_guest_pull_global_allowlist_denied if {
 	not allow_storages([], [guest_pull_runtime("evil.example/malware:latest")], "cid", sandbox_id)
-		with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": ["evil.example/malware:latest"]}}
+		with data.agent_policy.policy_data as guest_pull_policy(["evil.example/malware:latest"])
 }
 
 # Missing per-container identity fails closed instead of allowing by shape.
@@ -241,7 +348,7 @@ test_guest_pull_per_container_allowed if {
 	allow_storages(
 		[guest_pull_marker([concat("", ["docker.io/library/nginx@", digest])])],
 		[guest_pull_runtime(concat("", ["mirror.example/nginx@", digest]))], "cid", sandbox_id,
-	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+	) with data.agent_policy.policy_data as guest_pull_policy([])
 }
 
 test_guest_pull_digest_only_marker_allowed if {
@@ -249,21 +356,21 @@ test_guest_pull_digest_only_marker_allowed if {
 	allow_storages(
 		[guest_pull_marker([digest])],
 		[guest_pull_runtime(concat("", ["mirror.example/nginx@", digest]))], "cid", sandbox_id,
-	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+	) with data.agent_policy.policy_data as guest_pull_policy([])
 }
 
 test_guest_pull_mutable_tag_denied if {
 	not allow_storages(
 		[guest_pull_marker(["docker.io/library/nginx:1.27"])],
 		[guest_pull_runtime("docker.io/library/nginx:1.27")], "cid", sandbox_id,
-	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+	) with data.agent_policy.policy_data as guest_pull_policy([])
 }
 
 test_guest_pull_different_digest_denied if {
 	not allow_storages(
 		[guest_pull_marker(["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])],
 		[guest_pull_runtime("mirror.example/nginx@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")], "cid", sandbox_id,
-	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+	) with data.agent_policy.policy_data as guest_pull_policy([])
 }
 
 test_guest_pull_wrong_mount_point_denied if {
@@ -274,7 +381,7 @@ test_guest_pull_wrong_mount_point_denied if {
 	not allow_storages(
 		[guest_pull_marker(["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])],
 		[storage], "cid", sandbox_id,
-	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+	) with data.agent_policy.policy_data as guest_pull_policy([])
 }
 
 test_guest_pull_missing_driver_metadata_denied if {
@@ -285,7 +392,7 @@ test_guest_pull_missing_driver_metadata_denied if {
 	not allow_storages(
 		[guest_pull_marker(["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])],
 		[storage], "cid", sandbox_id,
-	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+	) with data.agent_policy.policy_data as guest_pull_policy([])
 }
 
 # Cross-container isolation: presenting another container's image ("api") is
@@ -296,7 +403,7 @@ test_guest_pull_per_container_isolation if {
 	not allow_storages(
 		[guest_pull_marker(["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])],
 		[guest_pull_runtime("ghcr.io/app/api@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")], "cid", sandbox_id,
-	) with data.agent_policy.policy_data as {"guest_pull": {"allowed_images": []}}
+	) with data.agent_policy.policy_data as guest_pull_policy([])
 }
 
 # Runtime i_storage for a block-encrypted emptyDir as produced by the shim's
@@ -511,22 +618,199 @@ test_shared_fs_none_configmap_mount_bad_hex_denied if {
 	)
 }
 
-# The agent CopyFile destinations (the projected files copied into the rootfs)
-# are confined to the shared dir, so the default CopyFileRequest rule authorizes
-# them.
+# The agent CopyFile destinations are restricted to resource roots derived from
+# trusted ConfigMap and Secret volume intent.
 copy_policy_data := {
+	"evaluator_schema_version": 1,
 	"common": {
 		"cpath": "/run/kata-containers/shared/containers(?:/passthrough)?",
 		"sfprefix": "^$(cpath)/(watchable/)?$(bundle-id)-[a-z0-9]{16}-",
+		"copy_file_bundle_id_regex": "[a-z0-9]{64}",
+		"substitutions": {
+			"cpath": "$(cpath)",
+			"sfprefix": "$(sfprefix)",
+			"bundle_id": "$(bundle-id)",
+			"unresolved_token_regex": "\\$\\([^)]+\\)"
+		},
+		"copy_file_compatibility": {
+			"regular_type": "Regular",
+			"directory_type": "Directory",
+			"symlink_type": "Symlink",
+			"traversal_regex": "(^|/)\\.\\.($|/)",
+			"symlink_path_suffix": ".*/.+"
+		},
+		"request_shape": {
+			"copy_file_default_size": 0,
+			"copy_file_default_offset": 0,
+			"copy_file_minimum_value": 0,
+			"create_sandbox_pidns": false,
+			"exec_process_default_port": 0
+		},
 	},
-	"request_defaults": {"CopyFileRequest": ["$(sfprefix)"]},
+	"request_defaults": {"CopyFileRequest": [
+		"^$(cpath)/$(bundle-id)-[0-9a-f]{16}-config",
+	]},
 }
+
+copy_policy_with_bundle_regex(value) := object.union(copy_policy_data, {
+	"common": object.union(copy_policy_data.common, {
+		"copy_file_bundle_id_regex": value,
+	}),
+})
+
+copy_policy_with_compatibility(key, value) := object.union(copy_policy_data, {
+	"common": object.union(copy_policy_data.common, {
+		"copy_file_compatibility": object.union(
+			copy_policy_data.common.copy_file_compatibility,
+			{key: value},
+		),
+	}),
+})
+
+copy_policy_with_request_shape(key, value) := object.union(copy_policy_data, {
+	"common": object.union(copy_policy_data.common, {
+		"request_shape": object.union(copy_policy_data.common.request_shape, {key: value}),
+	}),
+})
 
 test_shared_fs_none_configmap_copy_allowed if {
 	CopyFileRequest with input as {
 		"file_type": "Regular",
 		"path": concat("", [
 			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/token",
+		]),
+	}
+		with data.agent_policy.policy_data as copy_policy_data
+}
+
+test_copy_file_bundle_id_grammar_mutation_denied if {
+	mutated := copy_policy_with_bundle_regex("[a-z0-9]{32}")
+	not CopyFileRequest with input as {
+		"file_type": "Regular",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/token",
+		]),
+	}
+		with data.agent_policy.policy_data as mutated
+}
+
+test_copy_file_regular_type_mutation_denied if {
+	mutated := copy_policy_with_compatibility("regular_type", "File")
+	not CopyFileRequest with input as {
+		"file_type": "Regular",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/token",
+		]),
+	} with data.agent_policy.policy_data as mutated
+}
+
+test_copy_file_traversal_regex_mutation_denied if {
+	mutated := copy_policy_with_compatibility("traversal_regex", ".*")
+	not CopyFileRequest with input as {
+		"file_type": "Regular",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/token",
+		]),
+	} with data.agent_policy.policy_data as mutated
+}
+
+test_copy_file_minimum_value_mutation_denied if {
+	mutated := copy_policy_with_request_shape("copy_file_minimum_value", 1)
+	not CopyFileRequest with input as {
+		"file_type": "Regular",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/token",
+		]),
+	} with data.agent_policy.policy_data as mutated
+}
+
+test_shared_fs_none_configmap_root_directory_allowed if {
+	CopyFileRequest with input as {
+		"file_type": "Directory",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config",
+		]),
+	}
+		with data.agent_policy.policy_data as copy_policy_data
+}
+
+test_shared_fs_none_nested_relative_symlink_allowed if {
+	CopyFileRequest with input as {
+		"file_type": "Symlink",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/current/token",
+		]),
+		"symlink_target": "data/token",
+	}
+		with data.agent_policy.policy_data as copy_policy_data
+}
+
+# The kubelet atomic-writer layout places the "..data" symlink and every
+# user-visible key symlink directly beneath the resource root, and the shim
+# copies them from both the initial walk and each secret rotation. An end anchor
+# on the CopyFile prefix would deny these, so they are pinned as regressions.
+test_shared_fs_none_data_symlink_allowed if {
+	CopyFileRequest with input as {
+		"file_type": "Symlink",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/..data",
+		]),
+		"symlink_target": "..2026_08_10_00_00_00.1234",
+	}
+		with data.agent_policy.policy_data as copy_policy_data
+}
+
+test_shared_fs_none_key_symlink_allowed if {
+	CopyFileRequest with input as {
+		"file_type": "Symlink",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/token",
+		]),
+		"symlink_target": "..data/token",
+	}
+		with data.agent_policy.policy_data as copy_policy_data
+}
+
+test_shared_fs_none_absolute_symlink_target_denied if {
+	not CopyFileRequest with input as {
+		"file_type": "Symlink",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/current/token",
+		]),
+		"symlink_target": "/etc/passwd",
+	}
+		with data.agent_policy.policy_data as copy_policy_data
+}
+
+test_shared_fs_none_symlink_target_traversal_denied if {
+	not CopyFileRequest with input as {
+		"file_type": "Symlink",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-config/current/token",
+		]),
+		"symlink_target": "../../etc/passwd",
+	}
+		with data.agent_policy.policy_data as copy_policy_data
+}
+
+test_shared_fs_none_undeclared_resource_copy_denied if {
+	not CopyFileRequest with input as {
+		"file_type": "Regular",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-evil/token",
+		]),
+	}
+		with data.agent_policy.policy_data as copy_policy_data
+}
+
+# A sibling resource whose name extends a declared basename is still reachable,
+# because the prefix cannot carry an end anchor. Such a copy lands on a guest
+# path that no mount admits, and the mount source regex remains exact.
+test_shared_fs_none_resource_prefix_sibling_reachable if {
+	CopyFileRequest with input as {
+		"file_type": "Regular",
+		"path": concat("", [
+			"/run/kata-containers/shared/containers/", bundle_id, "-0011223344556677-configuration/token",
 		]),
 	}
 		with data.agent_policy.policy_data as copy_policy_data
@@ -561,6 +845,3 @@ test_copy_offset_past_size_denied if {
 	}
 		with data.agent_policy.policy_data as copy_policy_data
 }
-
-
-

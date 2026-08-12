@@ -8,7 +8,15 @@ package agent_policy
 #
 # allow_devices splits volume vs VFIO devices using policy_data.devices.vfio; the
 # VFIO device_path here mirrors genpolicy-settings.json.
-policy_data := json.unmarshal(`{"devices": {"vfio": {"device_path": "/dev/vfio/devices/vfio"}}}`)
+fixture_policy_data := json.unmarshal(`{"devices": {"vfio": {"device_path": "/dev/vfio/devices/vfio", "cdi_annotation_prefix": "cdi.k8s.io/vfio", "device_number_regex": "^[0-9]+$", "device_id_prefix": "vfio", "pci_address_regex": "^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[01][0-9a-fA-F]\\.[0-7]=[0-9a-fA-F]{2}/[0-9a-fA-F]{2}$"}}}`)
+
+policy_data := fixture_policy_data
+
+vfio_operand_policy(key, value) := {
+	"devices": {
+		"vfio": object.union(fixture_policy_data.devices.vfio, {key: value}),
+	},
+}
 
 oci := {"Annotations": {}}
 
@@ -112,6 +120,42 @@ test_vfio_gpu_allowed if {
 		[vfio_request_device("0", "0000:00:05.0=10/de")],
 		gpu_oci("0"),
 	)
+}
+
+test_vfio_cdi_prefix_mutation_denied if {
+	mutated := vfio_operand_policy("cdi_annotation_prefix", "cdi.example/vfio")
+	not allow_devices(
+		[vfio_policy_device],
+		[vfio_request_device("0", "0000:00:05.0=10/de")],
+		gpu_oci("0"),
+	) with data.agent_policy.policy_data as mutated
+}
+
+test_vfio_number_regex_mutation_denied if {
+	mutated := vfio_operand_policy("device_number_regex", "^1$")
+	not allow_devices(
+		[vfio_policy_device],
+		[vfio_request_device("0", "0000:00:05.0=10/de")],
+		gpu_oci("0"),
+	) with data.agent_policy.policy_data as mutated
+}
+
+test_vfio_id_prefix_mutation_denied if {
+	mutated := vfio_operand_policy("device_id_prefix", "iommu")
+	not allow_devices(
+		[vfio_policy_device],
+		[vfio_request_device("0", "0000:00:05.0=10/de")],
+		gpu_oci("0"),
+	) with data.agent_policy.policy_data as mutated
+}
+
+test_vfio_pci_regex_mutation_denied if {
+	mutated := vfio_operand_policy("pci_address_regex", "^ffff:")
+	not allow_devices(
+		[vfio_policy_device],
+		[vfio_request_device("0", "0000:00:05.0=10/de")],
+		gpu_oci("0"),
+	) with data.agent_policy.policy_data as mutated
 }
 
 # A malformed PCI-address option is rejected.

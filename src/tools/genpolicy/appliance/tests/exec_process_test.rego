@@ -1,6 +1,10 @@
 package agent_policy
 
-policy_data := {}
+policy_data := json.unmarshal(`{
+    "common": {
+        "request_shape": {"exec_process_default_port": 0}
+    }
+}`)
 
 exec_input := {
 	"string_user": null,
