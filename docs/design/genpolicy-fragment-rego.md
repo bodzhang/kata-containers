@@ -273,14 +273,15 @@ endpoint whose request carries workload or profile-sensitive authority remains
 default-denied until static policy and all owning fragments authorize it.
 
 !!! warning "Legacy evaluator is compatibility evidence"
-    The current `src/tools/genpolicy/rules.rego` is the behavioral baseline for
-    endpoint and field coverage, but it still embeds CRI annotation names, Kata
-    paths, storage grammars, substitutions, and compatibility operands. The
-    migration keeps its generic control flow while moving those operands into
-    composer-produced `policy_data`. Compatibility with the file before that
-    refactoring is evidence only, not completion of the parameterization. The
-    [evaluator operand migration](genpolicy-evaluator-operand-migration.md)
-    defines the complete compiler, composer, and evaluator change plan.
+  The evaluator before operand migration is the behavioral baseline for
+  endpoint and field coverage, but its embedded CRI annotation names, Kata
+  paths, storage grammars, substitutions, and compatibility operands are not
+  authority. The parameterized evaluator keeps its generic control flow and
+  reads those operands from composer-produced `policy_data`. Compatibility
+  with the earlier evaluator is evidence only, not completion of the
+  parameterization. The
+  [evaluator operand migration](../../src/tools/genpolicy/appliance/EVALUATOR_OPERAND_MIGRATION.md)
+  defines the complete compiler, composer, and evaluator contract.
 
 ## Mutation Operations
 
