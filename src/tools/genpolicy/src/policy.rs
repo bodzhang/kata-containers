@@ -50,11 +50,17 @@ pub struct AgentPolicy {
 /// Representation of the policy_data field from the output policy text.
 #[derive(Debug, Serialize)]
 pub struct PolicyData {
+    /// Version of the policy-data contract consumed by rules.rego.
+    pub evaluator_schema_version: u32,
+
     /// Policy properties for each container allowed to be executed in a pod.
     pub containers: Vec<ContainerPolicy>,
 
     /// Settings read from genpolicy-settings.json.
     pub common: CommonData,
+
+    /// Profile-sensitive operands consumed by the RPC evaluator.
+    pub framework: FrameworkData,
 
     /// Sandbox settings read from genpolicy-settings.json.
     pub sandbox: SandboxData,
@@ -68,6 +74,44 @@ pub struct PolicyData {
 
     /// Cluster-level settings read from genpolicy-settings.json.
     pub cluster_config: ClusterConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrameworkData {
+    pub annotations: FrameworkAnnotations,
+    pub paths: FrameworkPaths,
+    pub roles: FrameworkRoles,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrameworkAnnotations {
+    pub container_name: String,
+    pub cri_container_type: String,
+    pub cri_prefix: String,
+    pub kata_container_type: String,
+    pub network_namespace: String,
+    pub sandbox_id: String,
+    pub sandbox_log_directory: String,
+    pub sandbox_name: String,
+    pub sandbox_namespace: String,
+    pub sandbox_uid: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrameworkPaths {
+    pub pod_log_directory_format: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrameworkRoles {
+    pub cri_container: String,
+    pub cri_sandbox: String,
+    pub kata_container: String,
+    pub kata_sandbox: String,
 }
 
 /// OCI Container spec. This struct is very similar to the Spec struct from
@@ -377,7 +421,14 @@ pub struct UpdateInterfaceRequestDefaults {
 
 /// UpdateInterfaceRequest settings from genpolicy-settings.json.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddARPNeighborsRequestDefaults {
+    /// Neighbor flag bitmask explicitly allowed to configure.
+    allowed_flags: u32,
+
+    /// Exact IP address mask required on neighbor updates.
+    required_ip_address_mask: String,
+
     /// Explicitly blocked interface names. Intent is to block changes to loopback interface.
     forbidden_device_names: Vec<String>,
     /// Explicitly blocked IP address ranges.
@@ -435,6 +486,12 @@ pub struct CommonData {
     /// Path to the container root - e.g., "/run/kata-containers/$(bundle-id)/rootfs".
     pub root_path: String,
 
+    /// Capturing regex substituted for $(bundle-id) when validating OCI Root.Path.
+    pub root_bundle_id_regex: String,
+
+    /// Regex substituted for $(bundle-id) in CopyFileRequest path templates.
+    pub copy_file_bundle_id_regex: String,
+
     /// Regex prefix for shared file paths - e.g., "^$(cpath)/$(bundle-id)-[a-z0-9]{16}-".
     pub sfprefix: String,
 
@@ -458,6 +515,76 @@ pub struct CommonData {
 
     /// Default capabilities for a privileged container.
     pub privileged_caps: Vec<String>,
+
+    pub namespace_compatibility: NamespaceCompatibility,
+    pub capability_compatibility: CapabilityCompatibility,
+    pub copy_file_compatibility: CopyFileCompatibility,
+    pub substitutions: SubstitutionContract,
+    pub request_shape: RequestShapeCompatibility,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestShapeCompatibility {
+    pub copy_file_default_size: i64,
+    pub copy_file_default_offset: i64,
+    pub copy_file_minimum_value: i64,
+    pub create_sandbox_pidns: bool,
+    pub exec_process_default_port: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubstitutionContract {
+    pub cpath: String,
+    pub root_path: String,
+    pub bundle_id: String,
+    pub sandbox_id: String,
+    pub sandbox_name: String,
+    pub sandbox_namespace: String,
+    pub sfprefix: String,
+    pub spath: String,
+    pub b64_device_id: String,
+    pub node_name: String,
+    pub host_name: String,
+    pub pod_uid: String,
+    pub resource_field: String,
+    pub todo_annotation: String,
+    pub pod_ip: String,
+    pub host_ip: String,
+    pub ipv4_a: String,
+    pub ip_p: String,
+    pub svc_name_downward_env: String,
+    pub dns_label: String,
+    pub escape_marker: String,
+    pub escaped_value: String,
+    pub unresolved_token_regex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceCompatibility {
+    pub aliases: BTreeMap<String, String>,
+    pub ignored_input_types: Vec<String>,
+    pub network_type: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityCompatibility {
+    pub prefix: String,
+    pub default_marker: String,
+    pub privileged_marker: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CopyFileCompatibility {
+    pub regular_type: String,
+    pub directory_type: String,
+    pub symlink_type: String,
+    pub traversal_regex: String,
+    pub symlink_path_suffix: String,
 }
 
 /// Configuration from "kubectl config".
@@ -487,6 +614,61 @@ pub struct ClusterConfig {
     /// (e.g. "nsdelegate", "memory_recursiveprot" on newer kernels).
     #[serde(default)]
     pub cgroup_mount_extras_allowed: Vec<String>,
+
+    /// Profile-sensitive mount compatibility operands consumed by rules.rego.
+    pub mount_compatibility: MountCompatibility,
+
+    /// Profile-sensitive rootfs representation operands consumed by rules.rego.
+    pub rootfs_compatibility: RootfsCompatibility,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootfsCompatibility {
+    pub multi_layer_option: String,
+    pub overlay_upper_option: String,
+    pub overlay_lower_option: String,
+    pub dmverity_enabled_option: String,
+
+    /// Prefix of the runtime option carrying a dm-verity root hash.
+    pub dmverity_roothash_option_prefix: String,
+
+    pub guest_pull_fstype: String,
+    pub guest_pull_driver_option_prefix: String,
+    pub erofs_upper_fstype: String,
+    pub erofs_lower_fstype: String,
+    pub block_transports: Vec<BlockTransport>,
+    pub rootfs_mount_points: Vec<String>,
+    pub overlayfs_driver: String,
+    pub overlayfs_source: String,
+    pub local_fstype: String,
+    pub bind_fstype: String,
+    pub tmpfs_fstype: String,
+    pub hugetlbfs_fstype: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockTransport {
+    pub driver: String,
+    pub source_regex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MountCompatibility {
+    /// OCI mount type for the privileged sysfs read-write to read-only exception.
+    pub sysfs_type: String,
+
+    /// Option emitted in the policy for a writable sysfs mount.
+    pub sysfs_policy_read_write_option: String,
+
+    /// Option accepted from the runtime for the corresponding read-only mount.
+    pub sysfs_request_read_only_option: String,
+
+    /// OCI mount type whose runtime-added options are checked against the
+    /// cgroup_mount_extras_allowed list.
+    pub cgroup_type: String,
 }
 
 fn default_fs_sharing_supported() -> bool {
@@ -498,6 +680,18 @@ fn default_fs_sharing_supported() -> bool {
 pub struct VfioDevices {
     /// Device path prefix for VFIO devices (without device number suffix).
     pub device_path: String,
+
+    /// Prefix for CDI VFIO annotation keys.
+    pub cdi_annotation_prefix: String,
+
+    /// Regex for the numeric suffix shared by VFIO device paths and CDI keys.
+    pub device_number_regex: String,
+
+    /// Prefix for the Agent VFIO device ID.
+    pub device_id_prefix: String,
+
+    /// Regex for VFIO PCI address mapping options.
+    pub pci_address_regex: String,
 
     /// Regex pattern for VFIO CDI annotation keys.
     #[serde(skip_serializing)]
@@ -654,9 +848,11 @@ impl AgentPolicy {
         }
 
         let policy_data = policy::PolicyData {
+            evaluator_schema_version: self.config.settings.evaluator_schema_version,
             containers: policy_containers,
             request_defaults: self.config.settings.request_defaults.clone(),
             common: self.config.settings.common.clone(),
+            framework: self.config.settings.framework.clone(),
             sandbox: self.config.settings.sandbox.clone(),
             devices: self.config.settings.devices.clone(),
             cluster_config: self.config.settings.cluster_config.clone(),
@@ -1425,6 +1621,39 @@ mod tests {
 
     fn additional_gids(process: &KataProcess) -> Vec<u32> {
         process.User.AdditionalGids.iter().copied().collect()
+    }
+
+    #[test]
+    fn evaluator_contract_rejects_unknown_fields() {
+        let value = serde_json::json!({
+            "copy_file_default_size": 0,
+            "copy_file_default_offset": 0,
+            "copy_file_minimum_value": 0,
+            "create_sandbox_pidns": false,
+            "exec_process_default_port": 0,
+            "unexpected": true
+        });
+        assert!(serde_json::from_value::<RequestShapeCompatibility>(value).is_err());
+    }
+
+    #[test]
+    fn evaluator_contract_rejects_missing_and_wrong_type_fields() {
+        let missing = serde_json::json!({
+            "copy_file_default_size": 0,
+            "copy_file_default_offset": 0,
+            "copy_file_minimum_value": 0,
+            "create_sandbox_pidns": false
+        });
+        assert!(serde_json::from_value::<RequestShapeCompatibility>(missing).is_err());
+
+        let wrong_type = serde_json::json!({
+            "copy_file_default_size": 0,
+            "copy_file_default_offset": 0,
+            "copy_file_minimum_value": 0,
+            "create_sandbox_pidns": false,
+            "exec_process_default_port": "0"
+        });
+        assert!(serde_json::from_value::<RequestShapeCompatibility>(wrong_type).is_err());
     }
 
     #[test]

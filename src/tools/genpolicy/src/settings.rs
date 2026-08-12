@@ -18,6 +18,7 @@ use std::path::Path;
 /// Policy settings loaded from genpolicy-settings.json.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Settings {
+    pub evaluator_schema_version: u32,
     pub pause_container: policy::KataSpec,
     pub other_container: policy::KataSpec,
     pub volumes: Volumes,
@@ -26,6 +27,7 @@ pub struct Settings {
     pub cluster_config: policy::ClusterConfig,
     pub request_defaults: policy::RequestDefaults,
     pub common: policy::CommonData,
+    pub framework: policy::FrameworkData,
     pub mount_destinations: Vec<String>,
     pub sandbox: policy::SandboxData,
 }

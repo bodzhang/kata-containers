@@ -1,10 +1,66 @@
 {
+    "evaluator_schema_version": 1,
     "pause_container": {
         "Root": {
             "Path": "$(root_path)",
             "Readonly": true
         },
         "Mounts": [
+            {
+                "destination": "/proc",
+                "type_": "proc",
+                "source": "proc",
+                "options": [
+                    "nosuid",
+                    "noexec",
+                    "nodev"
+                ]
+            },
+            {
+                "destination": "/dev",
+                "type_": "tmpfs",
+                "source": "tmpfs",
+                "options": [
+                    "nosuid",
+                    "strictatime",
+                    "mode=755",
+                    "size=65536k"
+                ]
+            },
+            {
+                "destination": "/dev/pts",
+                "type_": "devpts",
+                "source": "devpts",
+                "options": [
+                    "nosuid",
+                    "noexec",
+                    "newinstance",
+                    "ptmxmode=0666",
+                    "mode=0620",
+                    "gid=5"
+                ]
+            },
+            {
+                "destination": "/dev/mqueue",
+                "type_": "mqueue",
+                "source": "mqueue",
+                "options": [
+                    "nosuid",
+                    "noexec",
+                    "nodev"
+                ]
+            },
+            {
+                "destination": "/sys",
+                "type_": "sysfs",
+                "source": "sysfs",
+                "options": [
+                    "nosuid",
+                    "noexec",
+                    "nodev",
+                    "ro"
+                ]
+            },
             {
                 "destination": "/dev/shm",
                 "type_": "bind",
@@ -70,6 +126,73 @@
             "Path": "$(root_path)"
         },
         "Mounts": [
+            {
+                "destination": "/proc",
+                "type_": "proc",
+                "source": "proc",
+                "options": [
+                    "nosuid",
+                    "noexec",
+                    "nodev"
+                ]
+            },
+            {
+                "destination": "/dev",
+                "type_": "tmpfs",
+                "source": "tmpfs",
+                "options": [
+                    "nosuid",
+                    "strictatime",
+                    "mode=755",
+                    "size=65536k"
+                ]
+            },
+            {
+                "destination": "/dev/pts",
+                "type_": "devpts",
+                "source": "devpts",
+                "options": [
+                    "nosuid",
+                    "noexec",
+                    "newinstance",
+                    "ptmxmode=0666",
+                    "mode=0620",
+                    "gid=5"
+                ]
+            },
+            {
+                "destination": "/dev/mqueue",
+                "type_": "mqueue",
+                "source": "mqueue",
+                "options": [
+                    "nosuid",
+                    "noexec",
+                    "nodev"
+                ]
+            },
+            {
+                "destination": "/sys",
+                "type_": "sysfs",
+                "source": "sysfs",
+                "options": [
+                    "nosuid",
+                    "noexec",
+                    "nodev",
+                    "ro"
+                ]
+            },
+            {
+                "destination": "/sys/fs/cgroup",
+                "type_": "cgroup",
+                "source": "cgroup",
+                "options": [
+                    "nosuid",
+                    "noexec",
+                    "nodev",
+                    "relatime",
+                    "ro"
+                ]
+            },
             {
                 "destination": "/etc/hosts",
                 "type_": "bind",
@@ -228,12 +351,17 @@
     "devices": {
         "vfio": {
             "device_path": "/dev/vfio/devices/vfio",
+            "cdi_annotation_prefix": "cdi.k8s.io/vfio",
+            "device_number_regex": "^[0-9]+$",
+            "device_id_prefix": "vfio",
+            "pci_address_regex": "^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[01][0-9a-fA-F]\\.[0-7]=[0-9a-fA-F]{2}/[0-9a-fA-F]{2}$",
             "anno_key_regex": "^cdi\\.k8s\\.io/vfio[0-9]+$",
             "nvidia": {
                 "gpu_anno_value_regex": "^nvidia\\.com/gpu=[0-9]+$",
                 "gpu_gk_device_type": "vfio-pci-gk",
                 "pgpu_resource_keys": [
-                    "nvidia.com/pgpu"
+                    "nvidia.com/pgpu",
+                    "nvidia.com/gpu"
                 ]
             }
         }
@@ -271,6 +399,8 @@
         "cpath": "/run/kata-containers/shared/containers(?:/passthrough)?",
         "spath": "/run/kata-containers/sandbox/storage",
         "root_path": "/run/kata-containers/$(bundle-id)/rootfs",
+        "root_bundle_id_regex": "([0-9a-f]{64}|[a-z0-9][a-z0-9.-]*)",
+        "copy_file_bundle_id_regex": "[a-z0-9]{64}",
         "sfprefix": "^$(cpath)/(watchable/)?$(bundle-id)-[a-z0-9]{16}-",
         "ip_p": "[0-9]{1,5}",
         "ipv4_a": "(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])",
@@ -335,7 +465,79 @@
             "CAP_BPF",
             "CAP_CHECKPOINT_RESTORE"
         ],
+        "namespace_compatibility": {
+            "aliases": {"mount": "mnt"},
+            "ignored_input_types": ["network", "cgroup"],
+            "network_type": "network"
+        },
+        "capability_compatibility": {
+            "prefix": "CAP_",
+            "default_marker": "$(default_caps)",
+            "privileged_marker": "$(privileged_caps)"
+        },
+        "copy_file_compatibility": {
+            "regular_type": "Regular",
+            "directory_type": "Directory",
+            "symlink_type": "Symlink",
+            "traversal_regex": "(^|/)\\.\\.($|/)",
+            "symlink_path_suffix": ".*/.+"
+        },
+        "substitutions": {
+            "cpath": "$(cpath)",
+            "root_path": "$(root_path)",
+            "bundle_id": "$(bundle-id)",
+            "sandbox_id": "$(sandbox-id)",
+            "sandbox_name": "$(sandbox-name)",
+            "sandbox_namespace": "$(sandbox-namespace)",
+            "sfprefix": "$(sfprefix)",
+            "spath": "$(spath)",
+            "b64_device_id": "$(b64_device_id)",
+            "node_name": "$(node-name)",
+            "host_name": "$(host-name)",
+            "pod_uid": "$(pod-uid)",
+            "resource_field": "$(resource-field)",
+            "todo_annotation": "$(todo-annotation)",
+            "pod_ip": "$(pod-ip)",
+            "host_ip": "$(host-ip)",
+            "ipv4_a": "$(ipv4_a)",
+            "ip_p": "$(ip_p)",
+            "svc_name_downward_env": "$(svc_name_downward_env)",
+            "dns_label": "$(dns_label)",
+            "escape_marker": "$$",
+            "escaped_value": "$",
+            "unresolved_token_regex": "\\$\\([^)]+\\)"
+        },
+        "request_shape": {
+            "copy_file_default_size": 0,
+            "copy_file_default_offset": 0,
+            "copy_file_minimum_value": 0,
+            "create_sandbox_pidns": false,
+            "exec_process_default_port": 0
+        },
         "image_layer_verification": "none"
+    },
+    "framework": {
+        "annotations": {
+            "container_name": "io.kubernetes.cri.container-name",
+            "cri_container_type": "io.kubernetes.cri.container-type",
+            "cri_prefix": "io.kubernetes.cri.",
+            "kata_container_type": "io.katacontainers.pkg.oci.container_type",
+            "network_namespace": "nerdctl/network-namespace",
+            "sandbox_id": "io.kubernetes.cri.sandbox-id",
+            "sandbox_log_directory": "io.kubernetes.cri.sandbox-log-directory",
+            "sandbox_name": "io.kubernetes.cri.sandbox-name",
+            "sandbox_namespace": "io.kubernetes.cri.sandbox-namespace",
+            "sandbox_uid": "io.kubernetes.cri.sandbox-uid"
+        },
+        "paths": {
+            "pod_log_directory_format": "/var/log/pods/%s_%s_%s"
+        },
+        "roles": {
+            "cri_container": "container",
+            "cri_sandbox": "sandbox",
+            "kata_container": "pod_container",
+            "kata_sandbox": "pod_sandbox"
+        }
     },
     "kata_config": {
         "oci_version": "1.1.0",
@@ -343,13 +545,48 @@
     },
     "cluster_config": {
         "pause_container_image": "mcr.microsoft.com/oss/kubernetes/pause:3.6",
+        "pause_container_id_policy": "v1",
         "guest_pull": true,
         "emptydir_type": "block-encrypted",
         "fs_sharing_supported": true,
         "cgroup_mount_extras_allowed": [
             "nsdelegate",
             "memory_recursiveprot"
-        ]
+        ],
+        "mount_compatibility": {
+            "sysfs_type": "sysfs",
+            "sysfs_policy_read_write_option": "rw",
+            "sysfs_request_read_only_option": "ro",
+            "cgroup_type": "cgroup"
+        },
+        "rootfs_compatibility": {
+            "multi_layer_option": "X-kata.multi-layer=true",
+            "overlay_upper_option": "X-kata.overlay-upper",
+            "overlay_lower_option": "X-kata.overlay-lower",
+            "dmverity_enabled_option": "X-kata.dmverity-enabled=true",
+            "dmverity_roothash_option_prefix": "X-kata.dmverity.roothash=",
+            "guest_pull_fstype": "overlay",
+            "guest_pull_driver_option_prefix": "image_guest_pull=",
+            "erofs_upper_fstype": "ext4",
+            "erofs_lower_fstype": "erofs",
+            "block_transports": [
+                {"driver": "blk", "source_regex": "^[0-9a-f]{2}(/[0-9a-f]{2})?$"},
+                {"driver": "scsi", "source_regex": "^[0-9]+:[0-9]+$"},
+                {"driver": "mmioblk", "source_regex": "^/dev/vd[a-z]+$"},
+                {"driver": "blk-ccw", "source_regex": "^0\\.0\\.[0-9a-f]{4}$"},
+                {"driver": "nvdimm", "source_regex": "^/dev/pmem[0-9]+$"}
+            ],
+            "rootfs_mount_points": [
+                "/run/kata-containers/$(bundle-id)/rootfs",
+                "/run/kata-containers/shared/containers/passthrough/$(bundle-id)/rootfs"
+            ],
+            "overlayfs_driver": "overlayfs",
+            "overlayfs_source": "none",
+            "local_fstype": "local",
+            "bind_fstype": "bind",
+            "tmpfs_fstype": "tmpfs",
+            "hugetlbfs_fstype": "hugetlbfs"
+        }
     },
     "request_defaults": {
         "CreateContainerRequest": {
@@ -397,6 +634,8 @@
             ]
         },
         "AddARPNeighborsRequest": {
+            "allowed_flags": 136,
+            "required_ip_address_mask": "",
             "forbidden_device_names": [
                 "lo"
             ],
