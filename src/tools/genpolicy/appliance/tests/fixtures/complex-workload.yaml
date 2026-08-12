@@ -39,6 +39,7 @@ spec:
       labels:
         app: balanced-mode
     spec:
+      automountServiceAccountToken: false
       runtimeClassName: kata
       securityContext:
         supplementalGroups:

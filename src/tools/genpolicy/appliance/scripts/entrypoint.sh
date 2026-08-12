@@ -64,9 +64,15 @@ wait_for() {
 [[ "$(stat -fc %T /sys/fs/cgroup)" == "cgroup2fs" ]] ||
 	fail "cgroup v2 is required"
 
+identity_delivery_args=()
+if [[ "${GENPOLICY_CAPTURE_ONLY:-1}" == "1" ]]; then
+	identity_delivery_args+=(--allow-unsafe-identity-delivery)
+fi
+
 python3 "${appliance_root}/scripts/submit_workload.py" \
 	--input "${workload}" \
 	--images-output "${output_dir}/requested-images.txt" \
+	"${identity_delivery_args[@]}" \
 	--validate-only
 
 containerd_config="${appliance_root}/config/containerd.toml"
@@ -271,6 +277,7 @@ wait_for kubelet-node kubectl get "node/${NODE_NAME}"
 
 python3 "${appliance_root}/scripts/submit_workload.py" \
 	--input "${workload}" \
+	"${identity_delivery_args[@]}" \
 	--node-name "${NODE_NAME}" \
 	--objects-output "${output_dir}/submitted-objects.json" \
 	--pods-output "${output_dir}/pods.json" \

@@ -18,6 +18,7 @@ kind: Pod
 metadata:
   name: policy-matrix-env
 spec:
+  automountServiceAccountToken: false
   runtimeClassName: kata
   securityContext:
     supplementalGroups:

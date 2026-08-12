@@ -10,6 +10,7 @@ kind: Pod
 metadata:
   name: storage-boundary
 spec:
+  automountServiceAccountToken: false
   runtimeClassName: kata
   restartPolicy: Never
   containers:

@@ -10,6 +10,74 @@ SPEC.loader.exec_module(MODULE)
 
 
 class SubmitWorkloadTests(unittest.TestCase):
+    def test_service_account_fixture_disables_token_delivery(self):
+        fixture = Path(__file__).parent / "fixtures" / "service-account-workload.yaml"
+
+        MODULE.validate_guest_identity_delivery(fixture)
+
+    def test_implicit_service_account_token_automount_is_rejected(self):
+        import tempfile
+        import yaml
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workload = Path(temporary) / "workload.yaml"
+            workload.write_text(
+                yaml.safe_dump(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {"name": "unsafe"},
+                        "spec": {"containers": []},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "must set automountServiceAccountToken: false"
+            ):
+                MODULE.validate_guest_identity_delivery(workload)
+
+    def test_explicit_service_account_token_projection_is_rejected(self):
+        import tempfile
+        import yaml
+
+        with tempfile.TemporaryDirectory() as temporary:
+            workload = Path(temporary) / "workload.yaml"
+            workload.write_text(
+                yaml.safe_dump(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {"name": "unsafe"},
+                        "spec": {
+                            "automountServiceAccountToken": False,
+                            "containers": [],
+                            "volumes": [
+                                {
+                                    "name": "identity",
+                                    "projected": {
+                                        "sources": [
+                                            {
+                                                "serviceAccountToken": {
+                                                    "path": "token"
+                                                }
+                                            }
+                                        ]
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "unsupported ServiceAccount token delivery"
+            ):
+                MODULE.validate_guest_identity_delivery(workload)
+
     def test_deployment_becomes_bound_pod(self):
         deployment = {
             "apiVersion": "apps/v1",

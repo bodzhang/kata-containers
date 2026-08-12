@@ -5,6 +5,7 @@ metadata:
   annotations:
     io.katacontainers.config.hypervisor.default_vcpus: "2"
 spec:
+  automountServiceAccountToken: false
   runtimeClassName: kata
   restartPolicy: Never
   securityContext:

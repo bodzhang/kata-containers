@@ -19,6 +19,7 @@ kind: Pod
 metadata:
   name: storage-classes
 spec:
+  automountServiceAccountToken: false
   runtimeClassName: kata
   restartPolicy: Never
   securityContext:

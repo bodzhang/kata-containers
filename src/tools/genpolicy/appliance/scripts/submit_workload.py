@@ -140,10 +140,45 @@ def validate_image_references(path: Path) -> set[str]:
     return images
 
 
+def validate_guest_identity_delivery(path: Path) -> None:
+    errors = []
+    for document in iter_documents(path):
+        kind = document.get("kind")
+        if kind == "Pod":
+            pod_spec = document.get("spec") or {}
+        elif kind in TEMPLATE_PATHS:
+            pod_spec = (nested(document, TEMPLATE_PATHS[kind]).get("spec") or {})
+        else:
+            continue
+        if pod_spec.get("automountServiceAccountToken") is not False:
+            errors.append(
+                f"{kind} must set automountServiceAccountToken: false for Kata-CC"
+            )
+        for volume in pod_spec.get("volumes") or []:
+            name = volume.get("name", "<unnamed>")
+            if "downwardAPI" in volume:
+                errors.append(
+                    f"{kind} volume {name} uses unsupported Downward API delivery"
+                )
+            projected = volume.get("projected") or {}
+            for source in projected.get("sources") or []:
+                if "downwardAPI" in source:
+                    errors.append(
+                        f"{kind} projected volume {name} uses unsupported Downward API delivery"
+                    )
+                if "serviceAccountToken" in source:
+                    errors.append(
+                        f"{kind} projected volume {name} uses unsupported ServiceAccount token delivery"
+                    )
+    if errors:
+        raise ValueError("\n".join(errors))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--allow-unsafe-identity-delivery", action="store_true")
     parser.add_argument("--images-output", type=Path)
     parser.add_argument("--node-name")
     parser.add_argument("--objects-output", type=Path)
@@ -153,6 +188,8 @@ def main() -> None:
 
     try:
         images = validate_image_references(args.input)
+        if not args.allow_unsafe_identity_delivery:
+            validate_guest_identity_delivery(args.input)
     except ValueError as error:
         print(error, file=sys.stderr)
         raise SystemExit(1)

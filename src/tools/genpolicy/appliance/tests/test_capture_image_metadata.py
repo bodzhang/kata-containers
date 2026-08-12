@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -68,6 +69,10 @@ class CaptureImageMetadataTests(unittest.TestCase):
         self.assertEqual(
             (self.output / result[reference]["config_path"]).read_bytes(), self.config
         )
+        self.assertEqual(
+            (self.output / result[reference]["requested_path"]).read_bytes(),
+            self.manifest,
+        )
         index = json.loads((self.output / "index.json").read_text(encoding="utf-8"))
         self.assertEqual(index["images"], result)
 
@@ -117,6 +122,104 @@ class CaptureImageMetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(metadata.ImageMetadataError, "digest mismatch"):
             metadata.export_image_metadata(
                 [reference], self.output, lambda _: b"{}", "linux", "amd64"
+            )
+
+    def test_verifies_and_exports_layer_blob_and_diff_id(self):
+        layer_tar = b"trusted layer tar bytes"
+        layer_blob = gzip.compress(layer_tar, mtime=0)
+        layer_digest = digest(layer_blob)
+        diff_id = digest(layer_tar)
+        config = encoded(
+            {
+                "architecture": "amd64",
+                "config": {},
+                "os": "linux",
+                "rootfs": {"diff_ids": [diff_id], "type": "layers"},
+            }
+        )
+        config_digest = digest(config)
+        manifest = encoded(
+            {
+                "config": {
+                    "digest": config_digest,
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "size": len(config),
+                },
+                "layers": [
+                    {
+                        "digest": layer_digest,
+                        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                        "size": len(layer_blob),
+                    }
+                ],
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "schemaVersion": 2,
+            }
+        )
+        manifest_digest = digest(manifest)
+        self.content.update(
+            {
+                config_digest: config,
+                layer_digest: layer_blob,
+                manifest_digest: manifest,
+            }
+        )
+
+        result = metadata.export_image_metadata(
+            [f"registry/image@{manifest_digest}"],
+            self.output,
+            self.read_content,
+            "linux",
+            "amd64",
+        )
+
+        layer = result[f"registry/image@{manifest_digest}"]["layers"][0]
+        self.assertEqual(layer["digest"], layer_digest)
+        self.assertEqual(layer["diff_id"], diff_id)
+        self.assertEqual((self.output / layer["path"]).read_bytes(), layer_blob)
+
+    def test_rejects_layer_diff_id_mismatch(self):
+        layer_tar = b"layer"
+        layer_blob = gzip.compress(layer_tar, mtime=0)
+        layer_digest = digest(layer_blob)
+        config = encoded(
+            {
+                "rootfs": {
+                    "diff_ids": [f"sha256:{'0' * 64}"],
+                    "type": "layers",
+                }
+            }
+        )
+        config_digest = digest(config)
+        manifest = encoded(
+            {
+                "config": {"digest": config_digest, "size": len(config)},
+                "layers": [
+                    {
+                        "digest": layer_digest,
+                        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                        "size": len(layer_blob),
+                    }
+                ],
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            }
+        )
+        manifest_digest = digest(manifest)
+        self.content.update(
+            {
+                config_digest: config,
+                layer_digest: layer_blob,
+                manifest_digest: manifest,
+            }
+        )
+
+        with self.assertRaisesRegex(metadata.ImageMetadataError, "diff-id mismatch"):
+            metadata.export_image_metadata(
+                [f"registry/image@{manifest_digest}"],
+                self.output,
+                self.read_content,
+                "linux",
+                "amd64",
             )
 
 

@@ -3,6 +3,7 @@ kind: Pod
 metadata:
   name: tagged-oci-test
 spec:
+  automountServiceAccountToken: false
   runtimeClassName: kata
   securityContext:
     supplementalGroups:
