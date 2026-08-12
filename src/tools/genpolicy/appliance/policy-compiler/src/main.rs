@@ -203,8 +203,10 @@ struct TagDefinition {
 #[derive(Debug, Serialize)]
 #[allow(non_snake_case)]
 struct PolicyData {
+    evaluator_schema_version: u32,
     containers: Vec<ContainerPolicy>,
     common: policy::CommonData,
+    framework: policy::FrameworkData,
     sandbox: policy::SandboxData,
     request_defaults: Value,
     devices: policy::Devices,
@@ -1220,8 +1222,10 @@ fn run(args: Args) -> Result<()> {
     let dmverity = DmVerityData::default();
     let guest_pull = GuestPullData::default();
     let data = PolicyData {
+        evaluator_schema_version: settings.evaluator_schema_version,
         containers,
         common: settings.common,
+        framework: settings.framework,
         sandbox: settings.sandbox,
         request_defaults,
         devices: settings.devices,
@@ -1953,6 +1957,129 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, serde_json::to_string(&report).unwrap()).unwrap();
         path
+    }
+
+    #[test]
+    fn policy_data_serializes_evaluator_operands() {
+        let settings_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../genpolicy-settings.json");
+        let settings = Settings::new(settings_path.to_str().unwrap());
+        let data = PolicyData {
+            evaluator_schema_version: settings.evaluator_schema_version,
+            containers: Vec::new(),
+            common: settings.common,
+            framework: settings.framework,
+            sandbox: settings.sandbox,
+            request_defaults: serde_json::to_value(settings.request_defaults).unwrap(),
+            devices: settings.devices,
+            cluster_config: settings.cluster_config,
+            dmverity: DmVerityData::default(),
+            guest_pull: GuestPullData::default(),
+        };
+
+        let serialized = serde_json::to_value(data).unwrap();
+        assert_eq!(serialized["evaluator_schema_version"], 1);
+        assert_eq!(
+            serialized["framework"]["annotations"]["sandbox_name"],
+            "io.kubernetes.cri.sandbox-name"
+        );
+        assert_eq!(
+            serialized["common"]["root_bundle_id_regex"],
+            "([0-9a-f]{64}|[a-z0-9][a-z0-9.-]*)"
+        );
+        assert_eq!(
+            serialized["common"]["copy_file_bundle_id_regex"],
+            "[a-z0-9]{64}"
+        );
+        assert_eq!(
+            serialized["common"]["namespace_compatibility"]["aliases"]["mount"],
+            "mnt"
+        );
+        assert_eq!(
+            serialized["common"]["capability_compatibility"]["prefix"],
+            "CAP_"
+        );
+        assert_eq!(
+            serialized["common"]["substitutions"]["bundle_id"],
+            "$(bundle-id)"
+        );
+        assert_eq!(
+            serialized["common"]["request_shape"]["exec_process_default_port"],
+            0
+        );
+        assert_eq!(
+            serialized["common"]["copy_file_compatibility"]["traversal_regex"],
+            "(^|/)\\.\\.($|/)"
+        );
+        assert_eq!(
+            serialized["devices"]["vfio"]["cdi_annotation_prefix"],
+            "cdi.k8s.io/vfio"
+        );
+        assert_eq!(
+            serialized["devices"]["vfio"]["device_number_regex"],
+            "^[0-9]+$"
+        );
+        assert_eq!(serialized["devices"]["vfio"]["device_id_prefix"], "vfio");
+        assert_eq!(
+            serialized["devices"]["vfio"]["pci_address_regex"],
+            "^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[01][0-9a-fA-F]\\.[0-7]=[0-9a-fA-F]{2}/[0-9a-fA-F]{2}$"
+        );
+        assert_eq!(
+            serialized["cluster_config"]["mount_compatibility"],
+            json!({
+                "sysfs_type": "sysfs",
+                "sysfs_policy_read_write_option": "rw",
+                "sysfs_request_read_only_option": "ro",
+                "cgroup_type": "cgroup"
+            })
+        );
+        assert_eq!(
+            serialized["cluster_config"]["rootfs_compatibility"]["dmverity_roothash_option_prefix"],
+            "X-kata.dmverity.roothash="
+        );
+        assert_eq!(
+            serialized["cluster_config"]["rootfs_compatibility"]["block_transports"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            serialized["cluster_config"]["rootfs_compatibility"]["rootfs_mount_points"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            serialized["request_defaults"]["AddARPNeighborsRequest"]["allowed_flags"],
+            136
+        );
+        assert_eq!(
+            serialized["request_defaults"]["AddARPNeighborsRequest"]["required_ip_address_mask"],
+            ""
+        );
+
+        let rules = include_str!("../../../rules.rego");
+        for line in rules.lines() {
+            let mut remainder = line;
+            while let Some(offset) = remainder.find("policy_data.") {
+                let candidate = &remainder[offset + "policy_data.".len()..];
+                let raw_path: String = candidate
+                    .chars()
+                    .take_while(|character| {
+                        character.is_ascii_alphanumeric() || *character == '_' || *character == '.'
+                    })
+                    .collect();
+                let path = raw_path.trim_end_matches('.');
+                let pointer = format!("/{}", path.replace('.', "/"));
+                assert!(
+                    serialized.pointer(&pointer).is_some(),
+                    "rules.rego consumes missing policy-data path {pointer}"
+                );
+                remainder = &candidate[raw_path.len()..];
+            }
+        }
     }
 
     #[test]
