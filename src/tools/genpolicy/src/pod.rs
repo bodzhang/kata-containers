@@ -64,7 +64,7 @@ pub struct PodSpec {
     nodeName: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    serviceAccountName: Option<String>,
+    pub serviceAccountName: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     serviceAccount: Option<String>,
@@ -1042,6 +1042,10 @@ impl yaml::K8sResource for Pod {
         &self.spec.containers
     }
 
+    fn get_service_account_name(&self) -> &str {
+        self.spec.serviceAccountName.as_deref().unwrap_or("default")
+    }
+
     fn get_annotations(&self) -> &Option<BTreeMap<String, String>> {
         &self.metadata.annotations
     }
@@ -1364,5 +1368,41 @@ mod tests {
         };
 
         assert_eq!(c.get_nvidia_pgpu_count(&keys), Some(3));
+    }
+
+    #[test]
+    fn service_account_name_comes_from_pod_spec() {
+        let explicit: Pod = serde_yaml::from_str(
+            r#"
+apiVersion: v1
+kind: Pod
+metadata:
+    name: workload
+spec:
+    serviceAccountName: workload-identity
+    containers: []
+"#,
+        )
+        .unwrap();
+        let default: Pod = serde_yaml::from_str(
+            r#"
+apiVersion: v1
+kind: Pod
+metadata:
+    name: workload
+spec:
+    containers: []
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            yaml::K8sResource::get_service_account_name(&explicit),
+            "workload-identity"
+        );
+        assert_eq!(
+            yaml::K8sResource::get_service_account_name(&default),
+            "default"
+        );
     }
 }

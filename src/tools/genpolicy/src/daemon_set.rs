@@ -120,6 +120,15 @@ impl yaml::K8sResource for DaemonSet {
         &self.spec.template.spec.containers
     }
 
+    fn get_service_account_name(&self) -> &str {
+        self.spec
+            .template
+            .spec
+            .serviceAccountName
+            .as_deref()
+            .unwrap_or("default")
+    }
+
     fn get_annotations(&self) -> &Option<BTreeMap<String, String>> {
         if let Some(metadata) = &self.spec.template.metadata {
             return &metadata.annotations;

@@ -1036,19 +1036,13 @@ impl AgentPolicy {
             process.Env.push("HOSTNAME=$(host-name)".to_string());
         }
 
-        let service_account_name = if let Some(s) = &yaml_container.serviceAccountName {
-            s
-        } else {
-            "default"
-        };
-
         yaml_container.get_env_variables(
             &mut process.Env,
             &self.config_maps,
             &self.secrets,
             namespace,
             resource,
-            service_account_name,
+            resource.get_service_account_name(),
         );
         debug!(
             "get_container_process: after get_env_variables: User = {:?}",

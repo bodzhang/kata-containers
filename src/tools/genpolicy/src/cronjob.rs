@@ -121,6 +121,17 @@ impl yaml::K8sResource for CronJob {
         &self.spec.jobTemplate.spec.template.spec.containers
     }
 
+    fn get_service_account_name(&self) -> &str {
+        self.spec
+            .jobTemplate
+            .spec
+            .template
+            .spec
+            .serviceAccountName
+            .as_deref()
+            .unwrap_or("default")
+    }
+
     fn get_annotations(&self) -> &Option<BTreeMap<String, String>> {
         if let Some(metadata) = &self.spec.jobTemplate.spec.template.metadata {
             return &metadata.annotations;

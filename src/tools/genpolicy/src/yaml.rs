@@ -81,6 +81,10 @@ pub trait K8sResource {
         panic!("Unsupported");
     }
 
+    fn get_service_account_name(&self) -> &str {
+        "default"
+    }
+
     fn get_annotations(&self) -> &Option<BTreeMap<String, String>> {
         panic!("Unsupported");
     }
