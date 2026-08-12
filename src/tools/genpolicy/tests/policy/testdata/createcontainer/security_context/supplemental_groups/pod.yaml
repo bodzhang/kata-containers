@@ -2,6 +2,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: dummy
+  namespace: kata-containers-k8s-tests
 spec:
   runtimeClassName: kata-cc-isolation
   securityContext:

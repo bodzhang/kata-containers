@@ -14,7 +14,7 @@ spec:
       runtimeClassName: kata
       containers:
       - name: execprocessnamed
-        image: "quay.io/prometheus/busybox:latest"
+        image: "quay.io/prometheus/busybox@sha256:0a95bb8f4faff91409f980e9a497e48a3bddc6ba093c493a042fd4748d3edbf5"
         command:
           - sleep
           - "3600"
