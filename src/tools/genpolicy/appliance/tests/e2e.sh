@@ -109,6 +109,7 @@ python3 - "${temporary}/output" "${CAPTURE_BACKEND:-runtime-rs}" \
 import base64
 import gzip
 import json
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -155,15 +156,19 @@ assert "{{GENPOLICY_DYNAMIC:" not in json.dumps(final)
 for container in final_data["containers"]:
     annotations = container["OCI"]["Annotations"]
     identity = annotations.get("io.kubernetes.cri.container-name", "sandbox")
+    # Host-asserted node-local image naming is never policy authority.
+    assert "io.kubernetes.cri.image-name" not in annotations
     assert len(container["storages"]) == 1
     marker = container["storages"][0]
     assert marker["driver"] == "guest-pull-images"
-    expected_image = (
-        "pause"
-        if identity == "sandbox"
-        else annotations["io.kubernetes.cri.image-name"]
-    )
-    assert marker["options"] == [expected_image]
+    if identity == "sandbox":
+        assert marker["options"] == ["pause"]
+    else:
+        assert len(marker["options"]) == 1
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", marker["options"][0])
+# Clean-room registry configuration must never become a policy literal.
+assert "genpolicy.local" not in json.dumps(final_data)
+assert final_data["cluster_config"]["pause_container_image"] == ""
 assert final_data["sandbox"]["storages"]
 pause = next(
     container

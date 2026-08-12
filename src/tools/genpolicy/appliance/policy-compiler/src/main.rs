@@ -14,6 +14,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const DYNAMIC_PREFIX: &str = "{{GENPOLICY_DYNAMIC:";
+/// The sandbox rootfs is unpacked from the UVM-local pause bundle, so it has no
+/// registry digest and keeps this literal identity in both policy and request.
+const GUEST_PULL_PAUSE_IMAGE: &str = "pause";
 const POD_NAME_MARKER: &str = "{{GENPOLICY_DYNAMIC:pod.name}}";
 const POD_UID_MARKER: &str = "{{GENPOLICY_DYNAMIC:pod.uid}}";
 
@@ -801,10 +804,12 @@ fn compile_annotations(
     sandbox_name_pattern: Option<&str>,
 ) -> Result<BTreeMap<String, String>> {
     let mut annotations = template.Annotations.clone();
+    // `io.kubernetes.cri.image-name` is deliberately absent: rules.rego never
+    // reads it, and containerd derives it from node-local image-store naming.
+    // Image authority is the per-container guest-pull digest / dm-verity marker.
     for key in [
         "io.kubernetes.cri.container-type",
         "io.kubernetes.cri.container-name",
-        "io.kubernetes.cri.image-name",
         "io.kubernetes.cri.sandbox-namespace",
     ] {
         if let Some(value) = capture.annotations.get(key) {
@@ -1221,6 +1226,8 @@ fn run(args: Args) -> Result<()> {
     // legacy global fields remain empty and are not authorization inputs.
     let dmverity = DmVerityData::default();
     let guest_pull = GuestPullData::default();
+    let mut cluster_config = settings.cluster_config;
+    strip_generator_only_cluster_config(&mut cluster_config);
     let data = PolicyData {
         evaluator_schema_version: settings.evaluator_schema_version,
         containers,
@@ -1229,7 +1236,7 @@ fn run(args: Args) -> Result<()> {
         sandbox: settings.sandbox,
         request_defaults,
         devices: settings.devices,
-        cluster_config: settings.cluster_config,
+        cluster_config,
         dmverity,
         guest_pull,
     };
@@ -1364,9 +1371,10 @@ fn collect_guest_pull_images_per_container(path: &Path) -> Result<BTreeMap<Strin
             }
             match storage.get("source").and_then(Value::as_str) {
                 Some(source) if !source.is_empty() => {
+                    let identity = guest_pull_image_identity(source)?;
                     let entry = by_container.entry(name.to_string()).or_default();
-                    if !entry.iter().any(|s| s == source) {
-                        entry.push(source.to_string());
+                    if !entry.contains(&identity) {
+                        entry.push(identity);
                     }
                 }
                 _ => bail!(
@@ -1379,6 +1387,13 @@ fn collect_guest_pull_images_per_container(path: &Path) -> Result<BTreeMap<Strin
     Ok(by_container)
 }
 
+/// `pause_container_image` is a legacy-generator input that rules.rego never
+/// reads; leaving the clean-room registry in policy data would pin appliance
+/// configuration that carries no authority.
+fn strip_generator_only_cluster_config(cluster_config: &mut policy::ClusterConfig) {
+    cluster_config.pause_container_image.clear();
+}
+
 /// A synthetic policy-only storage carrying a container's allowed guest-pull
 /// image references in `options`. Never sent by the agent; the rules.rego
 /// per-container `image_guest_pull` clause reads it, and `allow_storages`
@@ -1389,6 +1404,24 @@ fn guest_pull_marker_storage(images: &[String]) -> agent::Storage {
         options: images.to_vec(),
         ..Default::default()
     }
+}
+
+/// Mirrors `guest_pull_image_identity` in rules.rego: the manifest digest is the
+/// content identity and the repository is only a transport location. A reference
+/// the evaluator cannot reduce to a digest would compile into a policy that can
+/// only deny, so it fails generation instead.
+fn guest_pull_image_identity(source: &str) -> Result<String> {
+    if source == GUEST_PULL_PAUSE_IMAGE {
+        return Ok(source.to_string());
+    }
+    let digest = source.rsplit_once('@').map_or(source, |(_, digest)| digest);
+    let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
+        anyhow!("guest-pull image reference {source} is not pinned by a manifest digest")
+    })?;
+    if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        bail!("guest-pull image reference {source} has a malformed manifest digest");
+    }
+    Ok(digest.to_string())
 }
 
 fn is_rootfs_storage(storage: &Value, root_path: &str) -> bool {
@@ -1501,7 +1534,7 @@ fn create_request_policy_data(
                         request.container_id
                     );
                 }
-                images.insert(source.to_string());
+                images.insert(guest_pull_image_identity(source)?);
             } else if overlay_lower {
                 if fs_type != "erofs"
                     || !options.contains(&"X-kata.multi-layer=true")
@@ -1964,6 +1997,8 @@ mod tests {
         let settings_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../genpolicy-settings.json");
         let settings = Settings::new(settings_path.to_str().unwrap());
+        let mut cluster_config = settings.cluster_config;
+        strip_generator_only_cluster_config(&mut cluster_config);
         let data = PolicyData {
             evaluator_schema_version: settings.evaluator_schema_version,
             containers: Vec::new(),
@@ -1972,13 +2007,14 @@ mod tests {
             sandbox: settings.sandbox,
             request_defaults: serde_json::to_value(settings.request_defaults).unwrap(),
             devices: settings.devices,
-            cluster_config: settings.cluster_config,
+            cluster_config,
             dmverity: DmVerityData::default(),
             guest_pull: GuestPullData::default(),
         };
 
         let serialized = serde_json::to_value(data).unwrap();
         assert_eq!(serialized["evaluator_schema_version"], 1);
+        assert_eq!(serialized["cluster_config"]["pause_container_image"], "");
         assert_eq!(
             serialized["framework"]["annotations"]["sandbox_name"],
             "io.kubernetes.cri.sandbox-name"
@@ -2096,7 +2132,7 @@ mod tests {
                     "options": ["ro", "X-kata.multi-layer=true", "X-kata.overlay-lower", "X-kata.dmverity-enabled=true", "X-kata.dmverity.roothash=abc"]
                 },
                 {
-                    "driver": "image_guest_pull", "source": "registry.example/app@sha256:123",
+                    "driver": "image_guest_pull", "source": "registry.example/app@sha256:1111111111111111111111111111111111111111111111111111111111111111",
                     "driver_options": ["image_guest_pull={}"], "fs_type": "overlay",
                     "mount_point": "/run/kata/rootfs", "options": []
                 },
@@ -2113,7 +2149,7 @@ mod tests {
         assert_eq!(data.dmverity_roothashes, vec!["abc"]);
         assert_eq!(
             data.guest_pull_images,
-            vec!["registry.example/app@sha256:123"]
+            vec!["sha256:1111111111111111111111111111111111111111111111111111111111111111"]
         );
         assert_eq!(data.volume_storages.len(), 1);
         assert_eq!(data.volume_storages[0].fstype, "tmpfs");
@@ -2473,31 +2509,57 @@ mod tests {
             "predictions": [
                 {"container_id": "c1", "container_name": "web", "rootfs": {"storages": [{
                     "driver": "image_guest_pull", "fs_type": "overlay",
-                    "source": "docker.io/library/nginx@sha256:aaaa", "options": []
+                    "source": "docker.io/library/nginx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "options": []
                 }]}},
                 {"container_id": "c2", "container_name": "api", "rootfs": {"storages": [{
                     "driver": "image_guest_pull", "fs_type": "overlay",
-                    "source": "ghcr.io/app/api@sha256:bbbb", "options": []
+                    "source": "ghcr.io/app/api@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "options": []
                 }]}}
             ]
         });
         let path = write_report(&dir, "predicted.json", report);
         let by_container = collect_guest_pull_images_per_container(&path).unwrap();
+        // The repository is a transport location; only the digest is identity.
         assert_eq!(
             by_container.get("web"),
-            Some(&vec!["docker.io/library/nginx@sha256:aaaa".to_string()])
+            Some(&vec![
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string()
+            ])
         );
         assert_eq!(
             by_container.get("api"),
-            Some(&vec!["ghcr.io/app/api@sha256:bbbb".to_string()])
+            Some(&vec![
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string()
+            ])
         );
         let marker = guest_pull_marker_storage(by_container.get("web").unwrap());
         assert_eq!(marker.driver, "guest-pull-images");
         assert_eq!(
             marker.options,
-            vec!["docker.io/library/nginx@sha256:aaaa".to_string()]
+            vec![
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string()
+            ]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_pull_identity_rejects_references_without_a_digest() {
+        // rules.rego leaves guest_pull_image_identity undefined for these, so a
+        // policy built from them could only deny.
+        assert!(guest_pull_image_identity("registry.example/app:1.36.1").is_err());
+        assert!(guest_pull_image_identity("registry.example/app@sha256:123").is_err());
+        assert!(guest_pull_image_identity("registry.example/app@sha512:aa").is_err());
+        assert_eq!(guest_pull_image_identity("pause").unwrap(), "pause");
+        let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        assert_eq!(guest_pull_image_identity(digest).unwrap(), digest);
+        assert_eq!(
+            guest_pull_image_identity(&format!("registry.example/app@{digest}")).unwrap(),
+            digest
+        );
     }
 
     #[test]

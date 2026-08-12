@@ -227,6 +227,47 @@ for container selection and path correlation, but the general annotation rule
 is a residual authorization gap and must not be described as full annotation
 value pinning.
 
+#### Image identity is not an annotation field
+
+The compiler does not emit `io.kubernetes.cri.image-name` into policy
+`OCI.Annotations`. `rules.rego` never reads the key, the generic annotation rule
+above admits it by key prefix regardless of value, and containerd derives the
+value from the node's local image-store naming rather than from the workload
+declaration. Compiling it exact would pin an untrusted host-side string that
+carries no authority, and would deny a production node that legitimately holds
+an additional tag for the same content.
+
+Image authority lives in the per-container marker storages instead. For
+guest-pull, `allow_guest_pull_image` reduces both the request source and the
+policy option through `guest_pull_image_identity`, which discards the registry
+and repository and compares only the `@sha256:` manifest digest. For EROFS the
+`dmverity-roothashes` marker pins the root hash and dm-verity verifies every
+block on read. Both identities are content-addressed and verified inside the
+guest, so a host that renames content changes nothing and a host that
+substitutes content fails closed. A name is an assertion that some bytes are
+called something; it is not evidence about what runs.
+
+The annotation still matters as *transport*: the shim's `get_image_reference`
+reads it to populate the `image_guest_pull` storage `source`, which is the value
+the policy pins. The compiler therefore reduces every collected guest-pull
+reference through the same identity function as the evaluator and **fails
+generation** when a reference is not digest-qualified. `guest_pull_image_identity`
+is undefined for a tag-only reference, so accepting one would emit a policy that
+denies unconditionally; rejecting it at compile time turns a silent runtime
+denial into a generation error. The reduction also keeps the capture's registry
+hostname out of the policy: the digest is the whole authority and the transport
+location is not.
+
+#### Residual: the CRI annotation namespace is default-allow
+
+The prefix clause in `allow_anno_key_value` is a wildcard over a namespace the
+untrusted host populates. It is bounded today only because the guest consumes a
+single CRI annotation, `io.kubernetes.cri.container-type`, which has its own
+correlation rule. Any new guest-side consumer of an `io.kubernetes.cri.*`
+annotation would become host-controlled with no policy change and no review. The
+clause must become an explicit key allowlist, so that keys carrying authority
+keep their correlation rules and unknown CRI keys fail closed.
+
 ## Compiler implementation contract
 
 ### Code reused directly
@@ -341,8 +382,15 @@ legacy `Settings` implementation, serializes the complete
 concatenates the configured shared `rules.rego` before that data. The
 production appliance image copies the repository's base
 `genpolicy-settings.json` and applies a drop-in that changes only
-`cluster_config.pause_container_image`. Consequently, the following legacy
-policy classes are inherited rather than reconstructed:
+`cluster_config.pause_container_image`. That drop-in is a **generator** input:
+it lets the legacy reference run resolve the pause image from the clean-room
+registry so it can read the image configuration and layers. `rules.rego` never
+reads the field, so the compiler clears it before serializing `cluster_config`
+and the clean-room registry hostname does not become a policy literal. Sandbox
+rootfs authority is the UVM-local pause bundle, measured together with the guest
+rootfs, and its request identity is the literal `pause` carried in the sandbox's
+`guest-pull-images` marker. Consequently, the following legacy policy classes
+are inherited rather than reconstructed:
 
 | Legacy policy class | Source | Appliance result |
 |---|---|---|
