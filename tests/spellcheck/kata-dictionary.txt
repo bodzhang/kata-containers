@@ -6,10 +6,15 @@ genpolicy
 kata
 katacontainers
 libcontainer
+metacharacters
 osbuilder
+Rego
 rootfs
+Rustjail
 shimv2
 SPDK
+tmpfs
+unsuffixed
 upcall
 virtcontainers
 

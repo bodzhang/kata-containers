@@ -292,6 +292,46 @@ The legacy pod-level root-hash and image fields remain empty and are not
 authorization inputs; a runtime rootfs without a matching container marker is
 denied.
 
+### Evaluator operand authority
+
+The policy compiler's tightened output is authoritative only if the shared
+evaluator does not reintroduce a broader decision through hardcoded,
+pipeline-specific operands. `rules.rego` therefore owns stable authorization
+algorithms, while generated `policy_data` owns values that can vary with the
+Kata-CC stack, runtime profile, or deployment pipeline.
+
+Stable evaluator behavior includes request traversal, cardinality and
+uniqueness checks, state correlation, exact and regular-expression comparison
+algorithms, and rootfs marker dispatch and identity-comparison semantics. The
+generated contract owns the operands supplied to those algorithms, including:
+
+- annotation names and role values;
+- paths, tokens, regular expressions, and request-shape values;
+- namespace and capability normalization;
+- mount and storage representations and compatibility exceptions;
+- rootfs options and block-transport grammars; and
+- VFIO and CDI paths, prefixes, and identifier grammar.
+
+`policy_data.evaluator_schema_version` identifies this contract. Every
+contract-consuming evaluator path must fail closed when the version is
+unsupported or a required operand is absent, malformed, or contains an
+unresolved token. It must not fall back to the literal that was moved from
+`rules.rego`, accept an alternative hardcoded representation, or add a
+compatibility branch that bypasses compiler output.
+
+This separation is required for compiler tightening to have effect. For
+example, clearing broad inherited environment expressions and emitting one
+anchored expression per captured variable would not reduce authority if
+`rules.rego` independently accepted the old broad pattern. The same rule
+applies to mount, storage, device, request-shape, and rootfs operands.
+
+Legacy GenPolicy and `genpolicy-oci-compiler` must serialize the same required
+operand contract from version-pinned settings. Producer tests compare the
+canonical contract, and evaluator tests cover every consumed path plus
+mutation, missing-field, wrong-type, unresolved-token, and wrong-version
+denials. Adding a new stack-dependent operand requires updating the shared
+typed contract and every producer before the evaluator can consume it.
+
 ### Request authority and coverage
 
 | Captured field | Compiler treatment |
