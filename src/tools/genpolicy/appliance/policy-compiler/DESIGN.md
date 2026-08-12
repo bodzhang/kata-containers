@@ -294,43 +294,17 @@ denied.
 
 ### Evaluator operand authority
 
-The policy compiler's tightened output is authoritative only if the shared
-evaluator does not reintroduce a broader decision through hardcoded,
-pipeline-specific operands. `rules.rego` therefore owns stable authorization
-algorithms, while generated `policy_data` owns values that can vary with the
-Kata-CC stack, runtime profile, or deployment pipeline.
+The compiler's tightened output is authoritative only if `rules.rego` does not
+reintroduce broader hardcoded, pipeline-specific allowances. The evaluator owns
+stable authorization algorithms; generated `policy_data` owns operands that
+vary with the Kata-CC stack, runtime profile, or deployment pipeline. Missing,
+malformed, unresolved, or wrong-version contract data fails closed without a
+literal or compatibility fallback.
 
-Stable evaluator behavior includes request traversal, cardinality and
-uniqueness checks, state correlation, exact and regular-expression comparison
-algorithms, and rootfs marker dispatch and identity-comparison semantics. The
-generated contract owns the operands supplied to those algorithms, including:
-
-- annotation names and role values;
-- paths, tokens, regular expressions, and request-shape values;
-- namespace and capability normalization;
-- mount and storage representations and compatibility exceptions;
-- rootfs options and block-transport grammars; and
-- VFIO and CDI paths, prefixes, and identifier grammar.
-
-`policy_data.evaluator_schema_version` identifies this contract. Every
-contract-consuming evaluator path must fail closed when the version is
-unsupported or a required operand is absent, malformed, or contains an
-unresolved token. It must not fall back to the literal that was moved from
-`rules.rego`, accept an alternative hardcoded representation, or add a
-compatibility branch that bypasses compiler output.
-
-This separation is required for compiler tightening to have effect. For
-example, clearing broad inherited environment expressions and emitting one
-anchored expression per captured variable would not reduce authority if
-`rules.rego` independently accepted the old broad pattern. The same rule
-applies to mount, storage, device, request-shape, and rootfs operands.
-
-Legacy GenPolicy and `genpolicy-oci-compiler` must serialize the same required
-operand contract from version-pinned settings. Producer tests compare the
-canonical contract, and evaluator tests cover every consumed path plus
-mutation, missing-field, wrong-type, unresolved-token, and wrong-version
-denials. Adding a new stack-dependent operand requires updating the shared
-typed contract and every producer before the evaluator can consume it.
+[GenPolicy Evaluator Operand Migration](../EVALUATOR_OPERAND_MIGRATION.md)
+defines this boundary in detail, inventories the migrated `rules.rego`
+families, specifies the shared Legacy GenPolicy and appliance compiler
+contract, and records the required negative and producer-parity validation.
 
 ### Request authority and coverage
 

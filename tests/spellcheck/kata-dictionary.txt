@@ -23,6 +23,7 @@ bootc
 distroless
 materialx
 ostree
+Regorus
 
 # Hardware & Architecture
 AMD
@@ -80,6 +81,7 @@ blockfile
 devicemapper
 devmapper
 hugepage
+hugetlbfs
 MACVTAP
 memdisk
 pmem
