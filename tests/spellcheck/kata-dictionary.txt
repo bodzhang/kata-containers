@@ -1,17 +1,20 @@
 # Kata Containers Dictionary
 
 # Project-Specific Terms
+automount
 Dragonball
 genpolicy
 kata
 katacontainers
 libcontainer
+literalization
 metacharacters
 osbuilder
 Rego
 rootfs
 Rustjail
 shimv2
+subpaths
 SPDK
 tmpfs
 unsuffixed
@@ -122,8 +125,6 @@ crio
 nerdctl
 crictl
 dockershim
-Rego
-tmpfs
 dentries
 hexdump
 hypercalls

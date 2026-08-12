@@ -27,12 +27,14 @@ versions in GenPolicy. Component upgrades can therefore cause policy drift even
 when workload intent has not changed.
 
 The proposed design makes GenPolicy responsible for static workload, image,
-and measured UVM constraints. Versioned **Rego fragments** validate mutations
-introduced by the platform profile. The name and composition model follow the hcsshim
-security-policy fragment design, including fragment identity by issuer, feed,
-namespace, and security version number (SVN). The main adaptation is that Kata
-fragments validate platform mutations rather than contribute additional
-containers.
+and measured UVM constraints. Versioned **Rego fragments** replace the
+version-pinned platform rules in the Legacy GenPolicy `rules.rego` monolith.
+The static IR authorizes the required fragment identities, and the selected
+fragments validate mutations introduced by that platform profile. The name and
+composition model follow the hcsshim security-policy fragment design,
+including fragment identity by issuer, feed, namespace, and security version
+number (SVN). The main adaptation is that Kata fragments validate platform
+mutations rather than contribute additional containers.
 
 The hcsshim design provides useful precedents:
 
@@ -53,6 +55,9 @@ and
 
 - Generate exact policy constraints from workload YAML and digest-bound image
   configuration without predicting platform implementation details.
+- Replace the version-pinned Legacy GenPolicy policy monolith with a
+  version-independent RPC evaluator plus policy data composed from static IR
+  and independently versioned fragments.
 - Assign every platform mutation to one category and one owning fragment.
 - Reuse reviewed fragments across workloads with the same measured profile.
 - Correlate generated values with static workload intent and with other values
@@ -136,11 +141,11 @@ literals for a production cluster.
 ```mermaid
 flowchart LR
     YAML[Workload YAML and image data] --> IR[Static policy IR]
-  UVM[Measured UVM image] --> IR
-    PROFILE[Selected profile fragments] --> COMPOSE[Additive compositor]
-    IR --> COMPOSE
-    COMPOSE --> POLICY[Final policy data]
-    POLICY --> REGO[Runtime Rego validators]
+    UVM[Measured UVM image] --> IR
+    IR --> POLICY[Agent policy module set]
+    PROFILE[Authorized profile fragments] --> POLICY
+    COMPOSE[Optional generic composer] --> POLICY
+    POLICY --> REQUEST[Runtime request authorization]
 ```
 
 The final policy produced by composition is:
@@ -167,8 +172,8 @@ construct policy data. In particular:
   `target.path`, so ownership, overlap, and category checks constrain the value
   that composition actually applies;
 - duplicate, missing, or ambiguous subjects fail composition;
-- the final policy contains ordinary policy data and can use the existing
-  Agent policy interface.
+- the final policy consists of the static IR and its authorized executable
+  fragments, packaged atomically for the existing Agent policy interface.
 
 !!! warning "The addition is the mutation, not the target path"
     Composition merges `addition`, while every ownership, overlap, and category
@@ -188,22 +193,25 @@ boundary is wrong.
 
 ## Runtime Authorization Model
 
-Let $P$ be the composed final policy, $Q$ the Agent-visible request, and $F_i$
-a fragment validator. Authorization requires the final static constraints and
-every selected fragment to agree:
+Let $P$ be the policy data composed from static IR and selected fragments, $Q$
+the Agent-visible request, and $E$ the version-independent RPC evaluator.
+Authorization is:
 
 $$
-allow(P,Q) = static(P,Q) \land \bigwedge_{i=1}^{n} F_i(P,Q,C)
+allow(P,Q) = E(P,Q,C)
 $$
 
 $C$ contains values bound from the same request, such as sandbox ID, bundle ID,
-Pod UID, sandbox name, and namespace. Fragments compose by intersection, not by
-union. A fragment cannot make a request valid after static policy rejects it.
+Pod UID, sandbox name, and namespace. $E$ retains the complete endpoint control
+flow, request-field traversal, cardinality checks, structural validation, and
+state correlation from Legacy GenPolicy. $P$ supplies both static constraints
+and profile-version-specific exact values, regular expressions, substitutions,
+and compatibility parameters.
 
 Each final request field must be one of:
 
 1. validated directly by static policy;
-2. claimed and validated by exactly one fragment;
+2. constrained by policy data owned by exactly one fragment;
 3. explicitly shared by fragments through a documented dependency; or
 4. rejected as unclaimed.
 
@@ -212,10 +220,67 @@ are keyed by destination and purpose, environment entries by variable name,
 storages by driver and correlated mount point, and namespaces by type. Array
 ordering is not a mutation unless the protocol gives ordering semantic meaning.
 
-!!! warning "Fragments are validators, not authorities"
+!!! warning "Fragments are policy-data authorities"
     API server, kubelet, containerd, and runtime-rs are outside the Kata-CC
-    trust boundary. A fragment describes the request shape that trusted Agent
-    policy permits; it does not make the producing component trusted.
+  trust boundary. A fragment supplies the constraints that trusted Agent
+  policy applies; it does not make the producing component trusted.
+
+### Parameterized RPC evaluator
+
+The fragment design retains the endpoint-specific authorization structure of
+Legacy GenPolicy `rules.rego`. This is important because that evaluator already
+checks the Agent RPC request shapes, collection cardinality, state transitions,
+and cross-field correlations. It must not be replaced by an incomplete generic
+path matcher or by separate fragment validators that duplicate portions of the
+RPC control flow.
+
+The replacement evaluator contains only Agent-RPC-version-specific control flow
+and version-independent authorization algorithms:
+
+- the Agent RPC endpoint registry, its enabled or disabled defaults, and
+  fail-closed handling for unknown endpoints;
+- exact, set, and anchored regular-expression matching;
+- typed collection matching and uniqueness checks;
+- path traversal, range, and structural validation;
+- bind-once equality and request-state correlation; and
+- fail-closed rejection of absent, ambiguous, or unclaimed constraints.
+
+Composer-produced policy data must own concrete profile conventions, including:
+
+- CRI annotation keys and container-role values;
+- sandbox log, bundle, rootfs, shared-filesystem, and storage path templates;
+- placeholder vocabulary, permitted substitution sites, and value derivation;
+- storage driver names, source grammars, mount-point derivation, and options;
+- namespace and mount normalization or compatibility exceptions; and
+- CDI prefixes, VFIO identifiers, PCI grammars, and device correlations.
+
+The evaluator may know that an OCI version is compared exactly, a sandbox name
+is matched as an anchored regular expression, mounts are matched by destination,
+or a sandbox identity is bound once. The exact version, pattern, annotation-key
+mapping, path template, allowed option, driver name, and compatibility exception
+must come from $P$. A component-profile change therefore changes fragments and
+composed data, not evaluator source.
+
+`compose.rego` verifies fragment identity, claim ownership, coverage, and schema
+compatibility, then produces $P$. It does not authorize RPC requests.
+`composition_schema_version` versions the shape consumed by the evaluator;
+profile applicability versions the concrete operands.
+
+The endpoint registry follows the Agent RPC API version rather than the
+Kubernetes/containerd/runtime profile. A default-enabled endpoint may perform
+only a profile-independent operation that needs no payload constraint. Any
+endpoint whose request carries workload or profile-sensitive authority remains
+default-denied until static policy and all owning fragments authorize it.
+
+!!! warning "Legacy evaluator is compatibility evidence"
+    The current `src/tools/genpolicy/rules.rego` is the behavioral baseline for
+    endpoint and field coverage, but it still embeds CRI annotation names, Kata
+    paths, storage grammars, substitutions, and compatibility operands. The
+    migration keeps its generic control flow while moving those operands into
+    composer-produced `policy_data`. Compatibility with the file before that
+    refactoring is evidence only, not completion of the parameterization. The
+    [evaluator operand migration](genpolicy-evaluator-operand-migration.md)
+    defines the complete compiler, composer, and evaluator change plan.
 
 ## Mutation Operations
 
@@ -596,8 +661,9 @@ addresses, VFIO device numbers, and CDI suffixes are correlation inputs rather
 than static workload authority.
 
 Legacy GenPolicy follows the same device model: `volumeDevices` emit only
-`container_path`, while NVIDIA pGPU entries emit only the unsuffixed VFIO guest
-path and reviewed device type. Legacy shared PVC and host-directory mounts use
+`container_path`, while NVIDIA pGPU entries emit only the VFIO guest path
+without a suffix and the reviewed device type. Legacy shared PVC and
+host-directory mounts use
 guest-side `$(sfprefix)` regular expressions rather than host paths. Legacy has
 an exception that serializes literal `/dev/*` and `/sys/*` hostPath sources;
 the fragment design deliberately does not inherit it and rejects those host
@@ -1024,7 +1090,7 @@ fragments := [
 
 The exact signing and distribution mechanism is independent of the mutation
 taxonomy. A COSE envelope and transparency receipts can be added without
-changing fragment validator semantics.
+changing fragment composition semantics.
 
 ## Profile Identity
 
@@ -1139,10 +1205,13 @@ second.
 
 ### Runtime validator coverage
 
-Canonical policy-data reconstruction does not prove that `rules.rego` consumes
-every fragment-owned path. The coverage prototype therefore accepts a separate
-runtime validator inventory through `--validator-inventory`. Every reusable
-profile claim must match exactly one inventory entry with:
+Canonical policy-data reconstruction does not prove that the RPC evaluator
+consumes every fragment-owned path. The coverage prototype therefore accepts a
+separate runtime validator inventory through `--validator-inventory`. During
+migration the inventory may reference Legacy GenPolicy `rules.rego`;
+release-ready coverage requires the referenced evaluator rule to be
+version-independent and to obtain profile operands from composed policy data.
+Every reusable profile claim must match exactly one inventory entry with:
 
 - the same fragment category and policy-data path;
 - an optional matching container role;
@@ -1194,10 +1263,23 @@ flowchart LR
     S --> R
     C[compose.rego] --> R
     R --> D[Canonical policy_data JSON]
-    F[Embedded versioned Agent framework] --> P[Agent packaging]
-    D --> P
-    P --> A[Final Agent policy]
+  D --> CHECK[Legacy compatibility check]
+  L[Legacy rules.rego] --> CHECK
 ```
+
+This prototype proves additive policy-data lowering. The production design
+packages the version-independent evaluator with the composed `policy_data` as
+one Agent policy. Profile fragments execute during composition; they do not
+duplicate endpoint authorization at request time.
+
+The first executable level-1 test uses a small evaluator fixture shaped like the
+corresponding Legacy GenPolicy helpers. It reads OCI version, CRI container role,
+and sandbox-name regex from separately composed policy data, permits the
+matching Agent-shaped request, and rejects mutations and an unanchored regex.
+It proves the parameterization boundary, not complete RPC coverage. The complete
+implementation must use the legacy evaluator as its coverage baseline and move
+each profile-sensitive operand without dropping any endpoint branch or field
+check.
 
 `generate_regorus_fragment_inputs.py` invokes the independent static generator
 on workload YAML, digest-indexed image configuration, optional authenticated
@@ -1324,25 +1406,34 @@ layer contains no exact container ID, and the sandbox does not receive an
 application Service environment.
 
 The Rust `fragment-policy-composer` binary contains no policy mutation logic. It
-loads the static IR, fragment, and composer modules into Regorus, evaluates
-`data.fragment_composer.final_policy`, and serializes the canonical data. Agent
-packaging appends that data to the independently versioned
-`agent-framework.rego` compiled into the tool. The PoC does not read or package
-legacy GenPolicy `rules.rego`, and neither workload input nor an appliance
-profile can select a replacement framework.
+simulates Agent policy initialization by loading the static IR, selected
+fragments, materializations, and composer module into Regorus, evaluating
+`data.fragment_composer.final_policy`, and serializing the canonical result.
+All mutations are implemented by the selected profile Rego modules. The
+composition step neither loads nor embeds the RPC authorization evaluator.
 
-The static Rego IR declares `agent_framework_version`. The generator and
-embedded framework currently target schema version `1`, and `compose.rego`
-fails closed before materialization when the version differs. A Kata-CC policy
-framework change therefore requires a coordinated framework, generator, and
-composer version change. YAML, image, cluster, or appliance-profile changes do
-not change the framework artifact. The resulting Agent module is parsed in the
-same Regorus engine used by the Agent.
+As a separate migration check, the PoC can accept Legacy GenPolicy
+`rules.rego` explicitly and append the composed `policy_data` to it. The
+resulting module has the same shape as a Legacy GenPolicy policy and is parsed
+by Regorus before the test completes. This packaging step does not participate
+in composition and cannot alter the IR or composed data. It is a migration
+baseline. The target retains its complete RPC coverage while refactoring every
+profile-sensitive operand out of evaluator source and into composed data.
+
+The static Rego IR declares `composition_schema_version`. The generator and
+composition contract currently target schema version `1`, and `compose.rego`
+fails closed before materialization when the version differs. A composition
+contract change therefore requires coordinated generator, fragment, and
+composer version changes. A profile change selects different fragments and
+therefore different policy data. If a component upgrade requires an evaluator
+source change rather than a fragment/data change, the version-independence
+boundary has been violated or the generic policy-data schema needs an explicit
+revision.
 
 The composer fails closed when:
 
 - fragment and static profile identities differ;
-- static IR targets a different Agent framework version;
+- static IR targets a different composition schema version;
 - static-base materialization uses the wrong static-base digest;
 - a reusable selector has missing or ambiguous role cardinality;
 - an exact materialization subject does not exist;
@@ -1370,8 +1461,9 @@ Service intent. For comparison only, the candidate renderer applies the current
 policy-compiler Service environment contract to the older checked-in golden.
 The resulting JSON is byte-for-byte equal to that production-safe compiler
 target. The test also rejects captured ClusterIP, Pod UID, Pod name, and
-node-name literals. The generated Agent module embeds the resulting value after
-the versioned Agent framework and parses in Regorus.
+node-name literals. For migration evidence, the compatibility path appends the
+resulting value to Legacy GenPolicy `rules.rego` and verifies that the combined
+module parses in Regorus.
 
 !!! warning "Reviewed structure, not a signed production profile"
     Exact reconstruction is proved for `run-complex`, and reusable claims are
@@ -2171,6 +2263,23 @@ Kata Agent currently installs one policy in one Regorus engine.
 `SetPolicyRequest` replaces that engine and does not add a module. There is no
 current issuer/feed/SVN, signature, or additive-module API.
 
+### Testing boundary
+
+The fragment policy's authorization semantics can be tested before any Agent
+change. A Regorus harness first composes policy data from static IR and selected
+fragments, then loads that data with the parameterized evaluator, submits
+recorded Agent RPC inputs, queries the same `data.agent_policy.<Endpoint>`
+decisions, and applies returned state patches using the existing Agent
+contract. This tests the complete policy program but not its delivery through
+`SetPolicyRequest`.
+
+An end-to-end test through the current Agent appends composed `policy_data` to
+one valid evaluator module in `package agent_policy`, because `set_policy()`
+resets the engine and calls `add_policy()` once. No Agent change is needed for
+that packaged-module path. Performing composition inside the Agent from
+separately authenticated fragments requires the Phase 2 Agent and protocol
+changes.
+
 Implementation is therefore staged:
 
 ### Phase 1: build-time composition
@@ -2179,8 +2288,9 @@ Implementation is therefore staged:
 - GenPolicy emits a static policy IR containing no profile-owned fields.
 - The compiler verifies claim ownership, framework compatibility, SVN, stable
   subject existence, and target-path absence.
-- It additively materializes claim values and composes namespaced runtime Rego
-  validators into one policy text.
+- It additively materializes claim values into final `policy_data`.
+- It appends that data to the version-independent evaluator as one valid
+  `package agent_policy` module.
 - The existing `SetPolicyRequest` installs the resulting policy atomically.
 - Fragment descriptors, hashes, claims, and evidence remain in provenance.
 
@@ -2193,9 +2303,10 @@ changing the Agent RPC API.
   namespace, SVN, Rego, and optional signature evidence.
 - Add Regorus module lifecycle support without replacing policy state.
 - Perform pre-load identity and minimum-SVN checks.
-- Load into an isolated namespace, evaluate post-load metadata and claims, and
-  remove the module on any failure.
-- Seal the required fragment set before processing workload requests.
+- Load composition modules into isolated namespaces, evaluate post-load
+  metadata and claims, and remove the modules on any failure.
+- Compose and seal final policy data before processing workload requests; RPC
+  authorization still runs through the single parameterized evaluator.
 
 The two-phase pre-load/post-load validation used by hcsshim is the preferred
 model for this phase.
@@ -2245,12 +2356,14 @@ policy-compiler output.
 ## Decision Summary
 
 GenPolicy remains the authority for workload and image invariants. Fragments
-add profile-owned final constraints and validate mutations by category:
+add profile-owned final constraints by category:
 Kubernetes API/controller, kubelet resolution, containerd OCI generation,
 runtime-rs transformation, and rootfs/storage mode. Generated identities are
-common correlated facts. Build-time composition is additive and conflict-free;
-runtime composition is an intersection of validators with complete claim
-coverage, never a union of permissions.
+common correlated facts. The static IR authorizes the required fragment set.
+Build-time composition is additive and conflict-free. At runtime, a
+version-independent evaluator derived from the complete Legacy GenPolicy RPC
+control flow checks the composed policy data. `compose.rego` builds that data;
+it is not an RPC evaluator.
 
 The first implementation composes fragments before installing the policy. The
 hcsshim issuer/feed/SVN and runtime-loading mechanics can be adopted later
