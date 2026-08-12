@@ -108,7 +108,7 @@ grammar that admits every legitimate production value and nothing else.
 
 ## Dynamic OCI field treatment
 
-Regexes apply to complete policy field values, not to unchecked fragments. For
+Regexes apply to complete policy field values, not to unchecked substrings. For
 environment entries, the matched value is the complete `NAME=value` string and
 every input entry must match an exact policy environment entry or an approved
 anchored regex.

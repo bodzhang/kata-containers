@@ -4,8 +4,7 @@
 
 This document describes the completed appliance migration that makes Legacy
 GenPolicy and the appliance policy compiler produce the profile-sensitive data
-used to authorize Kata Agent RPC requests. It also defines the contract that a
-fragment policy composer must satisfy before it can package the same evaluator.
+used to authorize Kata Agent RPC requests.
 
 Implementation started on 2026-08-12. The first increment makes the appliance
 policy compiler emit the existing shared `framework` data and moves the CDI
@@ -34,29 +33,23 @@ evaluator.
   contract consumed by `rules.rego`. Serialized consumed-path and producer
   parity tests prevent drift between these appliance policy paths.
 
-The fragment composer implementation is maintained on the dependent fragment
-branch. Its output must satisfy the same contract and parity requirements
-defined below; the appliance evaluator does not contain a fragment-specific
-fallback.
-
 ## Decision
 
-The appliance policy compiler, Legacy GenPolicy, and fragment policy composer
-must emit the same versioned evaluator-data contract. The packaged evaluator
-must fail closed when that contract is absent, incomplete, malformed, or for a
-different evaluator schema version.
+The appliance policy compiler and Legacy GenPolicy must emit the same versioned
+evaluator-data contract. The packaged evaluator must fail closed when that
+contract is absent, incomplete, malformed, or for a different evaluator schema
+version.
 
 ```mermaid
 flowchart LR
     Y[Workload YAML and image metadata] --> PC[Appliance policy compiler]
     C[Reviewed compatibility settings] --> PC
     O[Validated capture observations] --> PC
-    Y --> IR[Static policy IR]
-    F[Selected profile fragments] --> FC[Fragment composer]
-    IR --> FC
+    S[Legacy GenPolicy settings] --> LG[Legacy GenPolicy]
+    Y --> LG
     PC --> PD1[Canonical policy_data]
-    FC --> PD2[Canonical policy_data]
-    PD1 --> EQ[Canonical equivalence check]
+    LG --> PD2[Canonical policy_data]
+    PD1 --> EQ[Producer parity check]
     PD2 --> EQ
     E[Parameterized RPC evaluator] --> PKG[Packaged Agent policy]
     EQ --> PKG
@@ -354,27 +347,9 @@ appliance compiler. Settings validation must reject missing fields, unknown
 runtime storage representations, invalid regexes, duplicate tokens, and
 unsupported schema versions.
 
-The settings file is transitional authority for the non-fragment path. It must
-contain every compatibility operand until the fragment profile becomes the
-sole source for that profile.
-
-### Fragment policy composer compatibility
-
-A compatible fragment producer must produce identical versioned evaluator data:
-
-- `policy-framework-settings` owns shared annotation, role, device,
-  normalization, substitution, and compatibility operands;
-- `runtime-rs` owns per-container root, mount, device, and runtime annotation
-  constraints derived from typed intent; and
-- `runtime-rs-envelope` owns runtime storage representations, rootfs identity
-  envelopes, and CopyFile roots that depend on runtime transport. It supplies
-  per-container rootfs identities and filesystem representation operands, but
-  not the stable marker interpretation or identity-comparison semantics.
-
-Such a composer must validate claim ownership and completeness against the
-contract schema. It may not fill a missing operand from evaluator source.
-Canonical composer output and canonical appliance compiler output must compare
-equal for the same workload, images, settings, and profile.
+The settings file is version-pinned authority for compatibility operands shared
+by Legacy GenPolicy and the appliance policy compiler. Both producers must
+serialize the same required values into canonical policy data.
 
 ## `rules.rego` Changes
 
@@ -392,8 +367,9 @@ can emit it. For each family:
   policy-data operand remain independent of the contract.
 6. Add a mutation-negative test before proceeding to the next family.
 
-No profile fragment is evaluated during an RPC request. No copied evaluator,
-generic JSON-path matcher, or runtime rule mini-language is introduced.
+No producer-specific policy module is evaluated during an RPC request. No
+copied evaluator, generic JSON-path matcher, or runtime rule mini-language is
+introduced.
 
 ## Migration Sequence
 
@@ -402,7 +378,6 @@ generic JSON-path matcher, or runtime rule mini-language is introduced.
 - Define shared Rust types and strict validation.
 - Populate the complete contract in `genpolicy-settings.json`.
 - Emit it from Legacy GenPolicy and `genpolicy-oci-compiler`.
-- Require any fragment producer to emit the same shape.
 - Add canonical producer-equivalence tests.
 
 This stage changes data but not evaluator behavior. It exposes missing producer
@@ -464,10 +439,7 @@ Each migrated operand family requires all of the following:
   mask, option, driver, token, and role independently;
 - missing-field, wrong-type, unknown-field, and wrong-schema rejection;
 - compiler tests proving the value is present in serialized policy data;
-- for a fragment implementation, composer tests proving the selected profile
-  owns the same value;
-- for a fragment implementation, canonical compiler/composer equality for
-  representative workloads;
+- canonical Legacy GenPolicy/compiler equality for representative workloads;
 - tests proving captures cannot widen the generated constraint; and
 - regression tests preserving all Legacy request fields, cardinality checks,
   uniqueness checks, and state operations.
@@ -510,10 +482,6 @@ The appliance migration is complete only when:
   and
 - appliance policy provenance identifies the compatibility settings and
   contract schema that produced the installed policy.
-
-A fragment policy path is complete only when its composer also emits this
-contract, proves canonical parity with the appliance compiler for equivalent
-inputs, and satisfies the fragment-specific validation requirements above.
 
 At that point, the appliance policy compiler generates the tightened policy it
 claims to generate: the evaluator supplies the authorization machinery, while
