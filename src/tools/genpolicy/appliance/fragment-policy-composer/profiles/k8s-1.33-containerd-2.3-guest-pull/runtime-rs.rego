@@ -131,8 +131,105 @@ device_claims(ir) := [claim |
   }
 ]
 
-# Remaining runtime-rs materializations are restricted to explicit OCI rewrite
-# paths whose typed transformations have not yet moved into this module.
+# runtime-rs replaces the host namespaces of every subject with guest namespaces
+# it creates itself, so the policy pins the set and requires an empty path.
+guest_namespaces := [
+  {"Path": "", "Type": "ipc"},
+  {"Path": "", "Type": "uts"},
+  {"Path": "", "Type": "mount"},
+]
+
+# The pause container is synthesized by runtime-rs rather than delivered over
+# CRI, so its process shape is profile-owned and carries no workload intent.
+# This set equals the containerd default in kubelet-or-containerd today; the two
+# are stated separately because their owners can diverge independently.
+sandbox_capabilities := [
+  "CAP_CHOWN",
+  "CAP_DAC_OVERRIDE",
+  "CAP_FSETID",
+  "CAP_FOWNER",
+  "CAP_MKNOD",
+  "CAP_NET_RAW",
+  "CAP_SETGID",
+  "CAP_SETUID",
+  "CAP_SETFCAP",
+  "CAP_SETPCAP",
+  "CAP_NET_BIND_SERVICE",
+  "CAP_SYS_CHROOT",
+  "CAP_KILL",
+  "CAP_AUDIT_WRITE",
+]
+
+normalization_specs(subject) := [
+  {
+    "addition": {"OCI": {"Linux": {"Namespaces": guest_namespaces}}},
+    "path": "/OCI/Linux/Namespaces",
+  },
+  {
+    "addition": {"OCI": {"Root": {"Path": "$(root_path)"}}},
+    "path": "/OCI/Root/Path",
+  },
+] if {
+  subject.role == "application"
+}
+
+normalization_specs(subject) := [
+  {
+    "addition": {"OCI": {"Linux": {"Namespaces": guest_namespaces}}},
+    "path": "/OCI/Linux/Namespaces",
+  },
+  {
+    "addition": {"OCI": {"Process": {"Terminal": false}}},
+    "path": "/OCI/Process/Terminal",
+  },
+  {
+    # The pause container receives no Service links, so the regex surface is
+    # cleared rather than left absent.
+    "addition": {"OCI": {"Process": {"EnvRegex": []}}},
+    "path": "/OCI/Process/EnvRegex",
+  },
+  {
+    "addition": {"OCI": {"Process": {"Capabilities": {"Ambient": []}}}},
+    "path": "/OCI/Process/Capabilities/Ambient",
+  },
+  {
+    "addition": {"OCI": {"Process": {"Capabilities": {"Bounding": sandbox_capabilities}}}},
+    "path": "/OCI/Process/Capabilities/Bounding",
+  },
+  {
+    "addition": {"OCI": {"Process": {"Capabilities": {"Effective": sandbox_capabilities}}}},
+    "path": "/OCI/Process/Capabilities/Effective",
+  },
+  {
+    "addition": {"OCI": {"Process": {"Capabilities": {"Inheritable": []}}}},
+    "path": "/OCI/Process/Capabilities/Inheritable",
+  },
+  {
+    "addition": {"OCI": {"Process": {"Capabilities": {"Permitted": sandbox_capabilities}}}},
+    "path": "/OCI/Process/Capabilities/Permitted",
+  },
+] if {
+  subject.role == "sandbox"
+}
+
+# Rewrites the OCI fields runtime-rs normalizes before the Agent sees them: the
+# guest rootfs path, the guest namespace set, and the synthesized pause process.
+# A path the static IR already owns keeps its typed value.
+oci_normalization_claims(ir) := [claim |
+  some subject in ir.subjects
+  some spec in normalization_specs(subject)
+  not spec.path in subject.owned_paths
+  claim := {
+    "addition": spec.addition,
+    "category": "runtime-rs",
+    "operation": "rewrite",
+    "subject": subject.id,
+    "target": {"path": spec.path},
+  }
+]
+
+# runtime-rs no longer needs materialization authority: every OCI field it
+# rewrites is produced by a reviewed rule above.
 fragment := {
   "applies_to": {
     "rootfs_mode": ["guest-pull"]
@@ -140,12 +237,7 @@ fragment := {
   "capture_provenance": "8b0ae298134cf114935b140f42fc2ca8a8294a674ecbeb58d4727ee2f33f00d2",
   "category": "runtime-rs",
   "claims": [],
-  "materialization_contracts": [
-    {
-      "operations": ["rewrite"],
-      "path_regex": "^/OCI/(Root/Path|Linux/Namespaces|Process/(Terminal|Capabilities/(Ambient|Bounding|Effective|Inheritable|Permitted)|EnvRegex))$"
-    }
-  ],
+  "materialization_contracts": [],
   "schema_version": 1,
   "scope": "profile"
 }

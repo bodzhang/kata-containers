@@ -1,7 +1,11 @@
 {
   "images": {
     "genpolicy.local:5000/busybox@sha256:c0aae9d756395ade52df06b55e160e6e32d2ecfe0181ed2c14c68effc5e3fe45": {
-      "config_path": "configs/busybox.json"
+      "config_path": "configs/busybox.json",
+      "user_database": {
+        "group": "root:x:0:\ndaemon:x:1:\nbin:x:2:\nsys:x:3:\nadm:x:4:\ntty:x:5:\ndisk:x:6:\nlp:x:7:\nmail:x:8:\nkmem:x:9:\nwheel:x:10:root\ncdrom:x:11:\ndialout:x:20:\nfloppy:x:21:\nvideo:x:25:\naudio:x:29:\ntape:x:32:\nwww-data:x:33:\noperator:x:37:\nutmp:x:43:\nplugdev:x:46:\nstaff:x:50:\nlock:x:54:\nnetdev:x:82:\nusers:x:100:\nnogroup:x:65534:\n",
+        "passwd": "root:x:0:0:root:/root:/bin/sh\ndaemon:x:1:1:daemon:/usr/sbin:/bin/false\nbin:x:2:2:bin:/bin:/bin/false\nsys:x:3:3:sys:/dev:/bin/false\nsync:x:4:100:sync:/bin:/bin/sync\nmail:x:8:8:mail:/var/spool/mail:/bin/false\nwww-data:x:33:33:www-data:/var/www:/bin/false\noperator:x:37:37:Operator:/var:/bin/false\nnobody:x:65534:65534:nobody:/home:/bin/false\n"
+      }
     }
   }
 }

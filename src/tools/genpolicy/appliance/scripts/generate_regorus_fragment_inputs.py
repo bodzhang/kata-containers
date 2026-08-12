@@ -122,11 +122,20 @@ def production_safe_policy(
     result["request_defaults"]["CopyFileRequest"] = copy_file_patterns(
         static_ir or {}
     )
+    # rules.rego never reads pause_container_image, so the compiler stopped
+    # pinning the clean-room registry it was captured from.
+    if "pause_container_image" in result.get("cluster_config", {}):
+        result["cluster_config"]["pause_container_image"] = ""
     static_subjects = {
         subject["subject"]: subject for subject in (static_ir or {}).get("subjects", [])
     }
     for container in result["containers"]:
         annotations = container["OCI"].get("Annotations", {})
+        # The compiler stopped emitting the CRI image-name annotation once it
+        # became clear that rules.rego never correlates the value and the host
+        # asserts it. The checked-in capture predates that change, so the target
+        # is normalized here rather than left describing an obsolete compiler.
+        annotations.pop("io.kubernetes.cri.image-name", None)
         identity = (
             annotations.get("io.kubernetes.cri.container-type", ""),
             annotations.get("io.kubernetes.cri.container-name", ""),
@@ -227,6 +236,10 @@ def regorus_static_ir(
             static_subject.get("rootfs_identity_storage", {})
         )
         subject["volumes"] = copy.deepcopy(static_subject.get("volumes", []))
+        # The controller object that owns the subject is typed identity, not a
+        # host observation, so fragments may derive controller-generated names
+        # from it.
+        subject["workload"] = copy.deepcopy(static_subject.get("workload", {}))
         subject["owned_paths"] = leaf_paths(subject["policy"])
         subject["role"] = (
             "application" if subject["id"].startswith("container/") else "sandbox"
@@ -458,6 +471,9 @@ PROFILE_GENERATED_KUBELET_CONTAINERD_PATHS = {
     "/OCI/Annotations/io.kubernetes.cri.sandbox-id",
     "/OCI/Annotations/io.kubernetes.cri.sandbox-log-directory",
     "/OCI/Annotations/io.kubernetes.cri.sandbox-namespace",
+    # Produced by the kubernetes-controller fragment from typed controller
+    # identity, but labelled kubelet-or-containerd by the compiler's evidence.
+    "/OCI/Annotations/io.kubernetes.cri.sandbox-name",
     "/OCI/Annotations/nerdctl~1network-namespace",
     "/OCI/Linux/Devices",
     "/OCI/Linux/MaskedPaths",
@@ -474,6 +490,25 @@ PROFILE_GENERATED_KUBELET_CONTAINERD_PATHS = {
     "/OCI/Root/Readonly",
 }
 
+# runtime-rs rewrites these before the Agent sees the request, so
+# `oci_normalization_claims` in the runtime-rs profile fragment produces them.
+PROFILE_GENERATED_RUNTIME_RS_PATHS = {
+    "/OCI/Linux/Namespaces",
+    "/OCI/Process/Capabilities/Ambient",
+    "/OCI/Process/Capabilities/Bounding",
+    "/OCI/Process/Capabilities/Effective",
+    "/OCI/Process/Capabilities/Inheritable",
+    "/OCI/Process/Capabilities/Permitted",
+    "/OCI/Process/EnvRegex",
+    "/OCI/Process/Terminal",
+    "/OCI/Root/Path",
+}
+
+# kubelet supplies HOSTNAME; the runtime-rs envelope closes the pause
+# container's exec surface.
+PROFILE_GENERATED_KUBELET_RESOLUTION_PATHS = {"/OCI/Process/Env/HOSTNAME"}
+PROFILE_GENERATED_RUNTIME_ENVELOPE_PATHS = {"/exec_commands"}
+
 
 def remove_profile_generated_materializations(
     materializations: list[dict], static_ir: dict
@@ -489,7 +524,15 @@ def remove_profile_generated_materializations(
             fragment["claims"] = [
                 claim
                 for claim in fragment["claims"]
-                if claim["target"]["path"] not in resolution_paths
+                if claim["target"]["path"]
+                not in resolution_paths | PROFILE_GENERATED_KUBELET_RESOLUTION_PATHS
+            ]
+            continue
+        if fragment["category"] == "runtime-rs":
+            fragment["claims"] = [
+                claim
+                for claim in fragment["claims"]
+                if claim["target"]["path"] not in PROFILE_GENERATED_RUNTIME_RS_PATHS
             ]
             continue
         if fragment["category"] != "kubelet-or-containerd":
@@ -499,7 +542,8 @@ def remove_profile_generated_materializations(
                     for claim in fragment["claims"]
                     if not (
                         claim["target"]["path"]
-                        in {
+                        in PROFILE_GENERATED_RUNTIME_ENVELOPE_PATHS
+                        | {
                             "/devices",
                             "/request_defaults/CopyFileRequest",
                             "/runtime_anno_patterns",

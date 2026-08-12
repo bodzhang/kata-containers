@@ -1068,7 +1068,7 @@ fragment := {
     {
       "addition": {
         "cluster_config": {
-          "pause_container_image": "genpolicy.local:5000/pause:3.10"
+          "pause_container_image": ""
         }
       },
       "evidence": "compiler-settings",
@@ -1078,7 +1078,7 @@ fragment := {
         "path": "/cluster_config/pause_container_image",
         "scope": "policy"
       },
-      "value": "genpolicy.local:5000/pause:3.10"
+      "value": ""
     },
     {
       "addition": {

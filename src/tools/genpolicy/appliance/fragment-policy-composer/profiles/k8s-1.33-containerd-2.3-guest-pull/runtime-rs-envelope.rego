@@ -194,21 +194,32 @@ runtime_pattern_claims(ir) := [claim |
 	}
 ]
 
-# Other non-OCI request fields remain behind a narrow materialization contract
-# until runtime-rs envelope transformations are modeled from typed inputs.
+# The pause container is synthesized by runtime-rs and never carries probes or
+# lifecycle hooks, so its exec surface is closed rather than left absent.
+# Application subjects own this path from the workload YAML.
+exec_command_claims(ir) := [claim |
+        some subject in ir.subjects
+        subject.role == "sandbox"
+        not "/exec_commands" in subject.owned_paths
+        claim := {
+                "addition": {"exec_commands": []},
+                "category": "runtime-rs-envelope",
+                "operation": "envelope",
+                "subject": subject.id,
+                "target": {"path": "/exec_commands"},
+        }
+]
+
+# The typed IR now owns `sandbox_pidns`, so the envelope holds no
+# materialization authority.
 fragment := {
-	"applies_to": {
-		"rootfs_mode": ["guest-pull"]
-	},
-	"capture_provenance": "8b0ae298134cf114935b140f42fc2ca8a8294a674ecbeb58d4727ee2f33f00d2",
-	"category": "runtime-rs-envelope",
-	"claims": [],
-	"materialization_contracts": [
-		{
-			"operations": ["envelope"],
-			"path_regex": "^/(sandbox_pidns|exec_commands)$"
-		}
-	],
+        "applies_to": {
+                "rootfs_mode": ["guest-pull"]
+        },
+        "capture_provenance": "8b0ae298134cf114935b140f42fc2ca8a8294a674ecbeb58d4727ee2f33f00d2",
+        "category": "runtime-rs-envelope",
+        "claims": [],
+        "materialization_contracts": [],
 	"schema_version": 1,
 	"scope": "profile"
 }

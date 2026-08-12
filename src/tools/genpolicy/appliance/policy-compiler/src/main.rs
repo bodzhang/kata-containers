@@ -2249,7 +2249,9 @@ mod tests {
 
         let devices = compile_request_devices(&captured, generated, vfio_path).unwrap();
         assert_eq!(devices.len(), 2);
-        assert!(devices.iter().all(|device| device.container_path == vfio_path));
+        assert!(devices
+            .iter()
+            .all(|device| device.container_path == vfio_path));
     }
 
     #[test]
@@ -3274,11 +3276,9 @@ spec:
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../genpolicy-settings.json");
         let settings = Settings::new(settings_path.to_str().unwrap());
 
-        let policy = load_workload_policy(
-            &workload,
-            &settings.devices.vfio.nvidia.pgpu_resource_keys,
-        )
-        .unwrap();
+        let policy =
+            load_workload_policy(&workload, &settings.devices.vfio.nvidia.pgpu_resource_keys)
+                .unwrap();
         let workload = &policy.containers["workload"];
 
         assert_eq!(workload.volume_device_paths, ["/dev/workload-data"]);

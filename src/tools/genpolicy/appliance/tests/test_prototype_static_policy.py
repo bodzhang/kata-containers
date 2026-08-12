@@ -228,7 +228,11 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
                 {
                     "images": {
                         image_reference: {
-                            "config_path": "configs/config.json"
+                            "config_path": "configs/config.json",
+                            "user_database": {
+                                "group": "root:x:0:\nwheel:x:10:root\n",
+                                "passwd": "root:x:0:0:root:/root:/bin/sh\n",
+                            },
                         }
                     }
                 }
@@ -1091,7 +1095,11 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
 
             sandbox = result["subjects"][1]
             self.assertEqual(sandbox["subject"], "sandbox/default/test")
-            self.assertEqual(sandbox["constraints"], constraints)
+            # The pause container is never placed in the shared PID namespace,
+            # so the sandbox subject pins it on top of the measured baseline.
+            self.assertEqual(
+                sandbox["constraints"], {**constraints, "/sandbox_pidns": False}
+            )
             self.assertEqual(sandbox["static_artifact"], f"sha256:{'a' * 64}")
             rendered = prototype.render_static_rego_ir(result)
             rendered_ir = json.loads(rendered.split("ir := ", 1)[1])
@@ -1299,6 +1307,71 @@ class StaticPolicyPrototypeTests(unittest.TestCase):
         self.assertEqual(coverage["matched"], 1)
         self.assertEqual(coverage["changed"], 1)
         self.assertEqual(coverage["not_serialized"], 1)
+
+    def test_resolves_image_user_and_group_memberships(self):
+        database = {
+            "group": "root:x:0:\nwheel:x:10:root\napp:x:2000:app\n",
+            "passwd": "root:x:0:0:root:/root:/bin/sh\napp:x:2000:2000:app:/home/app:/bin/sh\n",
+        }
+
+        self.assertEqual(
+            prototype.container_user_intent({}, {}, {}, database),
+            {
+                "/OCI/Process/User/AdditionalGids": [0, 10],
+                "/OCI/Process/User/GID": 0,
+                "/OCI/Process/User/UID": 0,
+                "/OCI/Process/User/Username": "",
+            },
+        )
+        self.assertEqual(
+            prototype.container_user_intent({}, {}, {"User": "app"}, database),
+            {
+                "/OCI/Process/User/AdditionalGids": [2000],
+                "/OCI/Process/User/GID": 2000,
+                "/OCI/Process/User/UID": 2000,
+                "/OCI/Process/User/Username": "",
+            },
+        )
+
+    def test_run_as_user_overrides_image_user_and_memberships(self):
+        database = {
+            "group": "root:x:0:\nwheel:x:10:root\n",
+            "passwd": "root:x:0:0:root:/root:/bin/sh\n",
+        }
+        container = {"securityContext": {"runAsUser": 1000, "runAsGroup": 3000}}
+
+        self.assertEqual(
+            prototype.container_user_intent({}, container, {}, database),
+            {
+                "/OCI/Process/User/AdditionalGids": [3000],
+                "/OCI/Process/User/GID": 3000,
+                "/OCI/Process/User/UID": 1000,
+                "/OCI/Process/User/Username": "",
+            },
+        )
+
+    def test_appends_pod_supplemental_groups(self):
+        database = {
+            "group": "root:x:0:\nwheel:x:10:root\n",
+            "passwd": "root:x:0:0:root:/root:/bin/sh\n",
+        }
+        spec = {"securityContext": {"supplementalGroups": [10, 4000]}}
+
+        self.assertEqual(
+            prototype.container_user_intent(spec, {}, {}, database)[
+                "/OCI/Process/User/AdditionalGids"
+            ],
+            [0, 10, 4000],
+        )
+
+    def test_rejects_image_without_a_digest_bound_user_database(self):
+        with self.assertRaisesRegex(ValueError, "digest-bound image user"):
+            prototype.container_user_intent({}, {}, {}, {})
+
+    def test_rejects_image_user_missing_from_the_database(self):
+        database = {"group": "root:x:0:\n", "passwd": "root:x:0:0:root:/root:/bin/sh\n"}
+        with self.assertRaisesRegex(ValueError, "no /etc/passwd entry"):
+            prototype.container_user_intent({}, {}, {"User": "nobody"}, database)
 
 
 if __name__ == "__main__":

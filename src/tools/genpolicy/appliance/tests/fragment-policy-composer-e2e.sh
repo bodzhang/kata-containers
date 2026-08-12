@@ -68,22 +68,24 @@ result = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
 
 assert "BACKEND_SERVICE" not in json.dumps(static_ir)
 assert profile_fragments
-assert materializations
+# Every final-policy leaf is now produced by the typed static IR or a reviewed
+# fragment rule, so the composition carries no residual capture materializations.
+assert materializations == []
 assert all(fragment["scope"] == "profile" for fragment in profile_fragments)
-assert all(
-	fragment["scope"] == "static-base-materialization"
-	for fragment in materializations
-)
 assert {fragment["category"] for fragment in profile_fragments} == {
 	"containerd-oci",
 	"kubelet-or-containerd",
 	"kubelet-resolution",
+	"kubernetes-controller",
 	"policy-framework-settings",
 	"runtime-rs",
 	"runtime-rs-envelope",
 }
 assert sum(len(fragment["claims"]) for fragment in profile_fragments) == 56
-assert sum(len(fragment["claims"]) for fragment in materializations) == 31
+assert all(
+	fragment.get("materialization_contracts", []) == []
+	for fragment in profile_fragments
+)
 forbidden_materialization_paths = {
 	"/devices",
 	"/OCI/Linux/Devices",
@@ -109,14 +111,21 @@ kubelet_fragment = next(
 	for fragment in profile_fragments
 	if fragment["category"] == "kubelet-resolution"
 )
-assert kubelet_fragment["materialization_contracts"] == [
-	{
-		"operations": ["resolve"],
-		"paths": [
-			"/OCI/Process/Env/HOSTNAME",
-		],
-	}
-]
+# Every kubelet-resolution path is now produced by a reviewed rule, so the
+# fragment holds no materialization authority at all.
+assert kubelet_fragment.get("materialization_contracts", []) == []
+runtime_rs_fragment = next(
+	fragment
+	for fragment in profile_fragments
+	if fragment["category"] == "runtime-rs"
+)
+assert runtime_rs_fragment.get("materialization_contracts", []) == []
+envelope_fragment = next(
+	fragment
+	for fragment in profile_fragments
+	if fragment["category"] == "runtime-rs-envelope"
+)
+assert envelope_fragment.get("materialization_contracts", []) == []
 workload_subject = next(
 	subject for subject in static_ir["subjects"] if subject["id"] == "container/workload"
 )
@@ -200,8 +209,13 @@ for disposable_value in (
 	"fc661901-c6de-4946-9e2b-c5d66c6a07eb",
 	"gp-deployment-balanced-mode-chnlp",
 	"genpolicy-node",
+	# The clean-room registry the capture was taken against carries no
+	# authority, so no reusable claim may pin appliance configuration to it.
+	"genpolicy.local",
 ):
 	assert disposable_value not in serialized
+for fragment_source in (Path(sys.argv[6]).glob("*.rego")):
+	assert "genpolicy.local" not in fragment_source.read_text(encoding="utf-8")
 assert result["request_defaults"]["CreateContainerRequest"]["allow_env_regex"] == []
 application_processes = [
 	container["OCI"]["Process"]
@@ -244,6 +258,62 @@ assert all(
 	if container["OCI"].get("Annotations", {}).get(
 		"io.kubernetes.cri.container-type"
 	) == "sandbox"
+)
+# Fields that used to arrive as capture materializations now come from reviewed
+# profile rules, so they must still be present in the composed policy.
+assert all(
+	"HOSTNAME=$(sandbox-name)" in process.get("Env", [])
+	for process in application_processes
+)
+assert all(
+	container["OCI"]["Root"]["Path"] == "$(root_path)"
+	and container["OCI"]["Linux"]["Namespaces"] == [
+		{"Path": "", "Type": "ipc"},
+		{"Path": "", "Type": "uts"},
+		{"Path": "", "Type": "mount"},
+	]
+	for container in result["containers"]
+)
+# rules.rego never correlates the CRI image-name value, so the composed policy
+# binds image identity through the guest-pull digest alone.
+assert all(
+	"io.kubernetes.cri.image-name" not in container["OCI"]["Annotations"]
+	for container in result["containers"]
+)
+sandbox_container = next(
+	container
+	for container in result["containers"]
+	if container["OCI"].get("Annotations", {}).get(
+		"io.kubernetes.cri.container-type"
+	) == "sandbox"
+)
+assert sandbox_container["OCI"]["Process"]["Terminal"] is False
+assert len(sandbox_container["OCI"]["Process"]["Capabilities"]["Bounding"]) == 14
+assert sandbox_container["OCI"]["Process"]["Capabilities"]["Ambient"] == []
+assert sandbox_container["exec_commands"] == []
+
+# The sandbox-name annotation is derived from the Deployment's typed identity,
+# so every subject carries the controller-generated Pod name grammar.
+suffix = "[bcdfghjklmnpqrstvwxz2456789]+"
+assert all(
+	container["OCI"]["Annotations"]["io.kubernetes.cri.sandbox-name"]
+	== f"^balanced-mode-{suffix}-{suffix}$"
+	for container in result["containers"]
+)
+
+# The application user is resolved from the image's digest-bound /etc/passwd and
+# /etc/group rather than copied from what the host happened to run as.
+application_containers = [
+	container
+	for container in result["containers"]
+	if container["OCI"]["Annotations"]["io.katacontainers.pkg.oci.container_type"]
+	!= "pod_sandbox"
+]
+assert len(application_containers) == 2
+assert all(
+	container["OCI"]["Process"]["User"]
+	== {"AdditionalGids": [0, 10], "GID": 0, "UID": 0, "Username": ""}
+	for container in application_containers
 )
 
 policy = Path(sys.argv[4]).read_text(encoding="utf-8")

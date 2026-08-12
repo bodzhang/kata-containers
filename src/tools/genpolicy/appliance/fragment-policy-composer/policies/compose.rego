@@ -8,13 +8,19 @@ selected_fragments := array.concat(
 )
 
 profile_generated_claims(ir) := array.concat(
-	data.profile_kubelet_or_containerd.generated_claims(ir),
+	array.concat(
+		data.profile_kubelet_or_containerd.generated_claims(ir),
+		data.profile_kubernetes_controller.sandbox_name_claims(ir),
+	),
 	array.concat(
 		data.profile_kubelet_resolution.service_link_claims(ir),
 		array.concat(
 			array.concat(
-				data.profile_runtime_rs.volume_mount_claims(ir),
-				data.profile_runtime_rs.device_claims(ir),
+				array.concat(
+					data.profile_runtime_rs.volume_mount_claims(ir),
+					data.profile_runtime_rs.device_claims(ir),
+				),
+				data.profile_runtime_rs.oci_normalization_claims(ir),
 			),
 			array.concat(
 				array.concat(
@@ -22,8 +28,11 @@ profile_generated_claims(ir) := array.concat(
 					data.profile_runtime_rs_envelope.copy_file_claims(ir),
 				),
 				array.concat(
-					data.profile_runtime_rs_envelope.device_claims(ir),
-					data.profile_runtime_rs_envelope.runtime_pattern_claims(ir),
+					array.concat(
+						data.profile_runtime_rs_envelope.device_claims(ir),
+						data.profile_runtime_rs_envelope.runtime_pattern_claims(ir),
+					),
+					data.profile_runtime_rs_envelope.exec_command_claims(ir),
 				),
 			),
 		),
@@ -48,6 +57,20 @@ materialization_contract_valid(profile_fragments, fragment, claim) if {
 	some contract in object.get(profile_fragment, "materialization_contracts", [])
 	claim.operation in contract.operations
 	contract_path_valid(contract, claim.target.path)
+}
+
+# A fragment must carry authority rather than sit inert: literal claims, a
+# materialization contract, or -- for a profile fragment whose whole surface is
+# produced by reviewed rules -- claims emitted through profile_generated_claims.
+fragment_contributes(fragment, _) if count(object.get(fragment, "claims", [])) > 0
+
+fragment_contributes(fragment, _) if {
+	count(object.get(fragment, "materialization_contracts", [])) > 0
+}
+
+fragment_contributes(fragment, generated_categories) if {
+	fragment.scope == "profile"
+	fragment.category in generated_categories
 }
 
 category_claim_valid("policy-framework-settings", claim) if {
@@ -290,12 +313,12 @@ final_policy := result if {
 	fragments := selected_fragments
 	count(fragments) > 0
 	count(missing_required_categories(ir, profile_fragments)) == 0
+	generated := profile_generated_claims(ir)
+	generated_categories := {claim.category | some claim in generated}
 	every fragment in fragments {
 		fragment_binding_valid(ir, fragment)
 		is_string(fragment.category)
-		claims := object.get(fragment, "claims", [])
-		contracts := object.get(fragment, "materialization_contracts", [])
-		count(claims) + count(contracts) > 0
+		fragment_contributes(fragment, generated_categories)
 		every claim in fragment.claims {
 			claim_shape_valid(claim)
 			target_valid(ir, claim.target)
@@ -307,7 +330,6 @@ final_policy := result if {
 			materialization_contract_valid(profile_fragments, fragment, claim)
 		}
 	}
-	generated := profile_generated_claims(ir)
 	every claim in generated {
 		claim_shape_valid(claim)
 		category_claim_valid(claim.category, claim)

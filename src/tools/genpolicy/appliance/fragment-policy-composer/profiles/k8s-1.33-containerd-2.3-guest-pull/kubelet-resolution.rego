@@ -105,18 +105,35 @@ environment_resolution_claims(ir) := [claim |
   }
 ]
 
-# Combines declared fieldRef values, regex-valued Service variables, and exact
-# named-port variables into the complete kubelet-resolution mutation stream.
+# kubelet sets HOSTNAME to the generated Pod name unless the Pod declares
+# spec.hostname, which the typed IR does not model yet and would have to own.
+hostname_claims(ir) := [claim |
+  some subject in ir.subjects
+  subject.role == "application"
+  not "/OCI/Process/Env/HOSTNAME" in subject.owned_paths
+  claim := {
+    "addition": {"OCI": {"Process": {"Env": {"HOSTNAME": "$(sandbox-name)"}}}},
+    "category": "kubelet-resolution",
+    "operation": "resolve",
+    "subject": subject.id,
+    "target": {"path": "/OCI/Process/Env/HOSTNAME"},
+  }
+]
+
+# Combines declared fieldRef values, regex-valued Service variables, exact
+# named-port variables, and the kubelet hostname default into the complete
+# kubelet-resolution mutation stream.
 service_link_claims(ir) := array.concat(
   environment_resolution_claims(ir),
   array.concat(
     service_env_regex_claims(ir),
-    named_service_port_claims(ir),
+    array.concat(
+      named_service_port_claims(ir),
+      hostname_claims(ir),
+    ),
   ),
 )
 
-# HOSTNAME is a kubelet default rather than a workload valueFrom declaration.
-# It remains an explicit typed-IR gap until hostname policy is modeled.
 fragment := {
   "applies_to": {
     "kubernetes": ["v1.33.13"]
@@ -124,14 +141,7 @@ fragment := {
   "capture_provenance": "8b0ae298134cf114935b140f42fc2ca8a8294a674ecbeb58d4727ee2f33f00d2",
   "category": "kubelet-resolution",
   "claims": [],
-  "materialization_contracts": [
-    {
-      "operations": ["resolve"],
-      "paths": [
-        "/OCI/Process/Env/HOSTNAME"
-      ]
-    }
-  ],
+  "materialization_contracts": [],
   "schema_version": 1,
   "scope": "profile"
 }

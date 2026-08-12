@@ -66,6 +66,8 @@ and
   mismatch.
 - Derive candidate fragments from capture evidence, then require review and
   negative tests before publication.
+- Reduce static-base materialization to zero for every supported workload, so
+  the composed policy is produced by static IR and accepted fragments alone.
 
 ## Non-goals
 
@@ -113,6 +115,12 @@ Claim
 :   A JSON-pointer path or typed collection role that a fragment exclusively
     owns and must validate.
 
+Static-base materialization
+:   A transitional claim set pinned to one static base, holding final-policy
+  leaves that neither static IR nor an accepted fragment can yet produce. It is
+  gap residue, not a composition layer, and a supported workload must reach
+  zero of them.
+
 ## Additive Composition Model
 
 The composition operation is purely additive. GenPolicy first emits a static
@@ -138,6 +146,15 @@ assigned by the disposable capture cluster, such as ClusterIPs, Pod UIDs,
 generated Pod names, node names, and runtime IDs, must not become exact policy
 literals for a production cluster.
 
+The same rule covers the capture appliance's own infrastructure configuration,
+not only its per-run generated values. Registry hostnames and ports, image tags
+resolved from that registry, the configured pause image reference, node and
+cluster names, and CNI or DNS addressing are properties of the capture rig. A
+production cluster running the identical workload and the identical component
+profile will present different values. Where such a value reaches an
+Agent-visible field, policy must constrain the part that carries authority and
+match the deployment-assigned remainder with an anchored regular expression.
+
 ```mermaid
 flowchart LR
     YAML[Workload YAML and image data] --> IR[Static policy IR]
@@ -158,6 +175,28 @@ where $S$ is the static IR and each $M_i$ is a set of additions at previously
 absent paths. The operator $\oplus$ is defined only when all target subjects
 exist, all target paths are absent, and no two fragments claim the same target.
 Composition fails otherwise.
+
+!!! warning "Materialization measures a gap; it is not a design layer"
+    In a completed profile every $M_i$ is produced by an accepted fragment, so
+    the composed policy is determined by static IR and fragments alone. Every
+    remaining static-base materialization claim names a final-policy leaf that
+    neither the typed IR nor a reviewed fragment can yet produce, so it is a
+    defect record against one of those two designs: a missing typed static
+    input, or a missing reviewed role rule, value template, or bind-once
+    correlation.
+
+    The target is therefore zero materialization claims for every supported
+    workload. A nonzero count means the workload is not yet supported, and the
+    outstanding claims identify exactly which IR field or fragment rule is
+    missing. Reaching zero is the completion criterion for the design, not an
+    optimization.
+
+    Capture-derived reconstruction is a test harness, not a policy-production
+    path. Diffing a captured final policy against static IR plus fragments
+    answers one question: does the current design already cover this workload,
+    and if not, what is left over? Composing a shippable policy from that
+    residue would reintroduce the untrusted platform as an authority, which is
+    exactly what the fragment design removes.
 
 This is simpler than applying general JSON Patch or allowing arbitrary Rego to
 construct policy data. In particular:
@@ -364,9 +403,67 @@ either generated policy:
   sources, never captured values.
 
 It rejects image references that are not manifest-digest bound. It does not yet
-classify user and group resolution, capability deltas other than explicit final
-sets, mounted PVC or CSI transports, or host block and character devices. The
-UVM-static pause subject requires a separate measured-UVM baseline.
+classify capability deltas other than explicit final sets, mounted PVC or CSI
+transports, or host block and character devices. The UVM-static pause subject
+requires a separate measured-UVM baseline.
+
+#### Static process user IR
+
+The process user is the one static constraint that cannot be read out of the
+workload YAML and the image config alone. An image `User` field names an
+account, not a UID, and the supplementary groups a container receives depend on
+the `/etc/group` memberships of that account. The prototype therefore captures
+`/etc/passwd` and `/etc/group` out of the image's verified layer stack, replayed
+in order with plain and opaque whiteout handling, and resolves the four
+`/OCI/Process/User` leaves from that database. Because the layers are the same
+ones the capture verified against the config diff-ids, the resolved UID, GID,
+and supplementary groups are bound to the manifest digest that already pins the
+rootfs, rather than to whatever the host resolved at admission time.
+
+Resolution order is image `User`, then `runAsUser`, then `runAsGroup`, then
+appended pod `supplementalGroups`. Memberships follow the account name that the
+effective UID resolves to, listed primary GID first and then `/etc/group` file
+order.
+
+!!! warning "This models one runtime's algorithm, not a specification"
+    None of the ordering above is normative. The OCI runtime specification
+    defines the `user` object but not how an image `User` string becomes one, so
+    the rules encoded here are read off containerd's `oci.WithUser` and the
+    kubelet's group handling at the versions in the profile matrix. A different
+    container runtime, or a future containerd release that changes membership
+    lookup or `AdditionalGids` ordering, would make the constraint wrong.
+
+    The failure is closed rather than permissive: these are exact equality
+    constraints, so a divergent runtime produces a request the policy denies,
+    never a request the policy wrongly admits. The operational risk is that a
+    version skew looks like an unexplained container-start denial, and the
+    tempting fix is to loosen the constraint instead of correcting the model.
+
+    The layering is also inconsistent with the rest of this design. Every other
+    host-runtime behavior lives in a version-scoped profile fragment whose
+    `applies_to` matrix states which containerd and Kubernetes releases it was
+    reviewed against. User resolution instead sits in the version-independent
+    static IR, so nothing gates it on the runtime version, and the differential
+    capture matrix does not currently cover it. Treat the current placement as
+    a prototype convenience: either the resolution moves into the
+    `containerd-oci` fragment as a derive rule over a typed database input, or
+    the static IR grows an explicit runtime-version input of its own.
+
+Further limitations of the current implementation:
+
+- Only `/etc/passwd` and `/etc/group` are consulted. Name service switch
+  configuration and any directory-backed identity source are ignored, so an
+  image that resolves users through them yields a database the prototype treats
+  as authoritative when it is not.
+- A database file that is a symbolic link, hard link, or device node leaves the
+  entry absent, and a missing database fails generation rather than defaulting.
+- A numeric image user with no `/etc/passwd` entry resolves to GID `0` with no
+  memberships, matching the runtime but recording no account identity.
+- `runAsGroup` overrides the primary GID while memberships still come from the
+  account the UID resolved to.
+- `fsGroup`, `SupplementalGroupsPolicy`, and `runAsNonRoot` are not modeled.
+  The first two would change the resulting GID list, and the third is an
+  admission-time check rather than an OCI field.
 
 #### Static `envFrom` IR
 
@@ -1260,13 +1357,18 @@ flowchart LR
     YAML[Workload YAML and image metadata] --> GEN[Static IR generator]
     GEN --> S[static-ir.rego]
     PF[Reusable profile fragments] --> R[Regorus]
-    MF[Static-base materialization] --> R
+    MF["Static-base materialization<br/>(transitional gap residue)"] -.-> R
     S --> R
     C[compose.rego] --> R
     R --> D[Canonical policy_data JSON]
   D --> CHECK[Legacy compatibility check]
   L[Legacy rules.rego] --> CHECK
 ```
+
+`MF` is drawn as a dashed edge because it is not part of the target design. A
+completed profile composes from `S` and `PF` alone; `MF` exists only while the
+typed IR or the reviewed fragments cannot yet produce some final-policy leaf,
+and each claim it carries is a work item against one of them.
 
 This prototype proves additive policy-data lowering. The production design
 packages the version-independent evaluator with the composed `policy_data` as
@@ -1448,14 +1550,26 @@ The end-to-end test uses the checked-in `run-complex` YAML, BusyBox image
 configuration, ConfigMap, Secret, Service, measured pause baseline, source
 provenance, policy-compiler output, tagged requests, and dynamic-tag manifest.
 The independent static generator produces the sparse base. Regorus loads the
-six checked-in profile modules and separately generated exact-subject
-materializations. The profile contributes `39` exact reusable claims and
-leaves `42` generated workload-bound claims. The reviewed
-`kubelet-or-containerd` transformation generates `44` exact-subject claims from
-typed static IR and profile constants, leaving `13` claims on six declared gap
-paths for this fixture. Runtime Rego generates three exact mount claims and
+seven checked-in profile modules and no capture materializations at all: for
+this fixture every final-policy leaf is produced by the typed static IR or a
+reviewed fragment rule. The profile contributes `56` exact reusable claims. The
+reviewed `kubelet-or-containerd` transformation generates `44` exact-subject
+claims from typed static IR and profile constants and holds no materialization
+authority. Runtime Rego generates three exact mount claims and
 three empty storage arrays; the same rules generate non-empty storage and mount
-arrays when typed `emptyDir` intents are present. Kubelet Rego additionally
+arrays when typed `emptyDir` intents are present. The reviewed `runtime-rs`
+normalization rules additionally generate the guest namespace set, the guest
+rootfs path, and the synthesized pause process shape, so `runtime-rs` now holds
+no materialization authority at all. The reviewed `kubernetes-controller` rules
+derive the sandbox-name annotation from the kind and name of the workload
+object, so the Pod name grammar is a function of typed controller identity
+rather than a host observation the policy copies. The static generator resolves
+the process user from the image's `/etc/passwd` and `/etc/group`, replayed out
+of the layer stack the capture verified against the config diff-ids, so the UID,
+GID, and supplementary groups are bound to the same manifest digest that pins
+the rootfs. That resolution encodes one container runtime's algorithm and is
+subject to the limits recorded under the static process user IR. Kubelet Rego
+additionally
 generates six exact-subject Service-link claims for the two application
 containers directly from trusted Service IR and profile-owned Kubernetes API
 Service intent. For comparison only, the candidate renderer applies the current
@@ -1469,12 +1583,19 @@ module parses in Regorus.
 !!! warning "Reviewed structure, not a signed production profile"
     Exact reconstruction is proved for `run-complex`, and reusable claims are
     now checked in rather than generated during the e2e. They remain PoC review
-    candidates derived from controlled policy/capture evidence. The `42`
-    remaining static-base materialization declarations include workload and cluster
-    constraints and are intentionally not reusable fragments. Signing still
-    requires security review, independent profile provenance, complete
-    CRI-boundary ownership, runtime-validator coverage, and measured profile
-    binding for every claim and contract.
+    candidates derived from controlled policy/capture evidence. No static-base
+    materialization declarations remain for this fixture, so no final-policy
+    leaf is copied from a host capture, but that is a property of one workload
+    shape rather than of the profile in general. The checked-in capture also
+    predates two committed compiler changes, which dropped the CRI image-name
+    annotation and cleared `pause_container_image`; the harness normalizes both
+    fields out of the reconstruction target so that the target describes the
+    current compiler rather than an obsolete one. The derived Pod name grammar
+    is also looser than the controllers can produce, because it mirrors the
+    unbounded quantifier the generator emits today. Signing still requires
+    security review, independent profile provenance, complete CRI-boundary
+    ownership, runtime-validator coverage, and measured profile binding for
+    every claim and contract.
 
 ### Runtime binding prototype
 
@@ -1592,11 +1713,19 @@ generation without changing either policy implementation.
 
 ### Complete candidate reconstruction
 
-`prototype_fragment_coverage.py` builds sparse subjects only from the
-independent static IR, derives a materialization claim for every remaining
-final policy-data leaf, and invokes the compositor with the compiler policy as
-an oracle. The expected policy supplies no static value. Environment entries
-are keyed by name in the composition IR and materialized back to OCI arrays.
+`prototype_fragment_coverage.py` is a coverage harness, not a policy generator.
+It builds sparse subjects only from the independent static IR, derives a
+materialization claim for every remaining final policy-data leaf, and invokes
+the compositor with the compiler policy as an oracle. The expected policy
+supplies no static value. Environment entries are keyed by name in the
+composition IR and materialized back to OCI arrays.
+
+Reconstruction succeeding only means the harness accounted for every leaf. The
+measurement that matters is how many leaves the typed IR and reviewed fragments
+produced on their own, and therefore how many claims were left as residue. Its
+output must not be shipped as policy: the residue is derived from a captured
+final policy, so composing from it would let the untrusted platform define the
+constraints that policy enforces.
 
 Both checked profiles reconstruct canonically:
 
@@ -1622,7 +1751,9 @@ all application containers and excludes the sandbox. The generator emits this
 role claim only when every application container has the same canonical regex
 set, operation, and evidence; otherwise it retains exact per-container claims.
 In total, `98` claims prove exact materialization for this static base but are
-not reusable fragments.
+not reusable fragments. That count is the current distance from the goal: each
+claim is a leaf awaiting a typed IR input or a reviewed fragment rule, and the
+section below classifies why each one cannot be promoted yet.
 
 ### Repeated claim fan-out
 
@@ -1774,7 +1905,7 @@ not mean the candidate set is complete or reusable.
 | `coverage` | Reconstruction counts, ownership status, portability counts, limitations, and fan-out analysis. |
 | `fragments` | Profile-only candidate fragments. Exact workload subjects are forbidden in this array. |
 | `ledger` | Flattened ownership record for every static, fragment, and materialization claim. |
-| `materialization_sets` | Reconstruction-only claims that depend on exact workload subjects or workload-derived values. |
+| `materialization_sets` | Outstanding gap residue: claims the typed IR and reviewed fragments could not produce, pinned to one static base. Empty is the target. |
 | `request_absence_coverage` | Coverage of fields observed to be removed before the final Agent request. |
 | `static_policy` | Sparse independently generated policy used as the composition base. |
 
@@ -2353,6 +2484,9 @@ policy-compiler output.
   provenance?
 - Which admission, CSI, and device-plugin behaviors are stable enough to become
   reviewed fragments?
+- Should image user and group resolution stay in the version-independent static
+  IR, or move into a version-scoped fragment that states which container
+  runtime's algorithm it encodes?
 
 ## Decision Summary
 

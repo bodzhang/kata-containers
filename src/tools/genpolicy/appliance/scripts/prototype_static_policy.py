@@ -85,6 +85,13 @@ def service_account_intent(spec: dict) -> dict:
     return {"automount_token": False, "name": name}
 
 
+def share_process_namespace_intent(spec: dict) -> bool:
+    shared = spec.get("shareProcessNamespace", False)
+    if not isinstance(shared, bool):
+        raise ValueError("shareProcessNamespace must be a boolean")
+    return shared
+
+
 def trusted_objects(documents: list[dict]) -> tuple[dict[str, dict], dict[str, dict]]:
     config_maps = {}
     secrets = {}
@@ -220,6 +227,143 @@ def image_manifest_digest(reference: str) -> str:
     if not separator or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
         raise ValueError(f"static image is not digest-bound to a sha256 manifest: {reference}")
     return digest
+
+
+def image_user_databases(capture: Path) -> dict[str, dict[str, str]]:
+    """Return the per-image user and group database recorded by the capture.
+
+    The database is bound to the same manifest digest that pins the rootfs, so
+    the UID a container runs as is decided by the measured image rather than by
+    whatever the host resolved at admission time.
+    """
+    images_dir = capture / "images"
+    index = json.loads((images_dir / "index.json").read_text(encoding="utf-8"))
+    return {
+        reference: descriptor.get("user_database") or {}
+        for reference, descriptor in index["images"].items()
+    }
+
+
+def parse_passwd_database(content: str) -> list[dict]:
+    accounts = []
+    for line in content.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        fields = line.split(":")
+        if len(fields) < 4:
+            raise ValueError("image /etc/passwd entry has too few fields")
+        accounts.append(
+            {"name": fields[0], "uid": int(fields[2]), "gid": int(fields[3])}
+        )
+    return accounts
+
+
+def parse_group_database(content: str) -> list[dict]:
+    groups = []
+    for line in content.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        fields = line.split(":")
+        if len(fields) < 3:
+            raise ValueError("image /etc/group entry has too few fields")
+        members = fields[3] if len(fields) > 3 else ""
+        groups.append(
+            {
+                "name": fields[0],
+                "gid": int(fields[2]),
+                "members": [member for member in members.split(",") if member],
+            }
+        )
+    return groups
+
+
+def image_user_identity(image_user: str, accounts: list[dict], groups: list[dict]):
+    """Resolve the image config User field to a UID, GID, and account name.
+
+    Mirrors containerd's oci.WithUser: an empty field means uid 0, a numeric
+    field selects by UID, and anything else selects by account name. The
+    optional group half overrides the account's primary GID.
+    """
+    user_part, separator, group_part = image_user.partition(":")
+    if user_part == "":
+        selected = [account for account in accounts if account["uid"] == 0]
+    elif user_part.isdigit():
+        selected = [account for account in accounts if account["uid"] == int(user_part)]
+    else:
+        selected = [account for account in accounts if account["name"] == user_part]
+    if len(selected) > 1:
+        raise ValueError(f"image user is ambiguous in /etc/passwd: {image_user!r}")
+    if not selected:
+        if user_part.isdigit():
+            # An unmatched numeric user carries no account name, so it inherits
+            # no group memberships.
+            return int(user_part), 0, ""
+        raise ValueError(f"image user has no /etc/passwd entry: {image_user!r}")
+    account = selected[0]
+    gid = account["gid"]
+    if separator:
+        if group_part.isdigit():
+            gid = int(group_part)
+        else:
+            matches = [group for group in groups if group["name"] == group_part]
+            if len(matches) != 1:
+                raise ValueError(f"image group has no /etc/group entry: {image_user!r}")
+            gid = matches[0]["gid"]
+    return account["uid"], gid, account["name"]
+
+
+def container_user_intent(spec: dict, container: dict, image: dict, database: dict) -> dict:
+    """Derive the OCI process user from the image database and typed intent."""
+    if not isinstance(database, dict) or "passwd" not in database or "group" not in database:
+        raise ValueError(
+            "capture has no digest-bound image user and group database for this image"
+        )
+    accounts = parse_passwd_database(database["passwd"])
+    groups = parse_group_database(database["group"])
+
+    image_user = image.get("User") or ""
+    if not isinstance(image_user, str):
+        raise ValueError("image config User must be a string")
+    uid, gid, account_name = image_user_identity(image_user, accounts, groups)
+
+    pod_security = spec.get("securityContext") or {}
+    container_security = container.get("securityContext") or {}
+    run_as_user = container_security.get("runAsUser", pod_security.get("runAsUser"))
+    if run_as_user is not None:
+        if not isinstance(run_as_user, int) or isinstance(run_as_user, bool):
+            raise ValueError("runAsUser must be an integer")
+        uid = run_as_user
+        # Group membership follows the account the numeric UID resolves to.
+        matches = [account for account in accounts if account["uid"] == uid]
+        if len(matches) > 1:
+            raise ValueError(f"runAsUser {uid} is ambiguous in /etc/passwd")
+        account_name = matches[0]["name"] if matches else ""
+        gid = matches[0]["gid"] if matches else 0
+    run_as_group = container_security.get("runAsGroup", pod_security.get("runAsGroup"))
+    if run_as_group is not None:
+        if not isinstance(run_as_group, int) or isinstance(run_as_group, bool):
+            raise ValueError("runAsGroup must be an integer")
+        gid = run_as_group
+
+    # containerd lists the primary GID first, then the memberships it finds in
+    # /etc/group in file order, and the kubelet appends supplementalGroups.
+    additional_gids = [gid]
+    for group in groups:
+        if account_name and account_name in group["members"]:
+            additional_gids.append(group["gid"])
+    for supplemental in pod_security.get("supplementalGroups") or []:
+        if not isinstance(supplemental, int) or isinstance(supplemental, bool):
+            raise ValueError("supplementalGroups entries must be integers")
+        additional_gids.append(supplemental)
+    deduplicated = list(dict.fromkeys(additional_gids))
+
+    return {
+        "/OCI/Process/User/AdditionalGids": deduplicated,
+        "/OCI/Process/User/GID": gid,
+        "/OCI/Process/User/UID": uid,
+        # Username is a Windows-only field of the OCI process user.
+        "/OCI/Process/User/Username": "",
+    }
 
 
 def normalized_capabilities(security_context: dict) -> dict[str, list[str]]:
@@ -825,6 +969,7 @@ def generate_static_ir(
     config_maps, secrets = trusted_objects(documents)
     services = trusted_services(documents)
     images = image_configs(capture)
+    user_databases = image_user_databases(capture)
     profile = capture_profile(capture / "profile.json")
     artifacts, artifact_manifest_digest = rootfs_artifacts(rootfs_artifacts_path)
     uvm_baseline = (
@@ -837,6 +982,7 @@ def generate_static_ir(
             continue
         spec, namespace, workload_name = resolved
         service_account = service_account_intent(spec)
+        share_process_namespace = share_process_namespace_intent(spec)
         containers = [
             container
             for field in ("initContainers", "containers", "ephemeralContainers")
@@ -861,6 +1007,10 @@ def generate_static_ir(
                 "/OCI/Process/Args": process_args(container, image),
                 "/OCI/Process/Env": environment,
                 "/exec_commands": exec_commands(container),
+                "/sandbox_pidns": share_process_namespace,
+                **container_user_intent(
+                    spec, container, image, user_databases.get(image_reference, {})
+                ),
             }
             working_directory = container.get("workingDir") or image.get("WorkingDir")
             if working_directory:
@@ -905,7 +1055,12 @@ def generate_static_ir(
         if uvm_baseline is not None:
             subjects.append(
                 {
-                    "constraints": uvm_baseline["constraints"],
+                    # The pause container is never placed in the shared PID
+                    # namespace, whatever the Pod declares.
+                    "constraints": {
+                        **copy.deepcopy(uvm_baseline["constraints"]),
+                        "/sandbox_pidns": False,
+                    },
                     "namespace": namespace,
                     "static_artifact": uvm_baseline["artifact_digest"],
                     "subject": f"sandbox/{namespace}/{workload_name}",

@@ -3,8 +3,11 @@
 import argparse
 import gzip
 import hashlib
+import io
 import json
+import posixpath
 import subprocess
+import tarfile
 from pathlib import Path
 from typing import Callable
 
@@ -17,6 +20,11 @@ MANIFEST_MEDIA_TYPES = {
     "application/vnd.docker.distribution.manifest.v2+json",
     "application/vnd.oci.image.manifest.v1+json",
 }
+# The files that decide which UID, GID, and supplementary groups a container
+# process runs as. They are read out of the layer stack, after every layer has
+# been checked against the config diff-ids, so the database is bound to the same
+# manifest digest that pins the rootfs rather than chosen by the host.
+USER_DATABASE_FILES = {"etc/group": "group", "etc/passwd": "passwd"}
 
 
 class ImageMetadataError(ValueError):
@@ -102,6 +110,56 @@ def content_kind(value: dict) -> str | None:
     return None
 
 
+def overlay_user_database(layer_contents: list[bytes]) -> dict[str, str]:
+    """Replay the layer stack for the files that define container user identity.
+
+    Layers are applied in order, later layers win, and both plain and opaque
+    whiteouts remove earlier content. Anything that is not a regular file where
+    the database is expected -- a symlink, a hardlink, a device node -- leaves
+    the entry absent rather than guessed, so resolution fails closed.
+    """
+    database: dict[str, str] = {}
+    for raw in layer_contents:
+        try:
+            archive = tarfile.open(fileobj=io.BytesIO(raw), mode="r:")
+        except tarfile.TarError as error:
+            raise ImageMetadataError("layer is not a readable tar archive") from error
+        with archive:
+            for member in archive:
+                normalized = posixpath.normpath(member.name)
+                if normalized.startswith("/") or normalized.startswith(".."):
+                    raise ImageMetadataError(f"layer escapes the rootfs: {member.name}")
+                directory, _, base = normalized.rpartition("/")
+                if base == ".wh..wh..opq":
+                    for path in list(database):
+                        if posixpath.dirname(path) == directory:
+                            del database[path]
+                    continue
+                if base.startswith(".wh."):
+                    removed = posixpath.join(directory, base[len(".wh.") :])
+                    database.pop(removed, None)
+                    continue
+                if normalized not in USER_DATABASE_FILES:
+                    continue
+                if not member.isfile():
+                    database.pop(normalized, None)
+                    continue
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    database.pop(normalized, None)
+                    continue
+                try:
+                    content = extracted.read().decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise ImageMetadataError(
+                        f"{normalized} is not valid UTF-8 text"
+                    ) from error
+                database[normalized] = content
+    return {
+        key: database[path] for path, key in USER_DATABASE_FILES.items() if path in database
+    }
+
+
 def export_image_metadata(
     references: list[str],
     output: Path,
@@ -161,16 +219,19 @@ def export_image_metadata(
                 f"manifest layer count does not match config diff_ids for {reference}"
             )
         layers = []
+        layer_contents = []
         for descriptor, diff_id in zip(layer_descriptors, diff_ids, strict=True):
             layer_digest = descriptor.get("digest", "")
             media_type = descriptor.get("mediaType", "")
             layer_raw = read_content(layer_digest)
             verify_content(layer_raw, layer_digest, descriptor.get("size"))
-            actual_diff_id = digest_bytes(uncompressed_layer(layer_raw, media_type))
+            uncompressed = uncompressed_layer(layer_raw, media_type)
+            actual_diff_id = digest_bytes(uncompressed)
             if actual_diff_id != diff_id:
                 raise ImageMetadataError(
                     f"layer diff-id mismatch: expected {diff_id}, got {actual_diff_id}"
                 )
+            layer_contents.append(uncompressed)
             layer_path = digest_path(layers_dir, layer_digest, ".blob")
             layer_path.write_bytes(layer_raw)
             layers.append(
@@ -199,6 +260,7 @@ def export_image_metadata(
             "requested_digest": requested_digest,
             "requested_media_type": top_media_type,
             "requested_path": requested_path.relative_to(output).as_posix(),
+            "user_database": overlay_user_database(layer_contents),
         }
 
     (output / "index.json").write_text(

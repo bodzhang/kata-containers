@@ -1,7 +1,9 @@
 import gzip
 import hashlib
 import importlib.util
+import io
 import json
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +22,16 @@ def encoded(value: dict) -> bytes:
 
 def digest(value: bytes) -> str:
     return f"sha256:{hashlib.sha256(value).hexdigest()}"
+
+
+def tar_layer(entries: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name, content in entries.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
 
 
 class CaptureImageMetadataTests(unittest.TestCase):
@@ -125,7 +137,12 @@ class CaptureImageMetadataTests(unittest.TestCase):
             )
 
     def test_verifies_and_exports_layer_blob_and_diff_id(self):
-        layer_tar = b"trusted layer tar bytes"
+        layer_tar = tar_layer(
+            {
+                "etc/passwd": b"root:x:0:0:root:/root:/bin/sh\n",
+                "etc/group": b"root:x:0:\nwheel:x:10:root\n",
+            }
+        )
         layer_blob = gzip.compress(layer_tar, mtime=0)
         layer_digest = digest(layer_blob)
         diff_id = digest(layer_tar)
@@ -177,6 +194,13 @@ class CaptureImageMetadataTests(unittest.TestCase):
         self.assertEqual(layer["digest"], layer_digest)
         self.assertEqual(layer["diff_id"], diff_id)
         self.assertEqual((self.output / layer["path"]).read_bytes(), layer_blob)
+        self.assertEqual(
+            result[f"registry/image@{manifest_digest}"]["user_database"],
+            {
+                "group": "root:x:0:\nwheel:x:10:root\n",
+                "passwd": "root:x:0:0:root:/root:/bin/sh\n",
+            },
+        )
 
     def test_rejects_layer_diff_id_mismatch(self):
         layer_tar = b"layer"

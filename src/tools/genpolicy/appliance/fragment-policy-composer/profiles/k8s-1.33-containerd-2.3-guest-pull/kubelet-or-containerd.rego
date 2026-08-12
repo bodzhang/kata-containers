@@ -258,8 +258,8 @@ generated_claims(ir) := array.concat(annotation_claims(ir), array.concat(
   ),
 ))
 
-# Materialization contracts retain only transformations whose typed inputs are
-# not implemented yet: image identity, generated Pod name, mounts, and user IDs.
+# Every OCI field this fragment covers is now produced by a reviewed rule above
+# or owned by the typed static IR, so it holds no materialization authority.
 fragment := {
   "applies_to": {
     "containerd": ["v2.3.3"],
@@ -268,35 +268,7 @@ fragment := {
   "capture_provenance": "8b0ae298134cf114935b140f42fc2ca8a8294a674ecbeb58d4727ee2f33f00d2",
   "category": "kubelet-or-containerd",
   "claims": [],
-  "materialization_contracts": [
-    {
-      "input": "canonical-cri-image-reference",
-      "operations": ["default"],
-      "paths": [
-        "/OCI/Annotations/io.kubernetes.cri.image-name"
-      ],
-      "status": "requires-typed-static-ir"
-    },
-    {
-      "input": "controller-generated-pod-name",
-      "operations": ["default"],
-      "paths": [
-        "/OCI/Annotations/io.kubernetes.cri.sandbox-name"
-      ],
-      "status": "requires-typed-static-ir"
-    },
-    {
-      "input": "digest-bound-image-user-and-group-database",
-      "operations": ["default"],
-      "paths": [
-        "/OCI/Process/User/AdditionalGids",
-        "/OCI/Process/User/GID",
-        "/OCI/Process/User/UID",
-        "/OCI/Process/User/Username"
-      ],
-      "status": "requires-typed-static-ir"
-    }
-  ],
+  "materialization_contracts": [],
   "schema_version": 1,
   "scope": "profile"
 }

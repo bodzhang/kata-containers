@@ -218,15 +218,22 @@ mod tests {
         "package profile_kubelet_resolution\n\nservice_link_claims(_ir) := []\n";
     const GENERATED_KUBELET_CONTAINERD_PROFILE: &str =
         "package profile_kubelet_or_containerd\n\ngenerated_claims(_ir) := []\n";
+    const GENERATED_KUBERNETES_CONTROLLER_PROFILE: &str =
+        "package profile_kubernetes_controller\n\nsandbox_name_claims(_ir) := []\n";
     const GENERATED_RUNTIME_ENVELOPE_PROFILE: &str = "package profile_runtime_rs_envelope
 
 volume_storage_claims(_ir) := []
 copy_file_claims(_ir) := []
 device_claims(_ir) := []
 runtime_pattern_claims(_ir) := []
+exec_command_claims(_ir) := []
 ";
-    const GENERATED_RUNTIME_RS_PROFILE: &str =
-        "package profile_runtime_rs\n\nvolume_mount_claims(_ir) := []\ndevice_claims(_ir) := []\n";
+    const GENERATED_RUNTIME_RS_PROFILE: &str = "package profile_runtime_rs
+
+volume_mount_claims(_ir) := []
+device_claims(_ir) := []
+oci_normalization_claims(_ir) := []
+";
     const RUNTIME_ENVELOPE_PROFILE: &str =
         include_str!("../profiles/k8s-1.33-containerd-2.3-guest-pull/runtime-rs-envelope.rego");
     const RUNTIME_RS_PROFILE: &str =
@@ -247,6 +254,10 @@ runtime_pattern_claims(_ir) := []
             (
                 "generated-kubelet-containerd-profile.rego",
                 GENERATED_KUBELET_CONTAINERD_PROFILE,
+            ),
+            (
+                "generated-kubernetes-controller-profile.rego",
+                GENERATED_KUBERNETES_CONTROLLER_PROFILE,
             ),
             (
                 "generated-runtime-envelope-profile.rego",
@@ -630,6 +641,10 @@ runtime_pattern_claims(_ir) := []
                 GENERATED_KUBELET_CONTAINERD_PROFILE,
             ),
             (
+                "generated-kubernetes-controller-profile.rego",
+                GENERATED_KUBERNETES_CONTROLLER_PROFILE,
+            ),
+            (
                 "generated-runtime-envelope-profile.rego",
                 GENERATED_RUNTIME_ENVELOPE_PROFILE,
             ),
@@ -656,6 +671,10 @@ runtime_pattern_claims(_ir) := []
             (
                 "generated-kubelet-containerd-profile.rego",
                 GENERATED_KUBELET_CONTAINERD_PROFILE,
+            ),
+            (
+                "generated-kubernetes-controller-profile.rego",
+                GENERATED_KUBERNETES_CONTROLLER_PROFILE,
             ),
             (
                 "generated-runtime-envelope-profile.rego",
@@ -717,6 +736,10 @@ volume_mount_claims(_ir) := [{
             (
                 "generated-kubelet-containerd-profile.rego",
                 GENERATED_KUBELET_CONTAINERD_PROFILE,
+            ),
+            (
+                "generated-kubernetes-controller-profile.rego",
+                GENERATED_KUBERNETES_CONTROLLER_PROFILE,
             ),
             (
                 "generated-runtime-envelope-profile.rego",
@@ -795,6 +818,10 @@ materializations := [{
                 GENERATED_KUBELET_CONTAINERD_PROFILE,
             ),
             (
+                "generated-kubernetes-controller-profile.rego",
+                GENERATED_KUBERNETES_CONTROLLER_PROFILE,
+            ),
+            (
                 "generated-runtime-envelope-profile.rego",
                 GENERATED_RUNTIME_ENVELOPE_PROFILE,
             ),
@@ -817,6 +844,10 @@ materializations := [{
             (
                 "generated-kubelet-containerd-profile.rego",
                 GENERATED_KUBELET_CONTAINERD_PROFILE,
+            ),
+            (
+                "generated-kubernetes-controller-profile.rego",
+                GENERATED_KUBERNETES_CONTROLLER_PROFILE,
             ),
             (
                 "generated-runtime-envelope-profile.rego",
@@ -853,6 +884,10 @@ materializations := [{
                 GENERATED_KUBELET_CONTAINERD_PROFILE,
             ),
             (
+                "generated-kubernetes-controller-profile.rego",
+                GENERATED_KUBERNETES_CONTROLLER_PROFILE,
+            ),
+            (
                 "generated-runtime-envelope-profile.rego",
                 GENERATED_RUNTIME_ENVELOPE_PROFILE,
             ),
@@ -876,6 +911,10 @@ materializations := [{
             (
                 "generated-kubelet-containerd-profile.rego",
                 GENERATED_KUBELET_CONTAINERD_PROFILE,
+            ),
+            (
+                "generated-kubernetes-controller-profile.rego",
+                GENERATED_KUBERNETES_CONTROLLER_PROFILE,
             ),
             (
                 "generated-runtime-envelope-profile.rego",
