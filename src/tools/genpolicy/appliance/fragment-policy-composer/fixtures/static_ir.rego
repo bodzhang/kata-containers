@@ -1,7 +1,7 @@
 package static_policy_ir
 
 ir := {
-    "agent_framework_version": 1,
+    "composition_schema_version": 1,
     "schema_version": 1,
     "capture_provenance": "8b0ae298134cf114935b140f42fc2ca8a8294a674ecbeb58d4727ee2f33f00d2",
     "environment": {

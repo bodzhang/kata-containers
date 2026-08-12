@@ -17,7 +17,7 @@ def load_module(name: str, path: Path):
 
 
 SCRIPT_DIR = Path(__file__).parent
-AGENT_FRAMEWORK_VERSION = 1
+COMPOSITION_SCHEMA_VERSION = 1
 PLATFORM_SERVICES = [
     {
         "name": "kubernetes",
@@ -193,7 +193,7 @@ def regorus_static_ir(
     )
     result.update(
         {
-            "agent_framework_version": AGENT_FRAMEWORK_VERSION,
+            "composition_schema_version": COMPOSITION_SCHEMA_VERSION,
             "capture_provenance": report["binding"]["profile_identity"],
             "environment": capture_environment(profile or {}),
             "policy_owned_paths": leaf_paths(result["policy_data"]),
@@ -290,7 +290,10 @@ def reviewed_profile_fragments(directory: Path) -> list[dict]:
 
 
 def validate_reviewed_profile_fragments(
-    candidates: list[dict], materializations: list[dict], reviewed: list[dict]
+    candidates: list[dict],
+    materializations: list[dict],
+    reviewed: list[dict],
+    expected: dict | None = None,
 ) -> None:
     for fragment in reviewed:
         if fragment.get("scope") != "profile":
@@ -319,16 +322,67 @@ def validate_reviewed_profile_fragments(
                 pattern = contract.get("path_regex", "")
                 if not pattern.startswith("^") or not pattern.endswith("$"):
                     raise ValueError("materialization contract regex must be anchored")
+        for claim in fragment.get("claims", []):
+            if claim.get("evidence") == "profile-compatibility-contract" and (
+                fragment["category"] != "policy-framework-settings"
+                or claim.get("operation") != "default"
+                or claim.get("target", {}).get("scope") != "policy"
+                or not claim.get("target", {}).get("path", "").startswith("/")
+                or claim.get("addition")
+                != sparse_patch(claim["target"]["path"], claim.get("value"))
+            ):
+                raise ValueError(
+                    "profile compatibility claims must be exact policy defaults"
+                )
     for candidate in candidates:
-        claims = [
+        compatibility_paths = [
+            claim["target"]["path"]
+            for fragment in reviewed
+            if fragment["category"] == candidate["category"]
+            for claim in fragment.get("claims", [])
+            if claim.get("evidence") == "profile-compatibility-contract"
+        ]
+        reviewed_claims = [
             claim
             for fragment in reviewed
             if fragment["category"] == candidate["category"]
             for claim in fragment.get("claims", [])
+            if claim.get("evidence") != "profile-compatibility-contract"
         ]
-        if claims != candidate["claims"]:
+        uncovered_candidate_claims = [
+            claim
+            for claim in candidate["claims"]
+            if not any(
+                claim["target"]["path"] == path
+                or claim["target"]["path"].startswith(path + "/")
+                for path in compatibility_paths
+            )
+        ]
+        candidate_paths = {claim["target"]["path"] for claim in uncovered_candidate_claims}
+        claims = [
+            claim for claim in reviewed_claims if claim["target"]["path"] in candidate_paths
+        ]
+        producer_claims = [
+            claim for claim in reviewed_claims if claim["target"]["path"] not in candidate_paths
+        ]
+        if expected is None and producer_claims:
+            raise ValueError("canonical policy is required to verify producer claims")
+        for claim in producer_claims:
+            try:
+                produced = coverage.composition.get_pointer(expected, claim["target"]["path"])
+            except (KeyError, IndexError, TypeError, coverage.composition.CompositionError):
+                raise ValueError(
+                    f"compiler omitted reviewed claim {claim['target']['path']}"
+                ) from None
+            if produced != claim["value"]:
+                raise ValueError(
+                    f"compiler value differs from reviewed claim {claim['target']['path']}"
+                )
+        if claims != uncovered_candidate_claims:
             raise ValueError(
-                f"reviewed {candidate['category']} claims do not cover candidate mutations"
+                f"reviewed {candidate['category']} claims do not cover candidate mutations: "
+                f"reviewed={[claim['target']['path'] for claim in claims]}, "
+                f"candidate={[claim['target']['path'] for claim in uncovered_candidate_claims]}"
             )
     for materialization in materializations:
         contracts = [
@@ -354,6 +408,29 @@ def validate_reviewed_profile_fragments(
                     f"{materialization['category']} {claim['operation']} "
                     f"{claim['target']['path']}"
                 )
+
+
+def apply_profile_policy_defaults(policy: dict, reviewed: list[dict]) -> None:
+    for fragment in reviewed:
+        for claim in fragment.get("claims", []):
+            if (
+                claim.get("operation") == "default"
+                and claim.get("target", {}).get("scope") == "policy"
+            ):
+                tokens = coverage.composition.pointer_tokens(claim["target"]["path"])
+                parent = policy
+                for token in tokens[:-1]:
+                    child = parent.setdefault(token, {})
+                    if not isinstance(child, dict):
+                        raise ValueError("profile compatibility path crosses a non-object")
+                    parent = child
+                leaf = tokens[-1]
+                value = claim["value"]
+                if leaf in parent and parent[leaf] != value:
+                    raise ValueError(
+                        f"profile policy default conflicts at {claim['target']['path']}"
+                    )
+                parent[leaf] = copy.deepcopy(value)
 
 
 def service_link_materialization_paths(static_ir: dict) -> set[str]:
@@ -544,8 +621,9 @@ def main() -> None:
         materializations, static_ir
     )
     reviewed_profiles = reviewed_profile_fragments(args.profile_fragments_dir)
+    apply_profile_policy_defaults(expected, reviewed_profiles)
     validate_reviewed_profile_fragments(
-        candidate_profiles, materializations, reviewed_profiles
+        candidate_profiles, materializations, reviewed_profiles, expected
     )
 
     args.static_output.write_text(

@@ -3,25 +3,25 @@
   "validators": [
     {
       "category": "containerd-oci",
-      "evidence": "src/tools/genpolicy/appliance/fragment-policy-composer/policies/agent-framework.rego: allow_oci_version",
+      "evidence": "src/tools/genpolicy/rules.rego: allow_oci_version",
       "path": "/OCI/Version",
       "test": "src/tools/genpolicy/appliance/tests/fragment_runtime_validators_test.rego: test_fragment_oci_version_mismatch_denied"
     },
     {
       "category": "containerd-oci",
-      "evidence": "src/tools/genpolicy/appliance/fragment-policy-composer/policies/agent-framework.rego: allow_container_role",
+      "evidence": "src/tools/genpolicy/rules.rego: allow_container_role",
       "path": "/OCI/Annotations/io.kubernetes.cri.container-type",
       "test": "src/tools/genpolicy/appliance/tests/fragment_runtime_validators_test.rego: test_fragment_container_role_mismatch_denied"
     },
     {
       "category": "policy-framework-settings",
-      "evidence": "src/tools/genpolicy/appliance/fragment-policy-composer/policies/agent-framework.rego: substitute_cpath",
+      "evidence": "src/tools/genpolicy/rules.rego: substitute_cpath",
       "path": "/common/cpath",
       "test": "src/tools/genpolicy/appliance/tests/fragment_runtime_validators_test.rego: test_fragment_cpath_mismatch_denied"
     },
     {
       "category": "policy-framework-settings",
-      "evidence": "src/tools/genpolicy/appliance/fragment-policy-composer/policies/agent-framework.rego: allow_var",
+      "evidence": "src/tools/genpolicy/rules.rego: allow_var",
       "path": "/request_defaults/CreateContainerRequest/allow_env_regex",
       "test": "src/tools/genpolicy/appliance/tests/service_env_test.rego: test_undeclared_service_environment_name_denied"
     }

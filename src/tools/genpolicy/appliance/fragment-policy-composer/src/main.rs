@@ -6,7 +6,6 @@ use std::{
 };
 
 const DEFAULT_QUERY: &str = "data.fragment_composer.final_policy";
-const AGENT_FRAMEWORK: &str = include_str!("../policies/agent-framework.rego");
 
 /// Every loaded module is policy code in one engine, so an unexpected package
 /// could add permissive definitions of the composer's own validation rules.
@@ -65,6 +64,34 @@ fn evaluate_modules_query(modules: &[(&str, &str)], query: &str) -> Result<Value
     Ok(value)
 }
 
+#[cfg(test)]
+fn evaluate_agent_request(
+    modules: &[(&str, &str)],
+    endpoint: &str,
+    input: &serde_json::Value,
+    state: &serde_json::Value,
+) -> Result<Value> {
+    let mut engine = Engine::new();
+    engine.set_strict_builtin_errors(false);
+    for (name, source) in modules {
+        engine
+            .add_policy((*name).to_string(), (*source).to_string())
+            .with_context(|| format!("load Agent policy module {name}"))?;
+    }
+    engine.add_data(Value::from_json_str(&state.to_string())?)?;
+    engine.set_input_json(&input.to_string())?;
+    let query = format!("data.agent_policy.{endpoint}");
+    let results = engine.eval_query(query, false)?;
+    if results.result.len() != 1 || results.result[0].expressions.len() != 1 {
+        bail!("Agent policy query returned an unexpected result shape");
+    }
+    let value = results.result[0].expressions[0].value.clone();
+    if value == Value::Undefined || value == Value::Null {
+        bail!("Agent policy query returned no decision");
+    }
+    Ok(value)
+}
+
 fn load(path: &Path) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
 }
@@ -91,37 +118,34 @@ fn load_rego_directory(path: &Path) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
-fn validate_agent_framework(framework: &str) -> Result<()> {
-    if framework.contains("\npolicy_data := ") {
-        bail!("Agent framework already contains a policy_data assignment");
-    }
-    let validation_module = format!("{}\npolicy_data := {{}}\n", framework.trim_end());
-    let metadata = evaluate_modules_query(
-        &[("agent-framework.rego", validation_module.as_str())],
-        "data.agent_policy.agent_framework_metadata",
-    )?;
-    let metadata = serde_json::to_value(metadata)?;
-    if metadata["name"] != "kata-agent-fragment-policy-framework" || metadata["schema_version"] != 1
-    {
-        bail!("unsupported Agent framework metadata");
+fn validate_rpc_evaluator(evaluator: &str) -> Result<()> {
+    require_package(evaluator, "RPC evaluator", "agent_policy")?;
+    if evaluator.contains("\npolicy_data := ") {
+        bail!("RPC evaluator already contains a policy_data assignment");
     }
     Ok(())
 }
 
-fn render_agent_policy(framework: &str, policy_data: &Value) -> Result<String> {
-    validate_agent_framework(framework)?;
-    Ok(format!(
+fn render_rpc_policy(evaluator: &str, policy_data: &Value) -> Result<String> {
+    validate_rpc_evaluator(evaluator)?;
+    let policy = format!(
         "{}\npolicy_data := {}\n",
-        framework.trim_end(),
+        evaluator.trim_end(),
         serde_json::to_string_pretty(policy_data)?
-    ))
+    );
+    evaluate_modules_query(
+        &[("policy.rego", policy.as_str())],
+        "data.agent_policy.AllowRequestsFailingPolicy",
+    )
+    .context("validate composed policy with Agent RPC evaluator")?;
+    Ok(policy)
 }
 
 fn run() -> Result<()> {
     let arguments: Vec<_> = env::args_os().skip(1).collect();
-    if arguments.len() != 5 && arguments.len() != 6 {
+    if arguments.len() != 5 && arguments.len() != 7 {
         bail!(
-            "usage: fragment-policy-composer <static-ir.rego> <profile-fragments-dir> <materializations.rego> <compose.rego> <output.json> [<output.rego>]"
+            "usage: fragment-policy-composer <static-ir.rego> <profile-fragments-dir> <materializations.rego> <compose.rego> <output.json> [<rpc-evaluator.rego> <output.rego>]"
         );
     }
     let static_path = Path::new(&arguments[0]);
@@ -163,11 +187,13 @@ fn run() -> Result<()> {
         serde_json::to_string_pretty(&final_policy)? + "\n",
     )
     .with_context(|| format!("write {}", output_path.display()))?;
-    if arguments.len() == 6 {
-        let agent_policy_path = Path::new(&arguments[5]);
+    if arguments.len() == 7 {
+        let evaluator_path = Path::new(&arguments[5]);
+        let agent_policy_path = Path::new(&arguments[6]);
+        let evaluator = load(evaluator_path)?;
         fs::write(
             agent_policy_path,
-            render_agent_policy(AGENT_FRAMEWORK, &final_policy)?,
+            render_rpc_policy(&evaluator, &final_policy)?,
         )
         .with_context(|| format!("write {}", agent_policy_path.display()))?;
     }
@@ -186,7 +212,7 @@ mod tests {
     use super::*;
 
     const STATIC: &str = include_str!("../fixtures/static_ir.rego");
-    const FRAGMENT: &str = include_str!("../fixtures/kubernetes_controller_fragment.rego");
+    const FRAGMENT: &str = include_str!("../fixtures/composition_test_profile.rego");
     const MATERIALIZATIONS: &str = "package selected_materializations\n\nmaterializations := []\n";
     const GENERATED_KUBELET_PROFILE: &str =
         "package profile_kubelet_resolution\n\nservice_link_claims(_ir) := []\n";
@@ -205,7 +231,12 @@ runtime_pattern_claims(_ir) := []
         include_str!("../profiles/k8s-1.33-containerd-2.3-guest-pull/runtime-rs-envelope.rego");
     const RUNTIME_RS_PROFILE: &str =
         include_str!("../profiles/k8s-1.33-containerd-2.3-guest-pull/runtime-rs.rego");
+    const POLICY_FRAMEWORK_PROFILE: &str = include_str!(
+        "../profiles/k8s-1.33-containerd-2.3-guest-pull/policy-framework-settings.rego"
+    );
     const COMPOSER: &str = include_str!("../policies/compose.rego");
+    const AGENT_POLICY: &str = include_str!("../fixtures/agent_policy.rego");
+    const STATIC_RUNTIME: &str = include_str!("../fixtures/static_runtime.rego");
 
     fn evaluate(fragment: &str) -> Result<serde_json::Value> {
         let value = evaluate_modules(&[
@@ -228,6 +259,34 @@ runtime_pattern_claims(_ir) := []
             ("compose.rego", COMPOSER),
         ])?;
         Ok(serde_json::to_value(value)?)
+    }
+
+    fn evaluate_agent_endpoint_with_policy(
+        endpoint: &str,
+        request: &serde_json::Value,
+        policy_data: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let value = evaluate_agent_request(
+            &[
+                ("static-runtime.rego", STATIC_RUNTIME),
+                ("agent-policy.rego", AGENT_POLICY),
+            ],
+            endpoint,
+            request,
+            &serde_json::json!({"policy_data": policy_data, "pstate": {}}),
+        )?;
+        Ok(serde_json::to_value(value)?)
+    }
+
+    fn evaluate_agent_endpoint(
+        endpoint: &str,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        evaluate_agent_endpoint_with_policy(endpoint, request, evaluate(FRAGMENT)?)
+    }
+
+    fn evaluate_create_container(request: &serde_json::Value) -> Result<serde_json::Value> {
+        evaluate_agent_endpoint("CreateContainerRequest", request)
     }
 
     #[test]
@@ -255,6 +314,141 @@ runtime_pattern_claims(_ir) := []
     }
 
     #[test]
+    fn framework_profile_declares_vfio_evaluator_operands() {
+        for path in [
+            "/devices/vfio/cdi_annotation_prefix",
+            "/devices/vfio/device_number_regex",
+            "/devices/vfio/device_id_prefix",
+            "/devices/vfio/pci_address_regex",
+        ] {
+            assert!(
+                POLICY_FRAMEWORK_PROFILE.contains(path),
+                "missing framework profile claim for {path}"
+            );
+        }
+        for value in [
+            "cdi.k8s.io/vfio",
+            "^[0-9]+$",
+            "vfio",
+            "^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}",
+        ] {
+            assert!(
+                POLICY_FRAMEWORK_PROFILE.contains(value),
+                "missing framework profile value {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn framework_profile_declares_mount_compatibility_operands() {
+        assert!(POLICY_FRAMEWORK_PROFILE.contains("/cluster_config/mount_compatibility"));
+        for field in [
+            "sysfs_type",
+            "sysfs_policy_read_write_option",
+            "sysfs_request_read_only_option",
+            "cgroup_type",
+        ] {
+            assert!(
+                POLICY_FRAMEWORK_PROFILE.contains(field),
+                "missing mount compatibility field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn framework_profile_declares_rootfs_compatibility_operands() {
+        assert!(POLICY_FRAMEWORK_PROFILE.contains("/cluster_config/rootfs_compatibility"));
+        for value in [
+            "dmverity_roothash_option_prefix",
+            "block_transports",
+            "rootfs_mount_points",
+            "image_guest_pull=",
+        ] {
+            assert!(POLICY_FRAMEWORK_PROFILE.contains(value));
+        }
+    }
+
+    #[test]
+    fn framework_profile_declares_bundle_id_grammars() {
+        for path in [
+            "/common/root_bundle_id_regex",
+            "/common/copy_file_bundle_id_regex",
+        ] {
+            assert!(
+                POLICY_FRAMEWORK_PROFILE.contains(path),
+                "missing framework profile claim for {path}"
+            );
+        }
+        assert!(POLICY_FRAMEWORK_PROFILE.contains("([0-9a-f]{64}|[a-z0-9][a-z0-9.-]*)"));
+        assert!(POLICY_FRAMEWORK_PROFILE.contains("[a-z0-9]{64}"));
+    }
+
+    #[test]
+    fn framework_profile_declares_common_compatibility_operands() {
+        for path in [
+            "/evaluator_schema_version",
+            "/common/namespace_compatibility",
+            "/common/capability_compatibility",
+            "/common/copy_file_compatibility",
+            "/common/substitutions",
+            "/common/request_shape",
+        ] {
+            assert!(POLICY_FRAMEWORK_PROFILE.contains(path));
+        }
+    }
+
+    #[test]
+    fn framework_profile_matches_canonical_evaluator_settings() {
+        let fragment: serde_json::Value = serde_json::from_str(
+            POLICY_FRAMEWORK_PROFILE
+                .split_once("\nfragment := ")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(include_str!("../../../genpolicy-settings.json")).unwrap();
+        let migrated_paths = [
+            "/evaluator_schema_version",
+            "/framework",
+            "/common/root_bundle_id_regex",
+            "/common/copy_file_bundle_id_regex",
+            "/common/namespace_compatibility",
+            "/common/capability_compatibility",
+            "/common/copy_file_compatibility",
+            "/common/substitutions",
+            "/common/request_shape",
+            "/devices/vfio/cdi_annotation_prefix",
+            "/devices/vfio/device_number_regex",
+            "/devices/vfio/device_id_prefix",
+            "/devices/vfio/pci_address_regex",
+            "/cluster_config/mount_compatibility",
+            "/cluster_config/rootfs_compatibility",
+            "/request_defaults/AddARPNeighborsRequest/allowed_flags",
+            "/request_defaults/AddARPNeighborsRequest/required_ip_address_mask",
+        ];
+        for path in migrated_paths {
+            let claim = fragment["claims"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|claim| claim["target"]["path"] == path)
+                .unwrap_or_else(|| panic!("missing profile claim for {path}"));
+            assert_eq!(claim["value"], *settings.pointer(path).unwrap(), "{path}");
+        }
+    }
+
+    #[test]
+    fn framework_profile_declares_arp_operands() {
+        assert!(POLICY_FRAMEWORK_PROFILE
+            .contains("/request_defaults/AddARPNeighborsRequest/allowed_flags"));
+        assert!(POLICY_FRAMEWORK_PROFILE.contains("\"allowed_flags\": 136"));
+        assert!(POLICY_FRAMEWORK_PROFILE
+            .contains("/request_defaults/AddARPNeighborsRequest/required_ip_address_mask"));
+        assert!(POLICY_FRAMEWORK_PROFILE.contains("\"required_ip_address_mask\": \"\""));
+    }
+
+    #[test]
     fn rejects_module_without_package_declaration() {
         assert!(package_of("allow := true\n", "bad.rego").is_err());
     }
@@ -266,7 +460,11 @@ runtime_pattern_claims(_ir) := []
             result["containers"][0]["OCI"]["Annotations"]["io.kubernetes.cri.sandbox-name"],
             "^demo$"
         );
-        assert_eq!(result["containers"][0]["OCI"]["Version"], "1.3.0");
+        assert_eq!(result["containers"][0]["OCI"]["Version"], "1.1.0");
+        assert_eq!(
+            result["framework"]["annotations"]["cri_container_type"],
+            "io.kubernetes.cri.container-type"
+        );
         assert!(result["containers"][0]["OCI"]["Process"]["Env"]
             .as_array()
             .unwrap()
@@ -279,14 +477,138 @@ runtime_pattern_claims(_ir) := []
     }
 
     #[test]
+    fn parameterized_evaluator_allows_composed_policy_request() {
+        let request = serde_json::json!({
+            "OCI": {
+                "Annotations": {
+                    "io.kubernetes.cri.container-type": "container",
+                    "io.kubernetes.cri.sandbox-name": "demo",
+                },
+                "Process": {"Args": ["/usr/bin/app"]},
+                "Version": "1.1.0",
+            },
+        });
+
+        assert_eq!(
+            evaluate_create_container(&request).unwrap(),
+            serde_json::json!({"allowed": true, "ops": []})
+        );
+    }
+
+    #[test]
+    fn parameterized_evaluator_denies_static_and_profile_mutations() {
+        let request = serde_json::json!({
+            "OCI": {
+                "Annotations": {
+                    "io.kubernetes.cri.container-type": "container",
+                    "io.kubernetes.cri.sandbox-name": "demo",
+                },
+                "Process": {"Args": ["/usr/bin/app"]},
+                "Version": "1.1.0",
+            },
+        });
+        let mut changed_args = request.clone();
+        changed_args["OCI"]["Process"]["Args"][0] = serde_json::json!("/bin/sh");
+        let mut changed_version = request.clone();
+        changed_version["OCI"]["Version"] = serde_json::json!("1.2.0");
+        let mut changed_type = request.clone();
+        changed_type["OCI"]["Annotations"]["io.kubernetes.cri.container-type"] =
+            serde_json::json!("sandbox");
+        let mut changed_name = request;
+        changed_name["OCI"]["Annotations"]["io.kubernetes.cri.sandbox-name"] =
+            serde_json::json!("other");
+
+        for mutation in [
+            &changed_args,
+            &changed_version,
+            &changed_type,
+            &changed_name,
+        ] {
+            assert_eq!(
+                evaluate_create_container(mutation).unwrap(),
+                serde_json::json!({"allowed": false, "ops": []})
+            );
+        }
+    }
+
+    #[test]
+    fn generic_evaluator_rejects_unanchored_profile_regex() {
+        let request = serde_json::json!({
+            "OCI": {
+                "Annotations": {
+                    "io.kubernetes.cri.container-type": "container",
+                    "io.kubernetes.cri.sandbox-name": "demo",
+                },
+                "Process": {"Args": ["/usr/bin/app"]},
+                "Version": "1.1.0",
+            },
+        });
+        let unanchored_fragment = FRAGMENT.replace("^demo$", "demo");
+        assert_eq!(
+            evaluate_agent_endpoint_with_policy(
+                "CreateContainerRequest",
+                &request,
+                evaluate(&unanchored_fragment).unwrap(),
+            )
+            .unwrap(),
+            serde_json::json!({"allowed": false, "ops": []})
+        );
+    }
+
+    #[test]
+    fn generic_evaluator_uses_composed_annotation_keys() {
+        let request = serde_json::json!({
+            "OCI": {
+                "Annotations": {
+                    "io.kubernetes.cri.container-type": "container",
+                    "io.kubernetes.cri.sandbox-name": "demo",
+                },
+                "Process": {"Args": ["/usr/bin/app"]},
+                "Version": "1.1.0",
+            },
+        });
+        let mut policy_data = evaluate(FRAGMENT).unwrap();
+        policy_data["framework"]["annotations"]["cri_container_type"] =
+            serde_json::json!("example.invalid/container-role");
+
+        assert_eq!(
+            evaluate_agent_endpoint_with_policy("CreateContainerRequest", &request, policy_data,)
+                .unwrap(),
+            serde_json::json!({"allowed": false, "ops": []})
+        );
+    }
+
+    #[test]
+    fn generic_agent_module_owns_rpc_endpoint_defaults() {
+        let empty_request = serde_json::json!({});
+
+        assert_eq!(
+            evaluate_agent_endpoint("StatsContainerRequest", &empty_request).unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            evaluate_agent_endpoint("CopyFileRequest", &empty_request).unwrap(),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            evaluate_agent_endpoint("AllowRequestsFailingPolicy", &empty_request).unwrap(),
+            serde_json::json!(false)
+        );
+        assert!(evaluate_agent_endpoint("UnknownRequest", &empty_request).is_err());
+    }
+
+    #[test]
     fn applies_to_mismatch_fails_closed() {
-        let fragment = FRAGMENT.replace("\"containerd\": [\"v2.3.3\"]", "\"containerd\": [\"v2.4.0\"]");
+        let fragment = FRAGMENT.replace(
+            "\"containerd\": [\"v2.3.3\"]",
+            "\"containerd\": [\"v2.4.0\"]",
+        );
         assert!(evaluate(&fragment).is_err());
     }
 
     #[test]
     fn fragment_replacement_keeps_static_ir_unchanged() {
-        let replacement = FRAGMENT.replace("1.3.0", "1.2.0");
+        let replacement = FRAGMENT.replace("1.1.0", "1.2.0");
         assert_ne!(replacement, FRAGMENT);
         let result = evaluate(&replacement).unwrap();
         assert_eq!(result["containers"][0]["OCI"]["Version"], "1.2.0");
@@ -321,10 +643,10 @@ runtime_pattern_claims(_ir) := []
     }
 
     #[test]
-    fn agent_framework_version_mismatch_fails_closed() {
+    fn composition_schema_version_mismatch_fails_closed() {
         let static_ir = STATIC.replace(
-            "\"agent_framework_version\": 1",
-            "\"agent_framework_version\": 2",
+            "\"composition_schema_version\": 1",
+            "\"composition_schema_version\": 2",
         );
         assert!(evaluate_modules(&[
             ("static_ir.rego", &static_ir),
@@ -360,7 +682,7 @@ runtime_pattern_claims(_ir) := []
     #[test]
     fn addition_outside_declared_target_fails_closed() {
         let fragment = FRAGMENT.replace(
-            r#""addition": {"OCI": {"Version": "1.3.0"}},"#,
+            r#""addition": {"OCI": {"Version": "1.1.0"}},"#,
             r#""addition": {"OCI": {"Process": {"Args": ["/bin/sh"]}}},"#,
         );
         assert!(evaluate(&fragment).is_err());
@@ -369,8 +691,8 @@ runtime_pattern_claims(_ir) := []
     #[test]
     fn addition_with_extra_branch_fails_closed() {
         let fragment = FRAGMENT.replace(
-            r#""addition": {"OCI": {"Version": "1.3.0"}},"#,
-            r#""addition": {"OCI": {"Version": "1.3.0", "Hostname": "evil"}},"#,
+            r#""addition": {"OCI": {"Version": "1.1.0"}},"#,
+            r#""addition": {"OCI": {"Version": "1.1.0", "Hostname": "evil"}},"#,
         );
         assert!(evaluate(&fragment).is_err());
     }
@@ -486,7 +808,7 @@ materializations := [{
     }
 
     #[test]
-    fn renders_agent_loadable_policy_module() {
+    fn simulates_agent_installing_composed_data_into_rpc_evaluator() {
         let result = evaluate_modules(&[
             ("static_ir.rego", STATIC),
             ("fragment.rego", FRAGMENT),
@@ -507,16 +829,10 @@ materializations := [{
             ("compose.rego", COMPOSER),
         ])
         .unwrap();
-        let framework = r#"package agent_policy
-
-    agent_framework_metadata := {
-        "name": "kata-agent-fragment-policy-framework",
-        "schema_version": 1,
-    }
-    "#;
-        let policy = render_agent_policy(framework, &result).unwrap();
+        let evaluator = "package agent_policy\n\ndefault AllowRequestsFailingPolicy := false\ndefault CreateContainerRequest := false\n";
+        let policy = render_rpc_policy(evaluator, &result).unwrap();
         assert!(policy.starts_with("package agent_policy\n"));
-        assert!(policy.contains("agent_framework_metadata := {"));
+        assert!(policy.contains("default CreateContainerRequest := false"));
         assert!(policy.contains("\npolicy_data := {"));
         assert!(policy.contains("\"containers\""));
         let mut engine = Engine::new();
@@ -526,7 +842,7 @@ materializations := [{
     }
 
     #[test]
-    fn rejects_unversioned_agent_framework() {
+    fn rejects_rpc_evaluator_outside_agent_policy_package() {
         let result = evaluate_modules(&[
             ("static_ir.rego", STATIC),
             ("fragment.rego", FRAGMENT),
@@ -547,11 +863,11 @@ materializations := [{
             ("compose.rego", COMPOSER),
         ])
         .unwrap();
-        assert!(render_agent_policy("package agent_policy\n", &result).is_err());
+        assert!(render_rpc_policy("package other\n", &result).is_err());
     }
 
     #[test]
-    fn rejects_framework_with_embedded_policy_data() {
+    fn rejects_rpc_evaluator_with_embedded_policy_data() {
         let result = evaluate_modules(&[
             ("static_ir.rego", STATIC),
             ("fragment.rego", FRAGMENT),
@@ -572,16 +888,8 @@ materializations := [{
             ("compose.rego", COMPOSER),
         ])
         .unwrap();
-        let framework = r#"package agent_policy
-
-agent_framework_metadata := {
-    "name": "kata-agent-fragment-policy-framework",
-    "schema_version": 1,
-}
-
-policy_data := {}
-"#;
-        assert!(render_agent_policy(framework, &result).is_err());
+        let evaluator = "package agent_policy\n\npolicy_data := {}\n";
+        assert!(render_rpc_policy(evaluator, &result).is_err());
     }
 
     #[test]

@@ -35,6 +35,7 @@ python3 "${appliance_dir}/scripts/generate_regorus_fragment_inputs.py" \
 		"${temporary}/materializations.rego" \
 		"${composer}/policies/compose.rego" \
 		"${temporary}/final-policy.json" \
+		"${repo_root}/src/tools/genpolicy/rules.rego" \
 		"${temporary}/policy.rego"
 )
 
@@ -81,7 +82,7 @@ assert {fragment["category"] for fragment in profile_fragments} == {
 	"runtime-rs",
 	"runtime-rs-envelope",
 }
-assert sum(len(fragment["claims"]) for fragment in profile_fragments) == 39
+assert sum(len(fragment["claims"]) for fragment in profile_fragments) == 56
 assert sum(len(fragment["claims"]) for fragment in materializations) == 31
 forbidden_materialization_paths = {
 	"/devices",
@@ -171,6 +172,27 @@ assert all(
 	for claim in fragment["claims"]
 )
 assert len(result["containers"]) == 3
+assert result["framework"] == {
+	"annotations": {
+		"container_name": "io.kubernetes.cri.container-name",
+		"cri_container_type": "io.kubernetes.cri.container-type",
+		"cri_prefix": "io.kubernetes.cri.",
+		"kata_container_type": "io.katacontainers.pkg.oci.container_type",
+		"network_namespace": "nerdctl/network-namespace",
+		"sandbox_id": "io.kubernetes.cri.sandbox-id",
+		"sandbox_log_directory": "io.kubernetes.cri.sandbox-log-directory",
+		"sandbox_name": "io.kubernetes.cri.sandbox-name",
+		"sandbox_namespace": "io.kubernetes.cri.sandbox-namespace",
+		"sandbox_uid": "io.kubernetes.cri.sandbox-uid",
+	},
+	"paths": {"pod_log_directory_format": "/var/log/pods/%s_%s_%s"},
+	"roles": {
+		"cri_container": "container",
+		"cri_sandbox": "sandbox",
+		"kata_container": "pod_container",
+		"kata_sandbox": "pod_sandbox",
+	},
+}
 serialized = json.dumps(result)
 for disposable_value in (
 	"10.100.240.108",

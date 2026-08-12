@@ -284,7 +284,7 @@ materialized_subject(subject, claims) := result if {
 
 final_policy := result if {
 	ir := data.static_policy_ir.ir
-	ir.agent_framework_version == 1
+	ir.composition_schema_version == 1
 	profile_fragments := data.selected_profile_fragments.fragments
 	materializations := data.selected_materializations.materializations
 	fragments := selected_fragments

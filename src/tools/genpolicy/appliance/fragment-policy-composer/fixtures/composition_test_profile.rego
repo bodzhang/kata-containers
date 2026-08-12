@@ -8,11 +8,38 @@ fragments := [
         "applies_to": {"containerd": ["v2.3.3"]},
         "capture_provenance": capture_provenance,
         "category": "containerd-oci",
+        "claims": [
+            {
+                "addition": {"OCI": {"Version": "1.1.0"}},
+                "operation": "default",
+                "target": {"cardinality": "all", "path": "/OCI/Version", "role": "all", "scope": "container"},
+                "value": "1.1.0",
+            },
+            {
+                "addition": {"OCI": {"Annotations": {"io.kubernetes.cri.container-type": "container"}}},
+                "operation": "default",
+                "target": {"cardinality": "all", "path": "/OCI/Annotations/io.kubernetes.cri.container-type", "role": "application", "scope": "container"},
+                "value": "container",
+            },
+        ],
+        "schema_version": 1,
+        "scope": "profile",
+    },
+    {
+        "applies_to": {"kubernetes": ["v1.33.13"]},
+        "capture_provenance": capture_provenance,
+        "category": "policy-framework-settings",
         "claims": [{
-            "addition": {"OCI": {"Version": "1.3.0"}},
+            "addition": {"framework": {"annotations": {
+                "cri_container_type": "io.kubernetes.cri.container-type",
+                "sandbox_name": "io.kubernetes.cri.sandbox-name",
+            }}},
             "operation": "default",
-            "target": {"cardinality": "all", "path": "/OCI/Version", "role": "all", "scope": "container"},
-            "value": "1.3.0",
+            "target": {"path": "/framework", "scope": "policy"},
+            "value": {"annotations": {
+                "cri_container_type": "io.kubernetes.cri.container-type",
+                "sandbox_name": "io.kubernetes.cri.sandbox-name",
+            }},
         }],
         "schema_version": 1,
         "scope": "profile",

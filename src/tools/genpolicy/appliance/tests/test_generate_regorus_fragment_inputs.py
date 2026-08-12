@@ -24,7 +24,7 @@ class RegorusFragmentInputTests(unittest.TestCase):
             {"OCI": {"Process": {"Env": {"A/B": "value"}}}},
         )
 
-    def test_static_rego_ir_targets_embedded_agent_framework(self):
+    def test_static_rego_ir_targets_composition_schema(self):
         report = {
             "binding": {
                 "profile_identity": "a" * 64,
@@ -37,7 +37,7 @@ class RegorusFragmentInputTests(unittest.TestCase):
         result = renderer.regorus_static_ir(report)
 
         self.assertEqual(
-            result["agent_framework_version"], renderer.AGENT_FRAMEWORK_VERSION
+            result["composition_schema_version"], renderer.COMPOSITION_SCHEMA_VERSION
         )
 
     def test_static_rego_ir_replaces_profile_identity_with_applicability_inputs(self):
@@ -298,6 +298,99 @@ class RegorusFragmentInputTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "regex must be anchored"):
             renderer.validate_reviewed_profile_fragments([], [], reviewed)
+
+    def test_profile_framework_may_own_compatibility_operands(self):
+        reviewed = [
+            {
+                "applies_to": {"kubernetes": ["v1.33.13"]},
+                "category": "policy-framework-settings",
+                "claims": [
+                    {
+                        "addition": {"framework": {"roles": {"sandbox": "sandbox"}}},
+                        "evidence": "profile-compatibility-contract",
+                        "operation": "default",
+                        "target": {"path": "/framework", "scope": "policy"},
+                        "value": {"roles": {"sandbox": "sandbox"}},
+                    }
+                ],
+                "scope": "profile",
+            }
+        ]
+
+        renderer.validate_reviewed_profile_fragments([], [], reviewed)
+
+        policy = {"containers": []}
+        renderer.apply_profile_policy_defaults(policy, reviewed)
+        self.assertEqual(
+            policy["framework"], {"roles": {"sandbox": "sandbox"}}
+        )
+
+    def test_profile_compatibility_claim_must_be_policy_scoped(self):
+        reviewed = [
+            {
+                "applies_to": {"kubernetes": ["v1.33.13"]},
+                "category": "policy-framework-settings",
+                "claims": [
+                    {
+                        "evidence": "profile-compatibility-contract",
+                        "operation": "default",
+                        "addition": {"request_defaults": {}},
+                        "target": {"path": "/request_defaults", "scope": "container"},
+                        "value": {},
+                    }
+                ],
+                "scope": "profile",
+            }
+        ]
+
+        with self.assertRaisesRegex(ValueError, "exact policy defaults"):
+            renderer.validate_reviewed_profile_fragments([], [], reviewed)
+
+    def test_profile_compatibility_claim_must_match_existing_value(self):
+        reviewed = [
+            {
+                "applies_to": {"kubernetes": ["v1.33.13"]},
+                "category": "policy-framework-settings",
+                "claims": [{
+                    "addition": {"common": {"request_shape": {"port": 0}}},
+                    "evidence": "profile-compatibility-contract",
+                    "operation": "default",
+                    "target": {"path": "/common/request_shape", "scope": "policy"},
+                    "value": {"port": 0},
+                }],
+                "scope": "profile",
+            }
+        ]
+
+        policy = {"common": {"request_shape": {"port": 1}}}
+        with self.assertRaisesRegex(ValueError, "conflicts at /common/request_shape"):
+            renderer.apply_profile_policy_defaults(policy, reviewed)
+
+    def test_profile_compatibility_parent_covers_candidate_leaves(self):
+        compatibility = {
+            "addition": {"common": {"request_shape": {"port": 0}}},
+            "evidence": "profile-compatibility-contract",
+            "operation": "default",
+            "target": {"path": "/common/request_shape", "scope": "policy"},
+            "value": {"port": 0},
+        }
+        reviewed = [{
+            "applies_to": {"kubernetes": ["v1.33.13"]},
+            "category": "policy-framework-settings",
+            "claims": [compatibility],
+            "scope": "profile",
+        }]
+        candidates = [{
+            "category": "policy-framework-settings",
+            "claims": [{"target": {"path": "/common/request_shape/port"}}],
+        }]
+
+        renderer.validate_reviewed_profile_fragments(
+            candidates,
+            [],
+            reviewed,
+            {"common": {"request_shape": {"port": 0}}},
+        )
 
     def test_every_materialization_requires_reviewed_contract(self):
         materializations = [
