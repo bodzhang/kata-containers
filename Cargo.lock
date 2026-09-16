@@ -61,6 +61,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-request-capture"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "protobuf",
+ "protocols",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "ttrpc",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

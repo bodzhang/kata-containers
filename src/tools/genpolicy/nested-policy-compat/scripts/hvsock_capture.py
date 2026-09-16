@@ -19,6 +19,17 @@ from pathlib import Path
 BACKEND_SUFFIX = ".npc"
 
 
+def write_private_json(path, value):
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(value, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
+
+
 class CaptureSupervisor:
     def __init__(self, roots, names, output, poll_seconds=0.01):
         self.roots = [Path(root) for root in roots]
@@ -36,24 +47,25 @@ class CaptureSupervisor:
         self.errors = []
         self.write_state()
 
+    def state_unlocked(self):
+        return {
+            "connections": self.connection_number,
+            "errors": list(self.errors),
+            "intercepted_sockets": sorted(
+                str(path) for path in self.intercepted_paths
+            ),
+        }
+
     def state(self):
         with self.lock:
-            return {
-                "connections": self.connection_number,
-                "errors": list(self.errors),
-                "intercepted_sockets": sorted(
-                    str(path) for path in self.intercepted_paths
-                ),
-            }
+            return self.state_unlocked()
 
     def write_state(self):
-        state_path = self.output / "state.json"
-        temporary = state_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(self.state(), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(state_path)
+        with self.lock:
+            write_private_json(
+                self.output / "state.json",
+                self.state_unlocked(),
+            )
 
     def add_error(self, message):
         with self.lock:
@@ -130,60 +142,79 @@ class CaptureSupervisor:
             with self.lock:
                 self.connection_number += 1
                 number = self.connection_number
+            connection_dir = self.output / f"{number:06d}"
+            metadata = {
+                "connection": number,
+                "socket": str(path),
+                "started_unix_ns": time.time_ns(),
+            }
+            try:
+                connection_dir.mkdir(mode=0o700)
+                write_private_json(connection_dir / "metadata.json", metadata)
+                for stream_name in (
+                    "shim-to-agent.bin",
+                    "agent-to-shim.bin",
+                ):
+                    stream_path = connection_dir / stream_name
+                    stream_path.touch(mode=0o600)
+                    os.chmod(stream_path, 0o600)
+            except OSError as error:
+                client.close()
+                agent.close()
+                self.add_error(
+                    f"failed to initialize capture connection {number}: {error}"
+                )
+                continue
             self.write_state()
             worker = threading.Thread(
                 target=self.capture_connection,
-                args=(number, path, client, agent),
+                args=(number, connection_dir, metadata, client, agent),
                 daemon=True,
             )
             with self.lock:
                 self.active_connections[number] = (client, agent, worker)
             worker.start()
 
-    def capture_connection(self, number, path, client, agent):
-        connection_dir = self.output / f"{number:06d}"
-        connection_dir.mkdir(mode=0o700)
-        metadata = {
-            "connection": number,
-            "socket": str(path),
-            "started_unix_ns": time.time_ns(),
-        }
-        (connection_dir / "metadata.json").write_text(
-            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-
-        workers = [
-            threading.Thread(
-                target=self.copy_stream,
-                args=(
-                    client,
-                    agent,
-                    connection_dir / "shim-to-agent.bin",
-                ),
-            ),
-            threading.Thread(
-                target=self.copy_stream,
-                args=(
-                    agent,
-                    client,
-                    connection_dir / "agent-to-shim.bin",
-                ),
-            ),
-        ]
-        for worker in workers:
-            worker.start()
-        for worker in workers:
-            worker.join()
+    def capture_connection(
+        self,
+        number,
+        connection_dir,
+        metadata,
+        client,
+        agent,
+    ):
+        metadata_path = connection_dir / "metadata.json"
 
         try:
+            workers = [
+                threading.Thread(
+                    target=self.copy_stream,
+                    args=(
+                        client,
+                        agent,
+                        connection_dir / "shim-to-agent.bin",
+                    ),
+                ),
+                threading.Thread(
+                    target=self.copy_stream,
+                    args=(
+                        agent,
+                        client,
+                        connection_dir / "agent-to-shim.bin",
+                    ),
+                ),
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+
             client.close()
             agent.close()
             metadata["finished_unix_ns"] = time.time_ns()
-            (connection_dir / "metadata.json").write_text(
-                json.dumps(metadata, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            write_private_json(metadata_path, metadata)
+        except OSError as error:
+            self.add_error(f"capture connection {number} failed: {error}")
         finally:
             with self.lock:
                 self.active_connections.pop(number, None)
@@ -255,7 +286,7 @@ def main():
     )
 
     def stop(_signum, _frame):
-        supervisor.close()
+        supervisor.stop_event.set()
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)

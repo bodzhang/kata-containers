@@ -23,11 +23,15 @@ bash -n "${root}/scripts/run_pinned_mkfs_erofs.sh"
 bash -n "${root}/scripts/source_tree_fingerprint.sh"
 bash -n "${root}/scripts/verify_kata_source_provenance.sh"
 bash -n "${root}/appliance/scripts/entrypoint.sh"
+bash -n "${root}/tests/copy-baseline-policy.sh"
 python3 -m py_compile \
 	"${root}/appliance/scripts/exercise_runtime_operations.py" \
 	"${root}/scripts/hvsock_capture.py" \
-	"${root}/scripts/compat_report.py"
+	"${root}/scripts/compat_report.py" \
+	"${root}/scripts/policy_evaluation_report.py"
 python3 -m unittest discover -s "${root}/tests" -p 'test_*.py'
+cargo test --locked --package agent-request-capture \
+	--manifest-path "${root}/../../../../Cargo.toml"
 grep -Fq 'input.rule == "CreateSandboxRequest"' \
 	"${root}/tests/policy/create-sandbox-reasons.rego.inc"
 grep -Fq 'KATA_AGENT_MAKEFLAGS="EXTRA_RUSTFEATURES=allow-unattested-initdata"' \
@@ -98,6 +102,7 @@ if command -v shellcheck >/dev/null 2>&1; then
 		"${root}/scripts/source_tree_fingerprint.sh" \
 		"${root}/scripts/verify_kata_source_provenance.sh" \
 		"${root}/appliance/scripts/entrypoint.sh" \
+		"${root}/tests/copy-baseline-policy.sh" \
 		"${root}/tests/fixture-matrix-e2e.sh" \
 		"${root}/tests/validate.sh"
 fi

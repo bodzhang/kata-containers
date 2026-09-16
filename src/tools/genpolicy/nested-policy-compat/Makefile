@@ -18,6 +18,10 @@ APPROVE_KATA_INSTALL ?= no
 GENPOLICY_TARGET ?= x86_64-unknown-linux-musl
 GENPOLICY_BIN ?= $(REPO_ROOT)/target/$(GENPOLICY_TARGET)/release/genpolicy
 GENPOLICY_STAGE := $(CURDIR)/build/genpolicy
+REQUEST_CAPTURE_DECODER ?= $(REPO_ROOT)/target/release/agent-request-capture
+CANDIDATE_POLICY_GENERATOR ?=
+RUNTIME_FIXTURES_DIR ?=
+POLICY_EXPECTATIONS_DIR ?=
 EROFS_UTILS_VERSION ?= $(shell yq -r '.. | select(has("erofs-utils")) | ."erofs-utils".version' $(REPO_ROOT)/versions.yaml)
 
 PROFILE_FILE := $(CURDIR)/appliance/profiles/$(PROFILE).env
@@ -26,7 +30,7 @@ $(error unknown PROFILE "$(PROFILE)")
 endif
 include $(PROFILE_FILE)
 
-.PHONY: image ensure-image ensure-host-environment prepare-kata-stack verify-kata-provenance ensure-kata-provenance validate genpolicy-bin fixture-e2e ci-fixture-e2e runtime-operations-e2e termination-log-e2e custom-service-account-e2e clean
+.PHONY: image ensure-image ensure-host-environment prepare-kata-stack verify-kata-provenance ensure-kata-provenance validate genpolicy-bin request-capture-decoder-bin fixture-e2e policy-evaluation-e2e ci-fixture-e2e runtime-operations-e2e termination-log-e2e custom-service-account-e2e clean
 
 image:
 	@test -n "$(CONTAINER_ENGINE)" || { echo "docker or podman is required"; exit 1; }
@@ -97,6 +101,10 @@ genpolicy-bin:
 		"$(REPO_ROOT)" "$(GENPOLICY_TARGET)" \
 		"$(GENPOLICY_BIN)" "$(GENPOLICY_STAGE)"
 
+request-capture-decoder-bin:
+	cargo build --locked --release --package agent-request-capture \
+		--manifest-path "$(REPO_ROOT)/Cargo.toml"
+
 define run_fixture_e2e
 	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" \
 		GENPOLICY_BIN="$(GENPOLICY_STAGE)" \
@@ -104,19 +112,29 @@ define run_fixture_e2e
 		PROFILE_FILE="$(PROFILE_FILE)" \
 		REPO_ROOT="$(REPO_ROOT)" \
 		NESTED_IMAGE="$(IMAGE)" \
+		REQUEST_CAPTURE_DECODER="$(REQUEST_CAPTURE_DECODER)" \
 		KATA_ROOT="$(KATA_ROOT)" \
 		KATA_CONFIG="$(KATA_CONFIG)" \
 		FIXTURES="$(FIXTURES)" \
+		CANDIDATE_POLICY_GENERATOR="$(CANDIDATE_POLICY_GENERATOR)" \
+		RUNTIME_FIXTURES_DIR="$(RUNTIME_FIXTURES_DIR)" \
+		POLICY_EXPECTATIONS_DIR="$(POLICY_EXPECTATIONS_DIR)" \
 		POD_READY_TIMEOUT="$(POD_READY_TIMEOUT)" \
 		OUTPUT_ROOT="$(OUTPUT_ROOT)" \
 		./tests/fixture-matrix-e2e.sh
 endef
 
-fixture-e2e: ensure-host-environment ensure-kata-provenance ensure-image genpolicy-bin
+fixture-e2e: ensure-host-environment ensure-kata-provenance ensure-image genpolicy-bin request-capture-decoder-bin
+	$(run_fixture_e2e)
+
+policy-evaluation-e2e: ensure-host-environment ensure-kata-provenance ensure-image genpolicy-bin request-capture-decoder-bin
+	@test -n "$(CANDIDATE_POLICY_GENERATOR)" || { \
+		echo "CANDIDATE_POLICY_GENERATOR is required"; exit 2; \
+	}
 	$(run_fixture_e2e)
 
 ci-fixture-e2e: APPROVE_KATA_INSTALL := no
-ci-fixture-e2e: ensure-host-environment verify-kata-provenance ensure-image genpolicy-bin
+ci-fixture-e2e: ensure-host-environment verify-kata-provenance ensure-image genpolicy-bin request-capture-decoder-bin
 	$(run_fixture_e2e)
 
 runtime-operations-e2e: FIXTURES := runtime-operations-workload.yaml

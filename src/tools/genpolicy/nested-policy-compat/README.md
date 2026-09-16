@@ -308,6 +308,10 @@ privilege rationale.
 - `compatibility.json`: `compatible`, `policy-incompatible`, or
   `infrastructure-failure`;
 - `agent-rpcs/`: byte-exact bidirectional hybrid-vsock captures;
+- `agent-requests/requests.jsonl`: versioned, structured Agent request records
+  derived from each `shim-to-agent.bin`;
+- `agent-requests/manifest.json`: raw-stream hashes, decode coverage, and
+  connection/frame/request counts;
 - `submitted-objects.json`, `pods.json`, and `pod-status.json`;
 - `component-versions.txt` and `kata-artifacts.sha256`;
 - control-plane, shim, relay, and Agent-related logs available through
@@ -355,8 +359,123 @@ reason and `denial` is `null`.
 
 All Kubernetes objects, Secret values, ConfigMap values, images, and cluster
 configuration used by the supplied fixtures are synthetic test data. Complete
-logs and raw `agent-rpcs/` captures may therefore include those values by
-design.
+logs, raw `agent-rpcs/` captures, and decoded `agent-requests/` records may
+therefore include those values by design. The raw stream remains the
+authoritative capture. Decoded request files are analysis-only output and are
+never passed to baseline or candidate policy generation; unknown methods are
+retained as base64 protobuf payloads and reported as incomplete typed coverage.
+Known methods with unknown protobuf fields also retain their complete encoded
+payload. Non-Agent hybrid-vsock ports are recorded but are not interpreted as
+ttRPC.
+
+## Policy-tightening evaluation
+
+The harness can run two policies against the same pinned runtime inputs:
+
+- `baseline`: the policy produced by the checkout's GenPolicy implementation;
+- `candidate`: a policy produced by an external candidate generator.
+
+Use `policy-evaluation-e2e` and provide an executable
+`CANDIDATE_POLICY_GENERATOR`. The harness invokes that executable once per
+fixture with these environment variables:
+
+| Variable | Meaning |
+|---|---|
+| `BASELINE_GENERATION_DIR` | Private copy of the baseline `policy.rego`, normalized workload, GenPolicy log, and generation-input hashes |
+| `CANDIDATE_OUTPUT_DIR` | Directory where the generator must write `policy.rego` and `generation-inputs.sha256` |
+| `GENERATION_INPUT_DIR` | Private copy of the original workload used to generate the baseline policy |
+| `PROFILE_FILE` | Exact Kubernetes/containerd/rootfs compatibility profile |
+| `REFERENCE_IMAGES_DIR` | Fixture OCI archives copied from the pinned appliance image |
+| `REPO_ROOT` | Current repository checkout |
+| `CONTAINER_ENGINE` | Selected Podman or Docker executable |
+
+The candidate generator owns the contents of
+`generation-inputs.sha256`. It must hash every compiler, rule, setting,
+capture, and other input needed to reproduce its policy. The harness validates
+the manifest syntax, records its hash and entry count, and independently hashes
+the candidate-generator executable. The manifest remains an attestation by the
+candidate generator: the harness cannot discover undeclared inputs used by an
+arbitrary external program.
+
+The harness invokes the candidate generator before reading or copying the
+runtime probe workload or its expectations, under a clean environment
+containing only the variables listed above plus `HOME` and `PATH`. Both
+policies are generated before either nested execution starts, and the harness
+checks that candidate generation did not change the authoritative baseline
+policy, workload, or generation-input manifest. The generator is still a
+trusted test component with repository filesystem access; this isolation
+prevents accidental probe coupling, not deliberate discovery by hostile code.
+
+For a positive compatibility comparison, omit `RUNTIME_FIXTURES_DIR`; both
+variants execute the same normalized workload used for baseline generation:
+
+```bash
+make -C src/tools/genpolicy/nested-policy-compat policy-evaluation-e2e \
+  CANDIDATE_POLICY_GENERATOR=/path/to/generate-candidate-policy \
+  PROFILE=k8s-1.36-containerd-2.3-erofs-dmverity \
+  OUTPUT_ROOT="$PWD/target/nested-policy-evaluation"
+```
+
+Use `tests/copy-baseline-policy.sh` as the candidate generator to smoke-test
+the two-variant orchestration before integrating another compiler. Because it
+copies the baseline policy byte for byte, both variants must produce identical
+verdicts. The checked-in command-mutation probe exercises both the automatic
+positive controls and attributed negative runs:
+
+```bash
+make -C src/tools/genpolicy/nested-policy-compat policy-evaluation-e2e \
+  FIXTURES=pod.yaml \
+  CANDIDATE_POLICY_GENERATOR="$PWD/src/tools/genpolicy/nested-policy-compat/tests/copy-baseline-policy.sh" \
+  RUNTIME_FIXTURES_DIR="$PWD/src/tools/genpolicy/nested-policy-compat/tests/policy-evaluation/command-mutation/runtime" \
+  POLICY_EXPECTATIONS_DIR="$PWD/src/tools/genpolicy/nested-policy-compat/tests/policy-evaluation/command-mutation/expectations" \
+  PROFILE=k8s-1.36-containerd-2.3-guest-pull \
+  OUTPUT_ROOT="$PWD/target/nested-policy-command-mutation"
+```
+
+To evaluate a suspected authorization gap, set `RUNTIME_FIXTURES_DIR` to a
+directory containing files with the same names as the selected `FIXTURES`.
+Policy is generated from the repository fixture, but both variants execute the
+corresponding runtime fixture. This models an untrusted host presenting a
+request derived from different workload intent.
+
+Every distinct runtime workload requires
+`POLICY_EXPECTATIONS_DIR/<fixture-name>.json`. The file states the expected
+Agent verdict and denial attribution for each active variant:
+
+```json
+{
+  "baseline": {
+    "result": "policy-incompatible",
+    "denial_contains": [
+      "CreateContainerRequest",
+      "annotations"
+    ]
+  },
+  "candidate": {
+    "result": "policy-incompatible",
+    "denial_contains": [
+      "CreateContainerRequest",
+      "annotations"
+    ]
+  }
+}
+```
+
+Valid expected verdicts are `compatible` and `policy-incompatible`.
+Infrastructure and policy generation failures always fail the harness and are
+never accepted as expected security outcomes. Every security-probe variant
+first runs an automatic positive control using the generation workload; the
+probe is accepted only when that control is compatible and the probe's denial
+contains every configured attribution string. An unexpected baseline
+`compatible` result in a probe expected to be denied is evidence of a policy
+authorization gap; a candidate-only denial on a positive fixture is a
+compatibility regression, not proof of improved security.
+
+Each case writes `policy-evaluation.json` with workload, policy, and generation
+input hashes plus expected and actual verdicts. The matrix writes an aggregate
+`policy-evaluation.json` under `OUTPUT_ROOT`, requires exactly one report for
+every selected fixture, and fails when any observed verdict differs from its
+expectation.
 
 ## Validation
 

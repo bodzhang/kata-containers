@@ -1,0 +1,22 @@
+# Copyright (c) 2026 Microsoft Corporation
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "agent-request-capture"
+version = "0.1.0"
+authors.workspace = true
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+protobuf.workspace = true
+protocols.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ttrpc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

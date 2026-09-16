@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.util
+import os
 import socket
 import tempfile
 import threading
@@ -73,6 +74,14 @@ class CaptureSupervisorTest(unittest.TestCase):
             self.assertEqual(
                 supervisor.state()["intercepted_sockets"],
                 [str(socket_path)],
+            )
+            self.assertEqual(
+                os.stat(output / "state.json").st_mode & 0o777,
+                0o600,
+            )
+            self.assertEqual(
+                os.stat(output / "000001" / "metadata.json").st_mode & 0o777,
+                0o600,
             )
 
 if __name__ == "__main__":

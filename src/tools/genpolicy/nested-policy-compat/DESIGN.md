@@ -131,9 +131,41 @@ frames. They may also contain the synthetic Secret or ConfigMap fixture
 payloads sent through `CopyFile`. The `agent-rpcs` directory is mode `0700` to
 keep each run's diagnostic artifacts isolated.
 
+After nested execution finishes, a host-side analysis tool reads each
+`shim-to-agent.bin`, validates the ttRPC framing, decodes the request envelope,
+and resolves known service methods through the repository's generated
+protobuf descriptors. It writes:
+
+- `agent-requests/requests.jsonl`, with connection and frame sequence,
+  stream ID, byte offset, service, method, metadata, request type, and the
+  reflected request body;
+- `agent-requests/manifest.json`, with source hashes, handshake and connection
+  metadata, request counts, and whether every request type was recognized.
+
+Unknown methods are retained with their protobuf payload encoded as base64.
+Known methods carrying protobuf fields newer than the checked-out descriptor
+retain the complete payload the same way. Both cases mark
+`typed_decode_complete` false. Connections to hybrid-vsock ports other than
+the Agent ttRPC port `1024` are hashed and recorded but not decoded as ttRPC.
+Malformed request payloads, a truncated final Agent frame, capture-supervisor
+errors, and connection-count mismatches are retained in the manifest and mark
+the capture incomplete. A decoder failure that prevents a manifest from being
+published fails the matrix independently of the policy verdict. The raw byte
+streams remain authoritative; the JSON files are versioned, analysis-only
+derivatives. Both the directory and files use restrictive permissions because
+decoded `CopyFile`, environment, annotation, and storage fields can contain
+Secret or ConfigMap content.
+
+Decoding occurs only after the nested container exits. Baseline and candidate
+policies are generated before nested execution, and neither generator receives
+the capture path or decoded files. Request capture therefore supports
+policy-versus-observation analysis without introducing a capture-derived
+policy-generation path.
+
 The initial implementation supports hybrid-vsock configurations only. Native
 QEMU AF_VSOCK does not expose a Unix pathname that this relay can interpose.
-Failure to capture at least one connection is an infrastructure failure.
+Failure to capture and decode at least one request is an infrastructure
+failure.
 
 ## Verdict
 

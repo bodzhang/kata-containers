@@ -1,0 +1,16 @@
+{
+  "baseline": {
+    "result": "policy-incompatible",
+    "denial_contains": [
+      "CreateContainerRequest",
+      "command: no policy container declares"
+    ]
+  },
+  "candidate": {
+    "result": "policy-incompatible",
+    "denial_contains": [
+      "CreateContainerRequest",
+      "command: no policy container declares"
+    ]
+  }
+}
