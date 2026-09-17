@@ -99,6 +99,7 @@ default AllowRequestsFailingPolicy := false
 # Constants
 S_NAME_KEY = "io.kubernetes.cri.sandbox-name"
 S_NAMESPACE_KEY = "io.kubernetes.cri.sandbox-namespace"
+S_UID_KEY = "io.kubernetes.cri.sandbox-uid"
 CDI_VFIO_ANNOTATION_PREFIX = "cdi.k8s.io/vfio"
 VFIO_PCI_ADDRESS_REGEX = "^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[01][0-9a-fA-F]\\.[0-7]=[0-9a-fA-F]{2}/[0-9a-fA-F]{2}$"
 
@@ -150,6 +151,9 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
     add_namespace_to_state := allow_namespace(p_namespace, i_namespace)
     ops_builder2 := concat_op_if_not_null(ops_builder1, add_namespace_to_state)
 
+    pod_uid_op := allow_pod_uid_state(p_oci.Process, i_oci)
+    ops_builder3 := concat_op_if_not_null(ops_builder2, pod_uid_op)
+
     print("CreateContainerRequest: p Version =", p_oci.Version, "i Version =", i_oci.Version)
     p_oci.Version == i_oci.Version
 
@@ -164,7 +168,7 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
     p_devices := p_container.devices
     allow_devices(p_devices, i_devices, i_oci)
 
-    ret := allow_linux(ops_builder2, p_oci, i_oci)
+    ret := allow_linux(ops_builder3, p_oci, i_oci)
     ret.allowed
 
     # save to policy state
@@ -214,6 +218,27 @@ allow_namespace(p_namespace, i_namespace) = add_namespace if {
     p_namespace == i_namespace
     add_namespace := state_allows("namespace", i_namespace)
     print("allow_namespace 1: input namespace matches policy data")
+}
+
+pod_uid_is_valid(uid) if {
+    regex.match("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", uid)
+}
+
+process_uses_pod_uid(p_process) if {
+    some name, rule in object.get(p_process, "EnvRules", {})
+    some source in object.get(rule.matcher, "sources", [])
+    source.type == "pod_uid"
+}
+
+allow_pod_uid_state(p_process, i_oci) := op if {
+    process_uses_pod_uid(p_process)
+    uid := i_oci.Annotations[S_UID_KEY]
+    pod_uid_is_valid(uid)
+    op := state_allows("pod_uid", uid)
+}
+
+allow_pod_uid_state(p_process, i_oci) := null if {
+    not process_uses_pod_uid(p_process)
 }
 
 allow_namespace(p_namespace, i_namespace) = add_namespace if {
@@ -1090,15 +1115,91 @@ allow_env(p_process, i_process, s_name, s_namespace) if {
     print("allow_env: true")
 }
 
-# Allow input env variables that are present in the policy data too.
+env_name_value(env) := [name, value] if {
+    eq := indexof(env, "=")
+    eq > 0
+    name := substring(env, 0, eq)
+    value := substring(env, eq + 1, -1)
+}
+
+typed_env_rule(p_process, name) := rule if {
+    rules := object.get(p_process, "EnvRules", {})
+    rule := rules[name]
+}
+
+# A typed rule is authoritative for its variable name. If its matcher is
+# unsupported or does not match, none of the legacy regex or placeholder rules
+# may authorize the same variable.
 allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
+    name_value := env_name_value(i_var)
+    rule := typed_env_rule(p_process, name_value[0])
+    typed_env_value_matches(rule.matcher, name_value[1], s_name, s_namespace)
+}
+
+allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
+    name_value := env_name_value(i_var)
+    not typed_env_rule(p_process, name_value[0])
+    allow_legacy_var(p_process, i_process, i_var, s_name, s_namespace)
+}
+
+typed_env_value_matches(matcher, value, s_name, s_namespace) if {
+    matcher.type == "exact"
+    value == matcher.value
+}
+
+typed_env_value_matches(matcher, value, s_name, s_namespace) if {
+    matcher.type == "runtime"
+    count(matcher.sources) == 1
+    matcher.sources[0].type == "sandbox_hostname"
+    hostname := get_state_val("sandbox_hostname")
+    expected := replace(matcher.template, "$(host-name)", hostname)
+    value == expected
+}
+
+typed_env_value_matches(matcher, value, s_name, s_namespace) if {
+    matcher.type == "runtime"
+    count(matcher.sources) == 1
+    matcher.sources[0].type == "pod_uid"
+    uid := input.OCI.Annotations[S_UID_KEY]
+    pod_uid_is_valid(uid)
+    expected := replace(matcher.template, "$(pod-uid)", uid)
+    value == expected
+}
+
+typed_env_value_matches(matcher, value, s_name, s_namespace) if {
+    matcher.type == "runtime"
+    count(matcher.sources) == 1
+    matcher.sources[0].type == "pod_uid"
+    uid := get_state_val("pod_uid")
+    expected := replace(matcher.template, "$(pod-uid)", uid)
+    value == expected
+}
+
+typed_env_value_matches(matcher, value, s_name, s_namespace) if {
+    matcher.type == "runtime"
+    count(matcher.sources) == 1
+    matcher.sources[0].type == "sandbox_name"
+    expected := replace(matcher.template, "$(sandbox-name)", s_name)
+    value == expected
+}
+
+typed_env_value_matches(matcher, value, s_name, s_namespace) if {
+    matcher.type == "runtime"
+    count(matcher.sources) == 1
+    matcher.sources[0].type == "sandbox_namespace"
+    expected := replace(matcher.template, "$(sandbox-namespace)", s_namespace)
+    value == expected
+}
+
+# Allow input env variables that are present in the policy data too.
+allow_legacy_var(p_process, i_process, i_var, s_name, s_namespace) if {
     some p_var in p_process.Env
     p_var == i_var
     print("allow_var 1: true")
 }
 
 # Match input with one of the policy variables, after substituting $(sandbox-name).
-allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
+allow_legacy_var(p_process, i_process, i_var, s_name, s_namespace) if {
     some p_var in p_process.Env
     p_var2 := replace(p_var, "$(sandbox-name)", s_name)
 
@@ -1119,7 +1220,7 @@ allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
 }
 
 # Allow input env variables that match with a request_defaults regex.
-allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
+allow_legacy_var(p_process, i_process, i_var, s_name, s_namespace) if {
     some p_regex1 in policy_data.request_defaults.CreateContainerRequest.allow_env_regex
     p_regex2 := replace(p_regex1, "$(ipv4_a)", policy_data.common.ipv4_a)
     p_regex3 := replace(p_regex2, "$(ip_p)", policy_data.common.ip_p)
@@ -1133,7 +1234,7 @@ allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
 }
 
 # Allow fieldRef "fieldPath: status.podIP" values.
-allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
+allow_legacy_var(p_process, i_process, i_var, s_name, s_namespace) if {
     name_value := split(i_var, "=")
     count(name_value) == 2
     is_ip(name_value[1])
@@ -1145,7 +1246,7 @@ allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
 }
 
 # Allow common fieldRef variables.
-allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
+allow_legacy_var(p_process, i_process, i_var, s_name, s_namespace) if {
     name_value := split(i_var, "=")
     count(name_value) == 2
 
@@ -1164,7 +1265,7 @@ allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
 }
 
 # Allow fieldRef "fieldPath: status.hostIP" values.
-allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
+allow_legacy_var(p_process, i_process, i_var, s_name, s_namespace) if {
     name_value := split(i_var, "=")
     count(name_value) == 2
     is_ip(name_value[1])
@@ -1176,7 +1277,7 @@ allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
 }
 
 # Allow resourceFieldRef values (e.g., "limits.cpu").
-allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
+allow_legacy_var(p_process, i_process, i_var, s_name, s_namespace) if {
     name_value := split(i_var, "=")
     count(name_value) == 2
 
@@ -1194,7 +1295,7 @@ allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
     print("allow_var 7: true")
 }
 
-allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
+allow_legacy_var(p_process, i_process, i_var, s_name, s_namespace) if {
     some p_var in p_process.Env
     p_var2 := replace(p_var, "$(sandbox-namespace)", s_namespace)
 
@@ -1240,7 +1341,7 @@ allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
 #     It also means a feed that exists only because another fragment delegated to it has no
 #     ceiling at all and therefore contributes no env rules -- delegation cannot manufacture
 #     env-rule authority the measured policy never granted.
-allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
+allow_legacy_var(p_process, i_process, i_var, s_name, s_namespace) if {
     # Split on the *first* "=" only. The `split(i_var, "=")` / `count == 2` idiom the arms
     # above use silently refuses any value that itself contains an "=" -- base64 payloads,
     # connection strings, JWTs -- which is a common shape for a pipeline-injected variable.
@@ -2263,7 +2364,7 @@ allow_sandbox_storage(p_storages, i_storage) if {
     print("allow_sandbox_storage: true")
 }
 
-CreateSandboxRequest if {
+CreateSandboxRequest := {"ops": ops, "allowed": true} if {
     print("CreateSandboxRequest: input.guest_hook_path =", input.guest_hook_path)
     count(input.guest_hook_path) == 0
 
@@ -2274,15 +2375,18 @@ CreateSandboxRequest if {
     print("CreateSandboxRequest: i_pidns =", i_pidns)
     i_pidns == false
     allow_sandbox_storages(input.storages)
+
+    hostname_op := state_allows("sandbox_hostname", input.hostname)
+    ops := concat_op_if_not_null([], hostname_op)
 }
 
 allow_exec(p_container, i_process) if {
     print("allow_exec: start")
 
     p_oci = p_container.OCI
-    p_s_name = p_oci.Annotations[S_NAME_KEY]
+    s_name = get_state_val("sandbox_name")
     s_namespace = get_state_val("namespace")
-    allow_probe_process(p_oci.Process, i_process, p_s_name, s_namespace)
+    allow_probe_process(p_oci.Process, i_process, s_name, s_namespace)
 
     print("allow_exec: true")
 }
@@ -2291,9 +2395,9 @@ allow_interactive_exec(p_container, i_process) if {
     print("allow_interactive_exec: start")
 
     p_oci = p_container.OCI
-    p_s_name = p_oci.Annotations[S_NAME_KEY]
+    s_name = get_state_val("sandbox_name")
     s_namespace = get_state_val("namespace")
-    allow_interactive_process(p_oci.Process, i_process, p_s_name, s_namespace)
+    allow_interactive_process(p_oci.Process, i_process, s_name, s_namespace)
 
     print("allow_interactive_exec: true")
 }

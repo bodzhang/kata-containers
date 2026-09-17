@@ -214,12 +214,11 @@ mod tests {
         let (mut pol, policy, testdata_dir, workdir) = prepare_policy(test_case_dir).await;
 
         // Run through the test cases and evaluate the canned requests.
+        let test_cases = load_test_cases(&testdata_dir, &policy);
 
-        let raw_cases =
-            fs::read_to_string(testdata_dir.join("testcases.json")).expect("test cases readable");
-        let test_cases: Vec<TestCase> =
-            serde_json::from_str(&resolve_roothashes(&raw_cases, &policy))
-                .expect("test case file should parse");
+        if test_case_dir != "createsandbox" {
+            seed_sandbox_hostname(&mut pol, &test_cases).await;
+        }
 
         for test_case in test_cases {
             println!("\n== case: {} ==\n", test_case.description);
@@ -243,6 +242,96 @@ mod tests {
                 logs, results.1
             );
         }
+    }
+
+    fn load_test_cases(testdata_dir: &path::Path, policy: &str) -> Vec<TestCase> {
+        let raw_cases =
+            fs::read_to_string(testdata_dir.join("testcases.json")).expect("test cases readable");
+        serde_json::from_str(&resolve_roothashes(&raw_cases, policy))
+            .expect("test case file should parse")
+    }
+
+    fn hostname_from_cases(test_cases: &[TestCase]) -> Option<String> {
+        test_cases.iter().find_map(|test_case| {
+            let env = match &test_case.request {
+                TestRequest::CreateContainerRequest(request) => {
+                    &request.OCI.as_ref()?.Process.as_ref()?.Env
+                }
+                TestRequest::ExecProcessRequest(request) => &request.process.as_ref()?.Env,
+                _ => return None,
+            };
+
+            env.iter()
+                .find_map(|entry| entry.strip_prefix("HOSTNAME=").map(str::to_string))
+        })
+    }
+
+    fn sandbox_annotation_from_cases(test_cases: &[TestCase], key: &str) -> Option<String> {
+        test_cases.iter().find_map(|test_case| {
+            let TestRequest::CreateContainerRequest(request) = &test_case.request else {
+                return None;
+            };
+            request.OCI.as_ref()?.Annotations.get(key).cloned()
+        })
+    }
+
+    async fn seed_sandbox_hostname(pol: &mut AgentPolicy, test_cases: &[TestCase]) {
+        let Some(hostname) = hostname_from_cases(test_cases) else {
+            return;
+        };
+
+        let request = CreateSandboxRequest {
+            hostname,
+            ..Default::default()
+        };
+        let input = serde_json::to_string(&request).unwrap();
+        let result = pol
+            .allow_request("CreateSandboxRequest", &input)
+            .await
+            .expect("sandbox hostname setup should evaluate");
+        assert!(result.0, "sandbox hostname setup denied: {}", result.1);
+    }
+
+    async fn evaluate_request(pol: &mut AgentPolicy, request: &TestRequest) -> (bool, String) {
+        let value = serialize_request_only(request).unwrap();
+        pol.allow_request(request.to_string().as_str(), &value.to_string())
+            .await
+            .expect("request should evaluate")
+    }
+
+    fn set_env(env: &mut Vec<String>, name: &str, value: &str) {
+        let prefix = format!("{name}=");
+        if let Some(entry) = env.iter_mut().find(|entry| entry.starts_with(&prefix)) {
+            *entry = format!("{prefix}{value}");
+        } else {
+            env.push(format!("{prefix}{value}"));
+        }
+    }
+
+    fn set_create_env(request: &mut CreateContainerRequest, name: &str, value: &str) {
+        let process = request
+            .OCI
+            .as_mut()
+            .and_then(|oci| oci.Process.as_mut())
+            .expect("create request should contain an OCI process");
+        set_env(&mut process.Env, name, value);
+    }
+
+    fn set_create_annotation(request: &mut CreateContainerRequest, key: &str, value: &str) {
+        request
+            .OCI
+            .as_mut()
+            .expect("create request should contain OCI")
+            .Annotations
+            .insert(key.to_string(), value.to_string());
+    }
+
+    fn set_exec_env(request: &mut ExecProcessRequest, name: &str, value: &str) {
+        let process = request
+            .process
+            .as_mut()
+            .expect("exec request should contain a process");
+        set_env(&mut process.Env, name, value);
     }
 
     /// Resolve `$(roothash-N)` placeholders in a test case file against the root
@@ -437,6 +526,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pod_uid_is_pinned_by_first_accepted_create() {
+        let (mut pol, policy, testdata_dir, _) = prepare_policy("state/execprocess").await;
+        let test_cases = load_test_cases(&testdata_dir, &policy);
+        seed_sandbox_hostname(&mut pol, &test_cases).await;
+
+        let mut creates = test_cases.into_iter().filter_map(|test_case| {
+            if !test_case.allowed {
+                return None;
+            }
+            let TestRequest::CreateContainerRequest(request) = test_case.request else {
+                return None;
+            };
+            Some(request)
+        });
+
+        let first = creates
+            .next()
+            .expect("fixture should contain a first create");
+        let first_result =
+            evaluate_request(&mut pol, &TestRequest::CreateContainerRequest(first)).await;
+        assert!(
+            first_result.0,
+            "first create should establish Pod UID state"
+        );
+
+        let mut second = creates
+            .next()
+            .expect("fixture should contain a second create");
+        set_create_annotation(
+            &mut second,
+            "io.kubernetes.cri.sandbox-uid",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        );
+        let second_result =
+            evaluate_request(&mut pol, &TestRequest::CreateContainerRequest(second)).await;
+        assert!(
+            !second_result.0,
+            "later create accepted a different canonical Pod UID"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_runtime_env_references_must_match_sandbox_state() {
+        let (mut pol, policy, testdata_dir, _) = prepare_policy("state/execprocess").await;
+        let test_cases = load_test_cases(&testdata_dir, &policy);
+        let pod_uid = sandbox_annotation_from_cases(&test_cases, "io.kubernetes.cri.sandbox-uid")
+            .expect("fixture should contain a sandbox UID");
+        seed_sandbox_hostname(&mut pol, &test_cases).await;
+
+        for test_case in test_cases {
+            match test_case.request {
+                TestRequest::ExecProcessRequest(mut request) if test_case.allowed => {
+                    set_exec_env(&mut request, "POD_NAME", "busybox");
+                    set_exec_env(&mut request, "POD_NAMESPACE", "default");
+                    set_exec_env(&mut request, "POD_UID", &pod_uid);
+                    let correct = evaluate_request(
+                        &mut pol,
+                        &TestRequest::ExecProcessRequest(request.clone()),
+                    )
+                    .await;
+                    assert!(correct.0, "exec rejected correct runtime references");
+
+                    let mut bad_hostname = request.clone();
+                    set_exec_env(&mut bad_hostname, "HOSTNAME", "attacker-hostname");
+                    let result =
+                        evaluate_request(&mut pol, &TestRequest::ExecProcessRequest(bad_hostname))
+                            .await;
+                    assert!(
+                        !result.0,
+                        "exec accepted HOSTNAME that differs from sandbox state"
+                    );
+
+                    let mut bad_name = request.clone();
+                    set_exec_env(&mut bad_name, "POD_NAME", "attacker-name");
+                    let result =
+                        evaluate_request(&mut pol, &TestRequest::ExecProcessRequest(bad_name))
+                            .await;
+                    assert!(
+                        !result.0,
+                        "exec accepted POD_NAME that differs from sandbox state"
+                    );
+
+                    let mut bad_namespace = request.clone();
+                    set_exec_env(&mut bad_namespace, "POD_NAMESPACE", "attacker-namespace");
+                    let result =
+                        evaluate_request(&mut pol, &TestRequest::ExecProcessRequest(bad_namespace))
+                            .await;
+                    assert!(
+                        !result.0,
+                        "exec accepted POD_NAMESPACE that differs from sandbox state"
+                    );
+
+                    let mut bad_uid = request.clone();
+                    set_exec_env(
+                        &mut bad_uid,
+                        "POD_UID",
+                        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    );
+                    let result =
+                        evaluate_request(&mut pol, &TestRequest::ExecProcessRequest(bad_uid)).await;
+                    assert!(
+                        !result.0,
+                        "exec accepted POD_UID that differs from sandbox state"
+                    );
+                    return;
+                }
+                request => {
+                    let result = evaluate_request(&mut pol, &request).await;
+                    assert_eq!(
+                        test_case.allowed, result.0,
+                        "setup request failed: {}",
+                        result.1
+                    );
+                }
+            }
+        }
+
+        panic!("fixture did not contain an allowed exec request");
+    }
+
+    #[tokio::test]
     async fn test_state_signal_process() {
         runtests("state/signalprocess").await;
     }
@@ -619,6 +829,87 @@ mod tests {
         runtests("createcontainer/env_vars").await;
     }
 
+    #[tokio::test]
+    async fn test_create_runtime_env_references_cannot_fall_back_to_legacy_rules() {
+        let (mut pol, policy, testdata_dir, _) = prepare_policy("createcontainer/env_vars").await;
+        let test_cases = load_test_cases(&testdata_dir, &policy);
+        seed_sandbox_hostname(&mut pol, &test_cases).await;
+
+        let request = test_cases
+            .iter()
+            .find_map(|test_case| {
+                if !test_case.allowed {
+                    return None;
+                }
+                let TestRequest::CreateContainerRequest(request) = &test_case.request else {
+                    return None;
+                };
+                Some(request.clone())
+            })
+            .expect("fixture should contain an allowed create request");
+
+        let mut bad_hostname = request.clone();
+        set_create_env(&mut bad_hostname, "HOSTNAME", "attacker-hostname");
+        let result =
+            evaluate_request(&mut pol, &TestRequest::CreateContainerRequest(bad_hostname)).await;
+        assert!(
+            !result.0,
+            "create accepted HOSTNAME through the legacy dns-label regex"
+        );
+
+        let mut bad_name = request.clone();
+        set_create_env(&mut bad_name, "POD_NAME", "attacker-name");
+        let result =
+            evaluate_request(&mut pol, &TestRequest::CreateContainerRequest(bad_name)).await;
+        assert!(
+            !result.0,
+            "create accepted POD_NAME that differs from the sandbox annotation"
+        );
+
+        let mut bad_namespace = request.clone();
+        set_create_env(&mut bad_namespace, "POD_NAMESPACE", "attacker-namespace");
+        let result = evaluate_request(
+            &mut pol,
+            &TestRequest::CreateContainerRequest(bad_namespace),
+        )
+        .await;
+        assert!(
+            !result.0,
+            "create accepted POD_NAMESPACE that differs from the sandbox annotation"
+        );
+
+        let mut bad_uid = request.clone();
+        set_create_env(
+            &mut bad_uid,
+            "POD_UID",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        );
+        let result =
+            evaluate_request(&mut pol, &TestRequest::CreateContainerRequest(bad_uid)).await;
+        assert!(
+            !result.0,
+            "create accepted POD_UID that differs from the sandbox annotation"
+        );
+
+        let mut invalid_uid = request;
+        invalid_uid
+            .OCI
+            .as_mut()
+            .expect("create request should contain OCI")
+            .Annotations
+            .insert(
+                "io.kubernetes.cri.sandbox-uid".to_string(),
+                "not-a-uuid".to_string(),
+            );
+        set_create_env(&mut invalid_uid, "POD_UID", "not-a-uuid");
+        let result =
+            evaluate_request(&mut pol, &TestRequest::CreateContainerRequest(invalid_uid)).await;
+        assert!(
+            !result.0,
+            "create accepted a non-canonical sandbox UID annotation"
+        );
+    }
+
     // FR-16: the policy exact-matches the OCI Process workingDir (Cwd), the
     // apparmor profile pinned by the pod spec, and the process rlimits, so a
     // compromised host cannot weaken these when starting a container.
@@ -660,12 +951,11 @@ mod tests {
     /// the paths the old exact-match diagnostic could not see.
     #[tokio::test]
     async fn a_denial_names_the_check_that_failed_and_no_others() {
-        let (mut pol, _policy, testdata_dir, _workdir) =
+        let (mut pol, policy, testdata_dir, _workdir) =
             prepare_policy("state/execprocessdeployment").await;
 
-        let raw_cases =
-            fs::read_to_string(testdata_dir.join("testcases.json")).expect("test cases readable");
-        let cases: Vec<TestCase> = serde_json::from_str(&raw_cases).expect("test cases parse");
+        let cases = load_test_cases(&testdata_dir, &policy);
+        seed_sandbox_hostname(&mut pol, &cases).await;
 
         // Start from a request the policy accepts, so the only thing under test is the
         // single field we break below.
@@ -719,7 +1009,7 @@ mod tests {
         );
         assert!(
             !message.contains("HOSTNAME"),
-            "HOSTNAME is admitted via the $(host-name) substitution and must not be \
+            "HOSTNAME is admitted by the sandbox-hostname resolver and must not be \
              reported as undeclared: {message}"
         );
         assert!(
@@ -734,12 +1024,11 @@ mod tests {
     /// everything for some unrelated reason.
     #[tokio::test]
     async fn the_unmodified_request_is_still_allowed() {
-        let (mut pol, _policy, testdata_dir, _workdir) =
+        let (mut pol, policy, testdata_dir, _workdir) =
             prepare_policy("state/execprocessdeployment").await;
 
-        let raw_cases =
-            fs::read_to_string(testdata_dir.join("testcases.json")).expect("test cases readable");
-        let cases: Vec<TestCase> = serde_json::from_str(&raw_cases).expect("test cases parse");
+        let cases = load_test_cases(&testdata_dir, &policy);
+        seed_sandbox_hostname(&mut pol, &cases).await;
         let case = cases
             .iter()
             .find(|c| c.allowed && matches!(c.request, TestRequest::CreateContainerRequest(_)))

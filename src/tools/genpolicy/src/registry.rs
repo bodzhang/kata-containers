@@ -456,12 +456,16 @@ impl Container {
         }
 
         assert!(process.Env.is_empty());
+        assert!(process.EnvRules.is_empty());
         if let Some(config_env) = &docker_config.Env {
             for env in config_env {
                 process.Env.push(env.clone());
             }
         } else {
             containerd::get_default_unix_env(&mut process.Env);
+        }
+        for env in process.Env.clone() {
+            process.record_env_entry_exact(&env);
         }
 
         let policy_args = &mut process.Args;

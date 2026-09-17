@@ -17,6 +17,21 @@ spec:
         fieldRef:
           apiVersion: v1
           fieldPath: metadata.labels['labels.test.com/test-label1']
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: metadata.name
+    - name: POD_NAMESPACE
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: metadata.namespace
+    - name: POD_UID
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: metadata.uid
     securityContext:
       runAsUser: 2
       runAsGroup: 1

@@ -67,6 +67,10 @@ pub trait K8sResource {
         panic!("Unsupported");
     }
 
+    fn get_uid(&self) -> Option<String> {
+        None
+    }
+
     fn get_container_mounts_and_storages(
         &self,
         _policy_mounts: &mut Vec<policy::KataMount>,

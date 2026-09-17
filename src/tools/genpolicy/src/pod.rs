@@ -753,7 +753,12 @@ pub struct ConfigMapEnvSource {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ResourceFieldSelector {
     resource: String,
-    // TODO: additional fields.
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    containerName: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    divisor: Option<String>,
 }
 
 /// See Reference / Kubernetes API / Common Definitions / ObjectFieldSelector.
@@ -883,27 +888,25 @@ impl Container {
 
     pub fn get_env_variables(
         &self,
-        dest_env: &mut Vec<String>,
+        process: &mut policy::KataProcess,
         config_maps: &Vec<config_map::ConfigMap>,
         secrets: &Vec<secret::Secret>,
         namespace: &str,
         resource: &dyn yaml::K8sResource,
         service_account_name: &str,
     ) {
+        let mut explicit_rules = Vec::new();
         if let Some(source_env) = &self.env {
             for env_variable in source_env {
-                let value = env_variable.get_value(
+                let matcher = env_variable.get_matcher(
                     config_maps,
                     secrets,
                     namespace,
                     resource,
                     service_account_name,
                 );
-                let src_string = format!("{}={value}", &env_variable.name);
-
-                if !dest_env.contains(&src_string) {
-                    dest_env.push(src_string.clone());
-                }
+                process.add_env_matcher(env_variable.name.clone(), matcher.clone());
+                explicit_rules.push((env_variable.name.clone(), matcher));
             }
         }
 
@@ -912,11 +915,16 @@ impl Container {
                 let env_from_source_values = env_from_source.get_values(config_maps, secrets);
 
                 for value in env_from_source_values {
-                    if !dest_env.contains(&value) {
-                        dest_env.push(value.clone());
-                    }
+                    process.add_env_entry_exact(value);
                 }
             }
+        }
+
+        // Kubernetes explicit env entries override values imported through envFrom.
+        // Restore that precedence in the keyed shadow rules without changing the
+        // legacy Env ordering.
+        for (name, matcher) in explicit_rules {
+            process.set_env_matcher(name, matcher);
         }
     }
 
@@ -1042,57 +1050,65 @@ impl EnvFromSource {
 }
 
 impl EnvVar {
-    pub fn get_value(
+    pub fn get_matcher(
         &self,
         config_maps: &Vec<config_map::ConfigMap>,
         secrets: &Vec<secret::Secret>,
         namespace: &str,
         resource: &dyn yaml::K8sResource,
         service_account_name: &str,
-    ) -> String {
+    ) -> policy::KataEnvMatcher {
         // When neither `value` nor `valueFrom` were specified, the default value is an empty string:
         // https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#environment-variables
         if let Some(value) = &self.value {
-            value.clone()
+            matcher_for_declared_value(value)
         } else {
-            self.get_value_from(
+            self.get_matcher_from(
                 config_maps,
                 secrets,
                 namespace,
                 resource,
                 service_account_name,
             )
-            .unwrap_or_default()
+            .unwrap_or_else(|| policy::KataEnvMatcher::exact(""))
         }
     }
 
-    fn get_value_from(
+    fn get_matcher_from(
         &self,
         config_maps: &Vec<config_map::ConfigMap>,
         secrets: &Vec<secret::Secret>,
         namespace: &str,
         resource: &dyn yaml::K8sResource,
         service_account_name: &str,
-    ) -> Option<String> {
+    ) -> Option<policy::KataEnvMatcher> {
         if let Some(value_from) = &self.valueFrom {
             if let Some(value) = config_map::get_value(value_from, config_maps) {
-                return Some(value);
+                return Some(policy::KataEnvMatcher::exact(value));
             }
 
             if let Some(value) = secret::get_value(value_from, secrets) {
-                return Some(value);
+                return Some(policy::KataEnvMatcher::exact(value));
             }
 
-            if let Some(value) =
-                self.get_value_from_field_ref(value_from, namespace, resource, service_account_name)
-            {
-                return Some(value);
+            if let Some(matcher) = self.get_matcher_from_field_ref(
+                value_from,
+                namespace,
+                resource,
+                service_account_name,
+            ) {
+                return Some(matcher);
             }
 
-            if value_from.resourceFieldRef.is_some() {
-                // TODO: should resource fields such as "limits.cpu" or "limits.memory"
-                // be handled in a different way?
-                return Some("$(resource-field)".to_string());
+            if let Some(selector) = &value_from.resourceFieldRef {
+                return Some(policy::KataEnvMatcher::runtime(
+                    "$(resource-field)",
+                    policy::KataEnvRuntimeSource::ResourceField {
+                        resource: selector.resource.clone(),
+                        container_name: selector.containerName.clone(),
+                        divisor: selector.divisor.clone(),
+                    },
+                ));
             }
 
             panic!("Couldn't get the value of env var: {}", &self.name);
@@ -1101,34 +1117,57 @@ impl EnvVar {
         None
     }
 
-    fn get_value_from_field_ref(
+    fn get_matcher_from_field_ref(
         &self,
         value_from: &EnvVarSource,
         namespace: &str,
         resource: &dyn yaml::K8sResource,
         service_account_name: &str,
-    ) -> Option<String> {
+    ) -> Option<policy::KataEnvMatcher> {
         if let Some(field_ref) = &value_from.fieldRef {
             let path: &str = &field_ref.fieldPath;
-            let v = match path {
-                "metadata.name" => "$(sandbox-name)",
+            let matcher = match path {
+                "metadata.name" => policy::KataEnvMatcher::runtime(
+                    "$(sandbox-name)",
+                    policy::KataEnvRuntimeSource::SandboxName,
+                ),
                 "metadata.namespace" => {
                     if namespace.is_empty() {
-                        "$(sandbox-namespace)"
+                        policy::KataEnvMatcher::runtime(
+                            "$(sandbox-namespace)",
+                            policy::KataEnvRuntimeSource::SandboxNamespace,
+                        )
                     } else {
-                        namespace
+                        policy::KataEnvMatcher::exact(namespace)
                     }
                 }
-                "metadata.uid" => "$(pod-uid)",
-                "status.hostIP" => "$(host-ip)",
-                "status.podIP" => "$(pod-ip)",
-                "spec.nodeName" => "$(node-name)",
-                "spec.serviceAccountName" => service_account_name,
+                "metadata.uid" => resource.get_uid().map_or_else(
+                    || {
+                        policy::KataEnvMatcher::runtime(
+                            "$(pod-uid)",
+                            policy::KataEnvRuntimeSource::PodUid,
+                        )
+                    },
+                    policy::KataEnvMatcher::exact,
+                ),
+                "status.hostIP" => policy::KataEnvMatcher::runtime(
+                    "$(host-ip)",
+                    policy::KataEnvRuntimeSource::HostIp,
+                ),
+                "status.podIP" => policy::KataEnvMatcher::runtime(
+                    "$(pod-ip)",
+                    policy::KataEnvRuntimeSource::PodIp,
+                ),
+                "spec.nodeName" => policy::KataEnvMatcher::runtime(
+                    "$(node-name)",
+                    policy::KataEnvRuntimeSource::NodeName,
+                ),
+                "spec.serviceAccountName" => policy::KataEnvMatcher::exact(service_account_name),
                 _ => {
-                    if let Some(value) = self.get_annotation_value(path, resource) {
-                        &value.to_string()
+                    if let Some(matcher) = self.get_annotation_matcher(path, resource) {
+                        matcher
                     } else if let Some(value) = self.get_label_value(path, resource) {
-                        &value.to_string()
+                        policy::KataEnvMatcher::exact(value)
                     } else {
                         panic!(
                             "Env var: unsupported field reference: {}",
@@ -1137,17 +1176,17 @@ impl EnvVar {
                     }
                 }
             };
-            Some(v.to_string())
+            Some(matcher)
         } else {
             None
         }
     }
 
-    fn get_annotation_value(
+    fn get_annotation_matcher(
         &self,
         reference: &str,
         resource: &dyn yaml::K8sResource,
-    ) -> Option<String> {
+    ) -> Option<policy::KataEnvMatcher> {
         let prefix = "metadata.annotations['";
         let suffix = "']";
         if reference.starts_with(prefix) && reference.ends_with(suffix) {
@@ -1157,17 +1196,16 @@ impl EnvVar {
                 let annotation = reference[start..end].to_string();
 
                 if let Some(value) = annotations.get(&annotation) {
-                    return Some(value.clone());
+                    return Some(policy::KataEnvMatcher::exact(value));
                 } else {
                     warn!(
-                        "Can't find the value of annotation {}. Allowing any value.",
+                        "Can't find the value of annotation {}. Recording an empty value.",
                         &annotation
                     );
                 }
             }
 
-            // TODO: should missing annotations be handled differently?
-            return Some("$(todo-annotation)".to_string());
+            return Some(policy::KataEnvMatcher::exact(""));
         }
         None
     }
@@ -1192,6 +1230,35 @@ impl EnvVar {
     }
 }
 
+fn matcher_for_declared_value(value: &str) -> policy::KataEnvMatcher {
+    let mut sources = BTreeSet::new();
+    let mut remaining = value;
+
+    while let Some(start) = remaining.find("$(") {
+        let reference = &remaining[start + 2..];
+        let Some(end) = reference.find(')') else {
+            break;
+        };
+
+        let name = &reference[..end];
+        if !name.is_empty() {
+            sources.insert(policy::KataEnvRuntimeSource::EnvironmentReference {
+                name: name.to_string(),
+            });
+        }
+        remaining = &reference[end + 1..];
+    }
+
+    if sources.is_empty() {
+        policy::KataEnvMatcher::exact(value)
+    } else {
+        policy::KataEnvMatcher::Runtime {
+            template: value.to_string(),
+            sources,
+        }
+    }
+}
+
 #[async_trait]
 impl yaml::K8sResource for Pod {
     async fn init(&mut self, config: &Config, doc_mapping: &serde_yaml::Value, _silent: bool) {
@@ -1205,6 +1272,10 @@ impl yaml::K8sResource for Pod {
 
     fn get_namespace(&self) -> Option<String> {
         self.metadata.get_namespace()
+    }
+
+    fn get_uid(&self) -> Option<String> {
+        self.metadata.uid.clone()
     }
 
     fn get_container_mounts_and_storages(
@@ -1525,6 +1596,164 @@ fn sum_limits_by_keys(limits: &BTreeMap<String, String>, keys: &[String]) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_environment_references_are_runtime_bound() {
+        assert_eq!(
+            matcher_for_declared_value("prefix-$(SOURCE)-$(node-name)"),
+            policy::KataEnvMatcher::Runtime {
+                template: "prefix-$(SOURCE)-$(node-name)".to_string(),
+                sources: BTreeSet::from([
+                    policy::KataEnvRuntimeSource::EnvironmentReference {
+                        name: "SOURCE".to_string(),
+                    },
+                    policy::KataEnvRuntimeSource::EnvironmentReference {
+                        name: "node-name".to_string(),
+                    },
+                ]),
+            }
+        );
+        assert_eq!(
+            matcher_for_declared_value("literal"),
+            policy::KataEnvMatcher::exact("literal")
+        );
+    }
+
+    #[test]
+    fn unsupported_runtime_sources_remain_legacy_only() {
+        let cases = [
+            (
+                policy::KataEnvMatcher::runtime("$(pod-ip)", policy::KataEnvRuntimeSource::PodIp),
+                "$(pod-ip)",
+            ),
+            (
+                policy::KataEnvMatcher::runtime("$(host-ip)", policy::KataEnvRuntimeSource::HostIp),
+                "$(host-ip)",
+            ),
+            (
+                policy::KataEnvMatcher::runtime(
+                    "$(node-name)",
+                    policy::KataEnvRuntimeSource::NodeName,
+                ),
+                "$(node-name)",
+            ),
+            (
+                policy::KataEnvMatcher::runtime(
+                    "$(resource-field)",
+                    policy::KataEnvRuntimeSource::ResourceField {
+                        resource: "limits.cpu".to_string(),
+                        container_name: None,
+                        divisor: None,
+                    },
+                ),
+                "$(resource-field)",
+            ),
+            (
+                policy::KataEnvMatcher::runtime(
+                    "$(OTHER)",
+                    policy::KataEnvRuntimeSource::EnvironmentReference {
+                        name: "OTHER".to_string(),
+                    },
+                ),
+                "$(OTHER)",
+            ),
+        ];
+
+        for (index, (matcher, legacy_value)) in cases.into_iter().enumerate() {
+            let mut process = policy::KataProcess::default();
+            let name = format!("UNRESOLVED_{index}");
+            let expected = format!("{name}={legacy_value}");
+            process.add_env_matcher(name.clone(), matcher);
+
+            assert!(process.Env.contains(&expected));
+            assert!(
+                !process.EnvRules.contains_key(&name),
+                "unsupported runtime source became authoritative"
+            );
+        }
+    }
+
+    #[test]
+    fn attested_pod_uid_is_an_exact_environment_rule() {
+        let pod: Pod = serde_yaml::from_str(
+            r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: uid-test
+  namespace: default
+  uid: 31df313a-931f-4979-a405-cc3f3ccb6a56
+spec:
+  containers:
+    - name: app
+      image: example.invalid/app
+      env:
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+"#,
+        )
+        .unwrap();
+        let env = &pod.spec.containers[0].env.as_ref().unwrap()[0];
+
+        assert_eq!(
+            env.get_matcher(&vec![], &vec![], "default", &pod, "default"),
+            policy::KataEnvMatcher::exact("31df313a-931f-4979-a405-cc3f3ccb6a56")
+        );
+    }
+
+    #[test]
+    fn explicit_env_rule_overrides_env_from_rule() {
+        let pod: Pod = serde_yaml::from_str(
+            r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: env-precedence
+spec:
+  containers:
+    - name: app
+      image: example.invalid/app
+      env:
+        - name: SHARED
+          value: explicit
+      envFrom:
+        - configMapRef:
+            name: app-env
+"#,
+        )
+        .unwrap();
+        let config_map: config_map::ConfigMap = serde_yaml::from_str(
+            r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-env
+data:
+  SHARED: imported
+"#,
+        )
+        .unwrap();
+        let container = &pod.spec.containers[0];
+        let mut process = policy::KataProcess::default();
+
+        container.get_env_variables(
+            &mut process,
+            &vec![config_map],
+            &Vec::new(),
+            "",
+            &pod,
+            "default",
+        );
+
+        assert!(process.Env.contains(&"SHARED=explicit".to_string()));
+        assert!(process.Env.contains(&"SHARED=imported".to_string()));
+        assert_eq!(
+            process.EnvRules["SHARED"].matcher,
+            policy::KataEnvMatcher::exact("explicit")
+        );
+    }
 
     fn make_limits(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries

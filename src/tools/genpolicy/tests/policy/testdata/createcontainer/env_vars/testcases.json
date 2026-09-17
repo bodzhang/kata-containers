@@ -277,7 +277,10 @@
           "Env": [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HOSTNAME=gid-experiment",
-            "TEST_VAR1=test-value1"
+            "TEST_VAR1=test-value1",
+            "POD_NAME=gid-experiment",
+            "POD_NAMESPACE=default",
+            "POD_UID=31df313a-931f-4979-a405-cc3f3ccb6a56"
           ],
           "NoNewPrivileges": false,
           "OOMScoreAdj": 994,
@@ -603,7 +606,10 @@
           "Env": [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HOSTNAME=gid-experiment",
-            "TEST_VAR1=test-value12"
+            "TEST_VAR1=test-value12",
+            "POD_NAME=gid-experiment",
+            "POD_NAMESPACE=default",
+            "POD_UID=31df313a-931f-4979-a405-cc3f3ccb6a56"
           ],
           "NoNewPrivileges": false,
           "OOMScoreAdj": 994,
@@ -929,7 +935,10 @@
           "Env": [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HOSTNAME=gid-experiment",
-            "TEST_VAR1=test-value1"
+            "TEST_VAR1=test-value1",
+            "POD_NAME=gid-experiment",
+            "POD_NAMESPACE=default",
+            "POD_UID=31df313a-931f-4979-a405-cc3f3ccb6a56"
           ],
           "NoNewPrivileges": false,
           "OOMScoreAdj": 994,
@@ -1255,7 +1264,10 @@
           "Env": [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HOSTNAME=gid-experiment",
-            "TEST_VAR1=test-value1"
+            "TEST_VAR1=test-value1",
+            "POD_NAME=gid-experiment",
+            "POD_NAMESPACE=default",
+            "POD_UID=31df313a-931f-4979-a405-cc3f3ccb6a56"
           ],
           "NoNewPrivileges": false,
           "OOMScoreAdj": 994,
@@ -1581,7 +1593,10 @@
           "Env": [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HOSTNAME=gid-experiment",
-            "TEST_VAR1=test-value1"
+            "TEST_VAR1=test-value1",
+            "POD_NAME=gid-experiment",
+            "POD_NAMESPACE=default",
+            "POD_UID=31df313a-931f-4979-a405-cc3f3ccb6a56"
           ],
           "NoNewPrivileges": false,
           "OOMScoreAdj": 994,

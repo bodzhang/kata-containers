@@ -205,6 +205,13 @@ pub struct KataProcess {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub Env: Vec<String>,
 
+    /// Typed environment matchers generated alongside the legacy Env list.
+    ///
+    /// Values resolved before policy measurement use Exact regardless of their
+    /// Kubernetes source. Runtime is reserved for values that need Agent state.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub EnvRules: BTreeMap<String, KataEnvRule>,
+
     /// Cwd is the current working directory for the process and must be
     /// relative to the container's root.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -232,6 +239,119 @@ pub struct KataProcess {
     /// apparmor is enabled on the host, which is not derivable from the pod spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ApparmorProfile: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct KataEnvRule {
+    pub matcher: KataEnvMatcher,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum KataEnvMatcher {
+    Exact {
+        value: String,
+    },
+    Runtime {
+        template: String,
+        sources: BTreeSet<KataEnvRuntimeSource>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum KataEnvRuntimeSource {
+    SandboxHostname,
+    SandboxName,
+    SandboxNamespace,
+    PodUid,
+    PodIp,
+    HostIp,
+    NodeName,
+    ResourceField {
+        resource: String,
+        container_name: Option<String>,
+        divisor: Option<String>,
+    },
+    EnvironmentReference {
+        name: String,
+    },
+}
+
+impl KataEnvMatcher {
+    pub fn exact(value: impl Into<String>) -> Self {
+        Self::Exact {
+            value: value.into(),
+        }
+    }
+
+    pub fn runtime(template: impl Into<String>, source: KataEnvRuntimeSource) -> Self {
+        Self::Runtime {
+            template: template.into(),
+            sources: BTreeSet::from([source]),
+        }
+    }
+
+    fn value(&self) -> &str {
+        match self {
+            Self::Exact { value } => value,
+            Self::Runtime { template, .. } => template,
+        }
+    }
+
+    fn is_enforced(&self) -> bool {
+        match self {
+            Self::Exact { .. } => true,
+            Self::Runtime { sources, .. } if sources.len() == 1 => matches!(
+                sources.first(),
+                Some(
+                    KataEnvRuntimeSource::SandboxHostname
+                        | KataEnvRuntimeSource::SandboxName
+                        | KataEnvRuntimeSource::SandboxNamespace
+                        | KataEnvRuntimeSource::PodUid
+                )
+            ),
+            Self::Runtime { .. } => false,
+        }
+    }
+}
+
+impl KataProcess {
+    pub(crate) fn add_env_entry_exact(&mut self, entry: impl Into<String>) {
+        let entry = entry.into();
+        let (name, value) = split_env_entry(&entry);
+        self.add_env_matcher(name.to_string(), KataEnvMatcher::exact(value));
+    }
+
+    pub(crate) fn record_env_entry_exact(&mut self, entry: &str) {
+        let (name, value) = split_env_entry(entry);
+        self.set_env_matcher(name.to_string(), KataEnvMatcher::exact(value));
+    }
+
+    pub(crate) fn add_env_matcher(&mut self, name: String, matcher: KataEnvMatcher) {
+        let entry = format!("{name}={}", matcher.value());
+        if !self.Env.contains(&entry) {
+            self.Env.push(entry);
+        }
+        self.set_env_matcher(name, matcher);
+    }
+
+    pub(crate) fn set_env_matcher(&mut self, name: String, matcher: KataEnvMatcher) {
+        if matcher.is_enforced() {
+            self.EnvRules.insert(name, KataEnvRule { matcher });
+        } else {
+            // Until a runtime source has an Agent-side resolver, retain only
+            // its manifold-cc legacy Env entry. Removing an earlier keyed rule
+            // also preserves Kubernetes explicit-env precedence over envFrom.
+            self.EnvRules.remove(&name);
+        }
+    }
+}
+
+fn split_env_entry(entry: &str) -> (&str, &str) {
+    entry
+        .split_once('=')
+        .unwrap_or_else(|| panic!("environment entry must use NAME=value syntax: {entry}"))
 }
 
 /// OCI POSIXRlimit struct, mirroring the POSIXRlimit message from oci.proto,
@@ -1441,11 +1561,16 @@ impl AgentPolicy {
             process.Terminal = tty;
             if tty && !is_pause_container {
                 process.Env.push("TERM=xterm".to_string());
+                process.record_env_entry_exact("TERM=xterm");
             }
         }
 
         if !is_pause_container {
             process.Env.push("HOSTNAME=$(host-name)".to_string());
+            process.set_env_matcher(
+                "HOSTNAME".to_string(),
+                KataEnvMatcher::runtime("$(host-name)", KataEnvRuntimeSource::SandboxHostname),
+            );
         }
 
         let service_account_name = if let Some(s) = &yaml_container.serviceAccountName {
@@ -1455,7 +1580,7 @@ impl AgentPolicy {
         };
 
         yaml_container.get_env_variables(
-            &mut process.Env,
+            &mut process,
             &self.config_maps,
             &self.secrets,
             namespace,
@@ -1467,7 +1592,7 @@ impl AgentPolicy {
             &process.User
         );
 
-        substitute_env_variables(&mut process.Env);
+        substitute_env_variables(&mut process);
         debug!(
             "get_container_process: after substitute_env_variables: User = {:?}",
             &process.User
@@ -1629,7 +1754,12 @@ impl KataSpec {
         process.User.Username = String::from(&self.Process.User.Username);
         add_missing_strings(&self.Process.Args, &mut process.Args);
 
-        add_missing_strings(&self.Process.Env, &mut process.Env);
+        for env in &self.Process.Env {
+            process.add_env_entry_exact(env.clone());
+        }
+        for (name, rule) in &self.Process.EnvRules {
+            process.add_env_matcher(name.clone(), rule.matcher.clone());
+        }
     }
 }
 
@@ -1664,7 +1794,11 @@ async fn parse_config_file(
     Ok(k8sRes)
 }
 
-fn substitute_env_variables(env: &mut Vec<String>) {
+fn substitute_env_variables(process: &mut KataProcess) {
+    substitute_legacy_env_variables(&mut process.Env);
+}
+
+fn substitute_legacy_env_variables(env: &mut Vec<String>) {
     loop {
         let mut substituted = false;
 
@@ -2016,12 +2150,36 @@ fn normalize_image_reference(image: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_image_reference;
-    use super::{
-        get_erofs_layer_storages, IMAGE_LAYER_VERIFICATION_EROFS_DM_VERITY,
-        IMAGE_LAYER_VERIFICATION_NONE,
-    };
+    use super::*;
     use crate::registry::ImageLayer;
+
+    #[test]
+    fn exact_rules_preserve_values_and_legacy_duplicates() {
+        let mut process = KataProcess::default();
+        process.add_env_entry_exact("TOKEN=header.payload=signature");
+        process.add_env_entry_exact("FEATURE=$(node-name)");
+        for _ in 0..2 {
+            process.Env.push("KEY=value".to_string());
+            process.record_env_entry_exact("KEY=value");
+        }
+
+        assert_eq!(
+            process.EnvRules["TOKEN"].matcher,
+            KataEnvMatcher::exact("header.payload=signature")
+        );
+        assert_eq!(
+            process.EnvRules["FEATURE"].matcher,
+            KataEnvMatcher::exact("$(node-name)")
+        );
+        assert_eq!(
+            process
+                .Env
+                .iter()
+                .filter(|entry| entry.as_str() == "KEY=value")
+                .count(),
+            2
+        );
+    }
 
     /// `count` layers, each carrying a distinct derived root hash.
     fn layers_with_hashes(count: usize) -> Vec<ImageLayer> {
